@@ -1,0 +1,492 @@
+# Copyright 2026 AceMQ.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""How this library reaches a broker: which authority it trusts, what
+certificate it presents, and where the password comes from.
+
+Two things are decided here and they are deliberately not the same knob. **The
+URL scheme decides whether the connection is encrypted** — ``amqps://`` is, and
+``amqp://`` is not — because that is the part somebody reads in a configuration
+file and believes. Everything in this module describes *how* an encrypted
+connection is checked and who it logs in as. A :class:`Security` carrying TLS
+settings against an ``amqp://`` URL is refused rather than ignored: settings that
+look like TLS and quietly do nothing are how a service ends up in plaintext with
+a certificate file sitting next to it.
+
+The defaults are the ones to want. ``amqps://`` with no :class:`Security` at all
+verifies the broker against the machine's trust store and will not speak
+anything older than TLS 1.2::
+
+    mq = await connect("amqps://broker.internal:5671/")
+
+A broker with its own authority — which is most brokers, because a public
+certificate authority does not issue certificates for ``broker.internal`` — needs
+that authority named, and then it is the *only* one trusted::
+
+    mq = await connect(
+        "amqps://broker.internal:5671/",
+        security=Security(
+            certificate_authority="certs/ca.crt",
+            credentials=credentials_from_environment(),
+        ),
+    )
+
+Credentials are separate from the URL on purpose. A password in a connection
+string reaches every log line, crash report and ``ps`` listing that URL ever
+appears in, and :class:`Credentials` never renders its secret however it is
+printed.
+
+Nothing here needs a dependency: :mod:`ssl` is in the standard library, and the
+context this module builds is handed to aio-pika rather than being reimplemented
+around it.
+"""
+
+from __future__ import annotations
+
+import os
+import ssl
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, TypeAlias
+from urllib.parse import quote, urlsplit, urlunsplit
+
+from .errors import SecurityError
+
+#: A path to a file, in either of the two shapes Python people write one.
+FilePath: TypeAlias = "str | os.PathLike[str]"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class Credentials:
+    """A username and a secret for the broker.
+
+    The secret never appears in :func:`repr` or :func:`str`, so a credential
+    logged by accident — in a dataclass dump, in an exception, in a debugger's
+    variables pane — prints the username and nothing else. That is the whole
+    reason this is a type rather than two strings, and a test pins it.
+
+    :param username: the account name
+    :param secret: the password, or the token for a broker that takes one
+    """
+
+    username: str = ""
+    secret: str = ""
+
+    @property
+    def empty(self) -> bool:
+        """Whether these credentials carry nothing at all."""
+        return not self.username and not self.secret
+
+    def __repr__(self) -> str:
+        if not self.username:
+            return "Credentials(<secret>)"
+        return f"Credentials(username={self.username!r}, secret=<secret>)"
+
+    __str__ = __repr__
+
+
+#: Where credentials come from, asked at the moment a connection is made.
+#:
+#: A callable rather than a class to subclass, because in Python a function is
+#: the interface: ``lambda: Credentials("app", vault.read())`` is a complete
+#: implementation. Asking each time is the point — a password rotated by a
+#: sidecar is only useful to something that reads it again.
+CredentialsSource: TypeAlias = Callable[[], "Credentials"]
+
+
+def credentials_from_environment(
+    username_variable: str = "ACEMQ_USERNAME",
+    password_variable: str = "ACEMQ_PASSWORD",
+) -> CredentialsSource:
+    """Reads two environment variables, each time it is asked.
+
+    :param username_variable: the variable holding the account name
+    :param password_variable: the variable holding the password
+    :returns: a source that reads them
+    :raises SecurityError: when either variable is unset, naming which one
+    """
+
+    def read() -> Credentials:
+        username = os.environ.get(username_variable)
+        if username is None:
+            raise SecurityError(
+                f"acemq: {username_variable} is not set, so there is no broker username"
+            )
+        password = os.environ.get(password_variable)
+        if password is None:
+            raise SecurityError(
+                f"acemq: {password_variable} is not set, so there is no broker password"
+            )
+        return Credentials(username, password)
+
+    return read
+
+
+def credentials_from_file(path: FilePath, *, username: str = "") -> CredentialsSource:
+    """Reads a secret from a file, each time it is asked.
+
+    This is how a mounted Kubernetes secret and a Docker secret arrive, and
+    reading it per connection rather than once at import is what lets a rotated
+    file take effect without a restart.
+
+    The file holds the password alone when ``username`` is given, and
+    ``username:password`` when it is not. Trailing whitespace is trimmed,
+    because a file written by an editor almost always ends in a newline and a
+    password with a newline on the end fails in a way nobody enjoys diagnosing.
+
+    :param path: the file to read
+    :param username: the account name, when the file holds only the secret
+    :returns: a source that reads the file
+    :raises SecurityError: when the file is missing, empty, or holds no username
+        and none was given
+    """
+
+    def read() -> Credentials:
+        where = os.fspath(path)
+        try:
+            with open(path, encoding="utf-8") as handle:
+                contents = handle.read().rstrip(" \t\r\n")
+        except OSError as unreadable:
+            raise SecurityError(
+                f"acemq: cannot read the credentials file {where!r}: {unreadable}"
+            ) from unreadable
+
+        if not contents:
+            raise SecurityError(f"acemq: the credentials file {where!r} is empty")
+        if username:
+            return Credentials(username, contents)
+        account, separator, secret = contents.partition(":")
+        if not separator:
+            raise SecurityError(
+                f"acemq: the credentials file {where!r} holds no username, and none was "
+                "given; write it as username:password, or pass username= to "
+                "credentials_from_file"
+            )
+        return Credentials(account, secret)
+
+    return read
+
+
+class Verification(Enum):
+    """What an encrypted connection checks about the broker on the other end.
+
+    Named rather than left as a boolean because a ``verify=False`` in a
+    configuration file says nothing about what is being given up. These say it.
+    """
+
+    #: Check the certificate chain and the name on it. The only setting to use
+    #: against a broker holding anything that matters.
+    CERTIFICATE = "certificate"
+
+    #: Check nothing. Encrypted, and to whoever answered.
+    #: :func:`without_verifying_the_broker` is the way to ask for this, and its
+    #: docstring says what it costs.
+    NOTHING_AT_ALL = "nothing-at-all"
+
+
+@dataclass(frozen=True, slots=True)
+class Security:
+    """How to verify the broker, what to present to it, and who to log in as.
+
+    Every field is optional and the default is the safe one: verify against the
+    machine's trust store, present no client certificate, and take the login
+    from the URL. Pass one to :func:`acemq_amqp.connect` or
+    :func:`acemq_amqp.sync.connect`.
+
+    A ``Security`` that carries TLS settings is refused against an ``amqp://``
+    URL rather than ignored — see this module's own documentation for why. One
+    that carries only ``credentials`` is fine on either scheme, because keeping
+    a password out of a connection string is worth doing whether or not the
+    connection is encrypted.
+
+    :param certificate_authority: a PEM file holding the authority to verify the
+        broker against. Naming one replaces the system trust store rather than
+        adding to it, which is the point: a broker with a certificate from a
+        public authority is not your broker, and the hundreds of authorities a
+        machine trusts by default are hundreds of ways to be wrong
+    :param client_certificate: a PEM certificate to present, for a broker that
+        authenticates clients by certificate rather than by password
+    :param client_key: the PEM private key for that certificate. Defaults to
+        reading the key out of ``client_certificate``, which is where it lives
+        when the two are in one file
+    :param client_key_password: the passphrase on that key, when it has one.
+        Kept out of this dataclass's :func:`repr` alongside the broker password
+    :param server_name: the name to check the certificate against, when it is
+        not the one in the URL. Needed for a broker reached by IP address,
+        through a tunnel, or at a container's internal name
+    :param credentials: the broker login, or a :data:`CredentialsSource` asked
+        for it at connection time. Overrides anything in the URL
+    :param verification: what to check about the broker's certificate
+    """
+
+    certificate_authority: FilePath | None = None
+    client_certificate: FilePath | None = None
+    client_key: FilePath | None = None
+    client_key_password: str | None = field(default=None, repr=False)
+    server_name: str | None = None
+    credentials: Credentials | CredentialsSource | None = None
+    verification: Verification = Verification.CERTIFICATE
+
+    @property
+    def describes_tls(self) -> bool:
+        """Whether this says anything about an encrypted connection.
+
+        A ``Security`` that says nothing — one carrying credentials alone — is
+        as valid against ``amqp://`` as against ``amqps://``. One that does is
+        an instruction that a plaintext connection cannot carry out.
+        """
+        return (
+            self.certificate_authority is not None
+            or self.client_certificate is not None
+            or self.client_key is not None
+            or self.server_name is not None
+            or self.verification is not Verification.CERTIFICATE
+        )
+
+    def resolve_credentials(self) -> Credentials | None:
+        """Asks for the login, now.
+
+        :returns: the credentials, or ``None`` when this leaves the login to
+            the URL
+        :raises SecurityError: when a source was configured and could not
+            produce them
+        """
+        if self.credentials is None:
+            return None
+        if isinstance(self.credentials, Credentials):
+            return self.credentials
+        found = self.credentials()
+        if not isinstance(found, Credentials):
+            raise SecurityError(
+                "acemq: a credentials source must return Credentials, and this one "
+                f"returned {type(found).__name__}"
+            )
+        return found
+
+    def ssl_context(self) -> ssl.SSLContext:
+        """Builds the TLS context for a connection.
+
+        TLS 1.2 is the floor whatever the machine's ``openssl`` would otherwise
+        allow: 1.0 and 1.1 are withdrawn, and a broker still offering them is
+        not a reason to speak them.
+
+        :returns: the context, ready to hand to the transport
+        :raises SecurityError: when a certificate or key cannot be read
+        """
+        context = self._new_context()
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+
+        if self.verification is Verification.NOTHING_AT_ALL:
+            # Both, and in this order: check_hostname cannot be left on once
+            # verify_mode is CERT_NONE, and Python raises rather than guessing
+            # which of the two was meant.
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        elif self.certificate_authority is not None:
+            # One authority, and no others. Verification succeeding therefore
+            # means the chain reached the authority named here — the system
+            # trust store is never consulted, which is what makes this stronger
+            # than the default rather than merely different from it.
+            authority = os.fspath(self.certificate_authority)
+            self._load(
+                lambda: context.load_verify_locations(cafile=authority),
+                f"the certificate authority {authority!r}",
+            )
+        else:
+            context.load_default_certs(ssl.Purpose.SERVER_AUTH)
+
+        if self.client_certificate is not None:
+            certificate = os.fspath(self.client_certificate)
+            key = None if self.client_key is None else os.fspath(self.client_key)
+            self._load(
+                lambda: context.load_cert_chain(
+                    certificate, keyfile=key, password=self.client_key_password
+                ),
+                f"the client certificate {certificate!r}"
+                + ("" if key is None else f" with key {key!r}"),
+            )
+        elif self.client_key is not None:
+            raise SecurityError(
+                "acemq: a client key was given with no client certificate; a broker "
+                "authenticates the certificate, and a key on its own proves nothing"
+            )
+
+        return context
+
+    def _new_context(self) -> ssl.SSLContext:
+        """A client context, naming a different broker when asked to.
+
+        ``PROTOCOL_TLS_CLIENT`` rather than :func:`ssl.create_default_context`
+        because the trust store is loaded deliberately a few lines further on:
+        the default context loads the system's, and a context that has already
+        trusted three hundred authorities cannot then be narrowed to one.
+        """
+        if self.server_name is None:
+            return ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context = _ContextNamingTheBroker(ssl.PROTOCOL_TLS_CLIENT)
+        context.expected_name = self.server_name
+        return context
+
+    @staticmethod
+    def _load(read: Callable[[], None], what: str) -> None:
+        """Runs one of :mod:`ssl`'s loaders and says what failed in words.
+
+        ``ssl`` reports a missing file as ``FileNotFoundError`` and a malformed
+        one as ``[SSL] PEM lib``, neither of which names the setting that was
+        wrong. This does.
+        """
+        try:
+            read()
+        except (OSError, ssl.SSLError) as failure:
+            raise SecurityError(f"acemq: cannot load {what}: {failure}") from failure
+
+    def applied_to(self, url: str) -> str:
+        """The URL this configuration would actually connect to.
+
+        Credentials given here replace whatever the URL carried, which is how a
+        password stays out of a connection string. When none were given the URL
+        comes back as it was.
+
+        :param url: where the broker is
+        :returns: the URL to hand to the transport
+        :raises SecurityError: when TLS settings were given for an ``amqp://``
+            URL, which cannot honour them
+        """
+        scheme = urlsplit(url).scheme
+        if self.describes_tls and scheme != "amqps":
+            raise SecurityError(
+                f"acemq: this Security configures TLS but the URL is {scheme or 'unset'}://, "
+                "which is not encrypted. Nothing here can make a plaintext connection safe: "
+                "change the URL to amqps:// or take the TLS settings off"
+            )
+
+        credentials = self.resolve_credentials()
+        if credentials is None or credentials.empty:
+            return url
+        return _with_credentials(url, credentials)
+
+    def transport_options(self, url: str) -> dict[str, Any]:
+        """What the transport needs, beyond the URL.
+
+        :param url: where the broker is, so that a plaintext connection is given
+            no context at all rather than one it would silently drop
+        :returns: keyword arguments for :func:`aio_pika.connect_robust`
+        """
+        if urlsplit(url).scheme != "amqps":
+            return {}
+        return {"ssl_context": self.ssl_context()}
+
+
+class _ContextNamingTheBroker(ssl.SSLContext):
+    """A context that checks the certificate against a name of our choosing.
+
+    The name a certificate is checked against is not a property of the context;
+    it is passed at the moment of the handshake, and asyncio takes it from the
+    host in the URL. That is the right default and the wrong answer for a broker
+    reached by IP address or through a tunnel, where the address dialled and the
+    name on the certificate are different strings on purpose.
+
+    Overriding it here rather than plumbing an argument through the client is
+    the only route available: aio-pika keeps a fixed list of the parameters it
+    forwards, and an unknown one is dropped rather than passed on — which would
+    make a ``server_name`` that was configured and never used, the exact failure
+    this module refuses to have elsewhere.
+    """
+
+    expected_name: str
+
+    def wrap_bio(
+        self,
+        incoming: ssl.MemoryBIO,
+        outgoing: ssl.MemoryBIO,
+        server_side: bool = False,
+        server_hostname: str | bytes | None = None,
+        session: ssl.SSLSession | None = None,
+    ) -> ssl.SSLObject:
+        return super().wrap_bio(
+            incoming,
+            outgoing,
+            server_side=server_side,
+            server_hostname=self.expected_name,
+            session=session,
+        )
+
+
+def without_verifying_the_broker(
+    *,
+    client_certificate: FilePath | None = None,
+    client_key: FilePath | None = None,
+    client_key_password: str | None = None,
+    credentials: Credentials | CredentialsSource | None = None,
+) -> Security:
+    """Encrypts the connection and checks nothing about who is on the other end.
+
+    **This gives up most of what TLS is for, and it is worth being exact about
+    which part.** The traffic cannot be read by somebody watching the network.
+    Nothing whatsoever stops that somebody from *being* the broker: any
+    certificate is accepted, from any issuer, for any name, so an attacker who
+    can answer on the address in your URL receives every message you publish and
+    every password you log in with, over a connection that looks encrypted in
+    every log and every metric.
+
+    It exists because there is one situation where the alternative is worse: a
+    broker with a self-signed certificate on a laptop or in a test fixture,
+    where the choice is otherwise between this and turning encryption off
+    entirely. It is deliberately a function with a long name rather than a
+    ``verify=False``, because it should be impossible to end up here by pasting
+    a keyword argument and difficult to leave in a file nobody rereads.
+
+    **It is wrong in production, always.** Against a real broker, name the
+    authority instead — ``Security(certificate_authority="ca.crt")`` — which is
+    one more line and gives back everything this gives up. Self-signed
+    certificates are fine there too: put the broker's own certificate in the
+    file and it becomes the one authority you trust.
+
+    :param client_certificate: a PEM certificate to present
+    :param client_key: the PEM private key for it
+    :param client_key_password: the passphrase on that key, when it has one
+    :param credentials: the broker login, or a source asked for it
+    :returns: the configuration
+    """
+    return Security(
+        client_certificate=client_certificate,
+        client_key=client_key,
+        client_key_password=client_key_password,
+        credentials=credentials,
+        verification=Verification.NOTHING_AT_ALL,
+    )
+
+
+def _with_credentials(url: str, credentials: Credentials) -> str:
+    """Puts a username and password into a URL, replacing what was there.
+
+    Percent-encoded, because a password is chosen by a person or a generator and
+    neither is under any obligation to avoid ``@``, ``/`` or ``:`` — and a
+    password containing one of those, spliced in raw, produces a URL that parses
+    into a different host.
+    """
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    if ":" in host:
+        # An IPv6 literal, which urlsplit hands back without the brackets that
+        # are the only thing separating its colons from the port's.
+        host = f"[{host}]"
+    if parts.port is not None:
+        host = f"{host}:{parts.port}"
+
+    login = f"{quote(credentials.username, safe='')}:{quote(credentials.secret, safe='')}"
+    return urlunsplit(
+        (parts.scheme, f"{login}@{host}", parts.path, parts.query, parts.fragment)
+    )

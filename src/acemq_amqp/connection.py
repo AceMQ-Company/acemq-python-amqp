@@ -40,6 +40,7 @@ from .codec import Codec, JsonCodec
 from .envelope import Envelope
 from .errors import AceMQError, PublishError
 from .retry import ZERO, RetryPolicy, no_retry
+from .security import Security
 from .topology import Topology
 from .transport import (
     ConsumeSpec,
@@ -824,23 +825,35 @@ async def connect(
     origin: str | None = None,
     retry: RetryPolicy | None = None,
     prefetch: int = DEFAULT_PREFETCH,
+    security: Security | None = None,
     **transport_options: Any,
 ) -> Connection:
     """Opens a connection to a broker.
 
-    The URL's scheme picks the transport. ``amqp://`` and ``amqps://`` need
-    aio-pika, which is why it is imported here rather than by the package: a
-    program that only reads AceMQ envelopes should not be made to install an
-    AMQP client to import this library.
+    The URL's scheme picks the transport, and says whether the connection is
+    encrypted: ``amqps://`` is, ``amqp://`` is not. Both need aio-pika, which is
+    why it is imported here rather than by the package: a program that only
+    reads AceMQ envelopes should not be made to install an AMQP client to import
+    this library.
+
+    An ``amqps://`` URL is verified against the machine's trust store and will
+    not speak anything older than TLS 1.2, with or without a ``security``. Pass
+    one to name a different authority, to present a client certificate, or to
+    supply the login separately from the URL — which is how a password stays out
+    of a connection string that ends up in a log.
 
     :param url: where the broker is
     :param codec: what publishers and consumers use unless they say otherwise
     :param origin: what to stamp on published messages
     :param retry: what consumers use unless they say otherwise
     :param prefetch: how many unacknowledged messages a consumer holds
+    :param security: how to verify the broker and who to log in as. See
+        :class:`~acemq_amqp.Security`
     :param transport_options: passed to the transport, which for RabbitMQ is
         :func:`aio_pika.connect_robust`
     :returns: the connection
+    :raises SecurityError: when the security settings cannot be honoured, before
+        anything is dialled
     """
     scheme = urlsplit(url).scheme
     if scheme not in ("amqp", "amqps"):
@@ -848,6 +861,17 @@ async def connect(
             f"acemq: no transport knows how to reach {scheme or url!r}; "
             "this library speaks amqp:// and amqps://"
         )
+
+    # Resolved here rather than in the transport, so that a missing certificate
+    # or an unset password variable is an exception from connect() with the
+    # setting named in it, rather than a handshake failure from somewhere in
+    # aio-pika that says only that the socket closed.
+    settings = security or Security()
+    url = settings.applied_to(url)
+    # The caller's own options win: transport_options is the escape hatch for
+    # everything this library does not model, and a Security built from defaults
+    # should not quietly overrule an ssl_context somebody passed by hand.
+    transport_options = {**settings.transport_options(url), **transport_options}
 
     try:
         from .rabbitmq import RabbitMQTransport

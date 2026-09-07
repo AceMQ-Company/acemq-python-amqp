@@ -31,6 +31,17 @@ class AceMQError(Exception):
     """Something this library refused to do."""
 
 
+class SecurityError(AceMQError):
+    """A security setting that cannot be honoured.
+
+    Raised before anything is dialled rather than after: a missing certificate
+    file, an environment variable that was going to hold the password, or TLS
+    settings against a URL that is not encrypted are all things to hear about at
+    start-up. A connection that half-applied them and carried on is the failure
+    this exists to prevent.
+    """
+
+
 class PublishError(AceMQError):
     """A message the broker would not take, or would not route.
 

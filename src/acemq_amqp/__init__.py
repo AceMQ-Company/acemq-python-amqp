@@ -31,6 +31,12 @@ aio-pika at the moment it is called rather than at import, so a program that
 only reads an envelope off a message somebody else delivered never has to have
 an AMQP client at all. The blocking API lives in :mod:`acemq_amqp.sync` for
 programs that are not running an event loop.
+
+Reaching a real broker means reaching it over TLS: an ``amqps://`` URL is
+verified against the machine's trust store with no further configuration, and
+:class:`Security` in :mod:`acemq_amqp.security` covers a private certificate
+authority, a client certificate, and a login supplied separately from the URL so
+that a password never has to be written into a connection string.
 """
 
 from __future__ import annotations
@@ -61,7 +67,7 @@ from .connection import (
     connect,
 )
 from .envelope import Envelope
-from .errors import AceMQError, PublishError
+from .errors import AceMQError, PublishError, SecurityError
 from .naming import dead_letter_queue, parked_queue, retry_queue
 from .retry import (
     DEFAULT_BROKER_WAIT_THRESHOLD,
@@ -70,6 +76,15 @@ from .retry import (
     exponential_retry,
     fixed_retry,
     no_retry,
+)
+from .security import (
+    Credentials,
+    CredentialsSource,
+    Security,
+    Verification,
+    credentials_from_environment,
+    credentials_from_file,
+    without_verifying_the_broker,
 )
 from .topology import Topology
 from .transport import (
@@ -108,6 +123,8 @@ __all__ = [
     "Connection",
     "ConsumeSpec",
     "Consumer",
+    "Credentials",
+    "CredentialsSource",
     "Delivery",
     "Envelope",
     "ExchangeSpec",
@@ -121,15 +138,20 @@ __all__ = [
     "Publisher",
     "QueueSpec",
     "RetryPolicy",
+    "Security",
+    "SecurityError",
     "TextCodec",
     "Topology",
     "Transport",
+    "Verification",
     "Wait",
     "__version__",
     "accept",
     "codec_by_name",
     "codec_names",
     "connect",
+    "credentials_from_environment",
+    "credentials_from_file",
     "dead_letter_queue",
     "exponential_retry",
     "fixed_retry",
@@ -140,4 +162,5 @@ __all__ = [
     "reject",
     "retry",
     "retry_queue",
+    "without_verifying_the_broker",
 ]

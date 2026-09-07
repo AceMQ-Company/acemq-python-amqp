@@ -31,23 +31,29 @@ import asyncio
 import contextlib
 import json
 import os
+import ssl
 import threading
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from datetime import timedelta
+from pathlib import Path
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 import pytest
+from aiormq.exceptions import AMQPConnectionError
 
 from acemq_amqp import (
     Ack,
     BytesCodec,
     Codec,
     Connection,
+    Credentials,
     Envelope,
     FatalError,
     Message,
     Outbound,
     RetryPolicy,
+    Security,
     Topology,
     accept,
     connect,
@@ -58,6 +64,7 @@ from acemq_amqp import (
     retry,
     retry_queue,
     sync,
+    without_verifying_the_broker,
 )
 from acemq_amqp.patterns import (
     HEADER_REPLAY_COUNT,
@@ -93,6 +100,34 @@ BROKER = os.environ.get("ACEMQ_TEST_BROKER", "amqp://guest:guest@localhost:5672/
 #: Every queue and exchange these tests create starts with this, so a broker
 #: shared with anything else can be cleaned up without guessing.
 PREFIX = "pyit."
+
+#: A broker with a TLS listener that verifies nothing about the client, and one
+#: that will not talk to a client without a certificate. Both are unset on a
+#: laptop with only a plain broker running, and the TLS tests skip rather than
+#: fail: a suite that reports red because a machine has no certificates on it
+#: teaches everybody to ignore red.
+TLS_BROKER = os.environ.get("ACEMQ_TEST_TLS_BROKER", "")
+MUTUAL_TLS_BROKER = os.environ.get("ACEMQ_TEST_TLS_MUTUAL_BROKER", "")
+
+#: A directory holding ``ca.crt``, the client's ``client.crt`` and
+#: ``client.key``, and a ``stranger.crt``/``stranger.key`` pair signed by an
+#: authority the broker has never heard of.
+CERTIFICATES = Path(os.environ.get("ACEMQ_TEST_TLS_CERTIFICATES", "/nonexistent"))
+
+#: The login for the TLS brokers, supplied through a :class:`Security` rather
+#: than in the URL — which is the thing being tested as much as it is a detail
+#: of how these tests connect.
+TLS_LOGIN = Credentials(
+    os.environ.get("ACEMQ_TEST_TLS_USERNAME", "guest"),
+    os.environ.get("ACEMQ_TEST_TLS_PASSWORD", "guest"),
+)
+
+needs_a_tls_broker = pytest.mark.skipif(
+    not TLS_BROKER, reason="ACEMQ_TEST_TLS_BROKER is not set"
+)
+needs_a_mutual_tls_broker = pytest.mark.skipif(
+    not MUTUAL_TLS_BROKER, reason="ACEMQ_TEST_TLS_MUTUAL_BROKER is not set"
+)
 
 
 class Workspace:
@@ -689,3 +724,203 @@ def test_the_blocking_api_publishes_and_consumes(blocking: sync.SyncConnection) 
         for name in (queue, dead_letter_queue(queue), parked_queue(queue)):
             with contextlib.suppress(Exception):
                 blocking.delete_queue(name)
+
+
+# --------------------------------------------------------------------------
+# Reaching the broker safely.
+#
+# The unit tests prove the SSL context is built the way it was asked for. These
+# prove the handshake really happens: a connection that was configured for TLS
+# and then quietly made in plaintext would pass every assertion about the
+# context and none of the ones below.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def handshakes(monkeypatch: pytest.MonkeyPatch) -> list[ssl.SSLObject]:
+    """Every TLS handshake made while a test runs, so it can be looked at.
+
+    The negotiated version, the cipher and the certificate the broker presented
+    are only knowable from the object that did the handshake, and neither
+    aio-pika nor aiormq keeps one anywhere reachable — the stream writer lives
+    in a closure. Recording them as :mod:`ssl` hands them out is the way to
+    assert on what actually crossed the wire rather than on what was configured.
+    """
+    seen: list[ssl.SSLObject] = []
+    original = ssl.SSLContext.wrap_bio
+
+    def recording(self: ssl.SSLContext, *args: object, **kwargs: object) -> ssl.SSLObject:
+        handshake = original(self, *args, **kwargs)  # type: ignore[arg-type]
+        seen.append(handshake)
+        return handshake
+
+    monkeypatch.setattr(ssl.SSLContext, "wrap_bio", recording)
+    return seen
+
+
+def trusting_the_test_authority(**extra: object) -> Security:
+    """The settings a service deployed against this broker would really use."""
+    return Security(
+        certificate_authority=CERTIFICATES / "ca.crt",
+        credentials=TLS_LOGIN,
+        **extra,  # type: ignore[arg-type]
+    )
+
+
+@needs_a_tls_broker
+async def test_an_amqps_connection_really_negotiates_tls_and_carries_a_message(
+    handshakes: list[ssl.SSLObject],
+) -> None:
+    mq = await connect(TLS_BROKER, security=trusting_the_test_authority())
+    space = Workspace(mq)
+    try:
+        queue = await space.queue("encrypted")
+        await mq.publisher(routing_key=queue, mandatory=True).send({"id": "7"})
+        assert (await collect(mq, queue))[0].payload == {"id": "7"}
+
+        # The message went over a real TLS session, not over a socket that was
+        # configured for one. A modern version, a cipher that was agreed with
+        # the other end, and a certificate the broker had to present to get
+        # this far.
+        assert handshakes, "nothing performed a TLS handshake"
+        session = handshakes[0]
+        assert session.version() in ("TLSv1.2", "TLSv1.3")
+        assert session.cipher() is not None
+        presented = session.getpeercert()
+        assert presented is not None
+        issuer = [field for name in presented["issuer"] for field in name]
+        assert ("commonName", "AceMQ Python Test CA") in issuer
+    finally:
+        await space.cleanup()
+        await mq.close()
+
+
+@needs_a_tls_broker
+async def test_a_broker_the_system_trust_store_does_not_vouch_for_is_refused() -> None:
+    # No authority named, so the machine's trust store is the one consulted —
+    # and it has never heard of the authority that signed this broker. The
+    # connection fails rather than falling back to trusting it, which is the
+    # single most important thing in this file.
+    with pytest.raises(AMQPConnectionError, match="CERTIFICATE_VERIFY_FAILED"):
+        await connect(TLS_BROKER, security=Security(credentials=TLS_LOGIN))
+
+
+@needs_a_tls_broker
+async def test_the_wrong_authority_is_refused_as_firmly_as_none_at_all() -> None:
+    # An authority that is real, is trusted, and did not sign this broker.
+    # Naming one has to mean "this one and no other" or it means nothing.
+    settings = Security(
+        certificate_authority=CERTIFICATES / "other-ca.crt", credentials=TLS_LOGIN
+    )
+
+    with pytest.raises(AMQPConnectionError, match="CERTIFICATE_VERIFY_FAILED"):
+        await connect(TLS_BROKER, security=settings)
+
+
+@needs_a_tls_broker
+async def test_the_opt_out_gets_in_where_verification_would_not(
+    handshakes: list[ssl.SSLObject],
+) -> None:
+    # The same broker that was just refused twice, reached by giving up the
+    # check. Encrypted, and to whoever answered: which is exactly what
+    # without_verifying_the_broker's docstring says it is for and against.
+    mq = await connect(
+        TLS_BROKER, security=without_verifying_the_broker(credentials=TLS_LOGIN)
+    )
+    try:
+        assert await mq.queue_exists(f"{PREFIX}nothing-of-the-kind") is False
+        assert handshakes[0].version() in ("TLSv1.2", "TLSv1.3")
+    finally:
+        await mq.close()
+
+
+@needs_a_mutual_tls_broker
+async def test_a_client_certificate_gets_in_where_none_at_all_does_not(
+    handshakes: list[ssl.SSLObject],
+) -> None:
+    without = trusting_the_test_authority()
+    # This broker will not speak to a client that cannot say who it is, so the
+    # handshake ends before there is any AMQP to have an opinion about.
+    with pytest.raises(AMQPConnectionError, match="CERTIFICATE"):
+        await connect(MUTUAL_TLS_BROKER, security=without)
+
+    handshakes.clear()
+    mq = await connect(
+        MUTUAL_TLS_BROKER,
+        security=trusting_the_test_authority(
+            client_certificate=CERTIFICATES / "client.crt",
+            client_key=CERTIFICATES / "client.key",
+        ),
+    )
+    space = Workspace(mq)
+    try:
+        queue = await space.queue("mutual")
+        await mq.publisher(routing_key=queue, mandatory=True).send({"id": "7"})
+        assert (await collect(mq, queue))[0].payload == {"id": "7"}
+        assert handshakes[0].version() in ("TLSv1.2", "TLSv1.3")
+    finally:
+        await space.cleanup()
+        await mq.close()
+
+
+@needs_a_mutual_tls_broker
+async def test_a_client_certificate_from_an_authority_the_broker_does_not_know_is_refused() -> (
+    None
+):
+    # Presenting *a* certificate is not the same as presenting one the broker
+    # accepts, and the difference is the whole of what mutual TLS buys. This
+    # one is well-formed, and signed by somebody nobody asked about.
+    settings = trusting_the_test_authority(
+        client_certificate=CERTIFICATES / "stranger.crt",
+        client_key=CERTIFICATES / "stranger.key",
+    )
+
+    with pytest.raises(AMQPConnectionError):
+        await connect(MUTUAL_TLS_BROKER, security=settings)
+
+
+async def test_a_password_given_out_of_band_logs_in_and_the_url_never_holds_it() -> None:
+    # The point of the whole credentials path: the URL that reaches the logs,
+    # the metrics and the process listing carries a host and nothing else.
+    url = _without_the_login(BROKER)
+    assert "@" not in url
+
+    mq = await connect(url, security=Security(credentials=_login_from(BROKER)))
+    space = Workspace(mq)
+    try:
+        queue = await space.queue("out-of-band")
+        await mq.publisher(routing_key=queue, mandatory=True).send({"id": "7"})
+        assert (await collect(mq, queue))[0].payload == {"id": "7"}
+    finally:
+        await space.cleanup()
+        await mq.close()
+
+
+def test_the_blocking_api_takes_the_same_credentials() -> None:
+    connection = sync.connect(
+        _without_the_login(BROKER), security=Security(credentials=_login_from(BROKER))
+    )
+    queue = f"{PREFIX}{uuid.uuid4().hex[:8]}.blocking-login"
+    try:
+        connection.declare(Topology().queue(queue, dead_letter=True))
+        assert connection.queue_exists(queue) is True
+    finally:
+        for name in (queue, dead_letter_queue(queue), parked_queue(queue)):
+            with contextlib.suppress(Exception):
+                connection.delete_queue(name)
+        connection.close()
+
+
+def _login_from(url: str) -> Credentials:
+    """The username and password the test broker's URL carries."""
+    parts = urlsplit(url)
+    return Credentials(unquote(parts.username or ""), unquote(parts.password or ""))
+
+
+def _without_the_login(url: str) -> str:
+    """The same URL with the userinfo taken off, as a deployment would write it."""
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    if parts.port is not None:
+        host = f"{host}:{parts.port}"
+    return urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))

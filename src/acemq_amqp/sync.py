@@ -46,6 +46,7 @@ from .connection import DEFAULT_PREFETCH, Connection, Consumer, Message, Publish
 from .connection import connect as _connect_async
 from .envelope import Envelope
 from .retry import RetryPolicy
+from .security import Security
 from .topology import Topology
 from .transport import PublishResult
 
@@ -273,18 +274,30 @@ def connect(
     origin: str | None = None,
     retry: RetryPolicy | None = None,
     prefetch: int = DEFAULT_PREFETCH,
+    security: Security | None = None,
     **transport_options: Any,
 ) -> SyncConnection:
     """Opens a connection to a broker, blocking until it is open.
 
     Takes the same arguments as :func:`acemq_amqp.connect` and returns the
-    blocking shape of the same thing.
+    blocking shape of the same thing — including ``security``, because a program
+    that is not running an event loop has exactly the same broker to reach::
+
+        with sync.connect(
+            "amqps://broker.internal:5671/",
+            security=Security(
+                certificate_authority="certs/ca.crt",
+                credentials=credentials_from_environment(),
+            ),
+        ) as mq:
+            ...
 
     :param url: where the broker is
     :param codec: what publishers and consumers use unless they say otherwise
     :param origin: what to stamp on published messages
     :param retry: what consumers use unless they say otherwise
     :param prefetch: how many unacknowledged messages a consumer holds
+    :param security: how to verify the broker and who to log in as
     :param transport_options: passed to the transport
     :returns: the connection
     """
@@ -297,6 +310,7 @@ def connect(
                 origin=origin,
                 retry=retry,
                 prefetch=prefetch,
+                security=security,
                 **transport_options,
             )
         )

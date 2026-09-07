@@ -85,6 +85,103 @@ and every call is handed to it, so the envelope rules and the retry engine are
 the ones above rather than a copy that can drift. Handlers run on a worker
 thread, so a blocking handler blocks nothing but itself.
 
+## Reaching a real broker: TLS and credentials
+
+**The URL scheme decides whether the connection is encrypted.** `amqps://` is,
+`amqp://` is not, because that is the part somebody reads in a configuration
+file and believes. An `amqps://` URL needs nothing else: the broker is verified
+against the machine's trust store and nothing older than TLS 1.2 is spoken.
+
+```python
+mq = await connect("amqps://broker.internal:5671/")
+```
+
+Most brokers are not on a public certificate authority, because no public
+authority issues certificates for `broker.internal`. Name the authority instead,
+and keep the password out of the URL while you are there:
+
+```python
+from acemq_amqp import Security, connect, credentials_from_environment
+
+mq = await connect(
+    "amqps://broker.internal:5671/",
+    security=Security(
+        certificate_authority="/etc/acemq/ca.crt",
+        credentials=credentials_from_environment("MQ_USER", "MQ_PASSWORD"),
+    ),
+)
+```
+
+Naming an authority **replaces** the system trust store rather than adding to
+it. That is the point: a broker holding a certificate from a public authority is
+not your broker, and the several hundred authorities a machine trusts by default
+are several hundred ways to be wrong. A self-signed broker certificate works
+here too — put the broker's own certificate in the file and it becomes the one
+authority you trust.
+
+| | |
+|---|---|
+| `certificate_authority` | The PEM authority to verify the broker against, and no other |
+| `client_certificate` / `client_key` | What to present, for a broker that authenticates clients by certificate |
+| `client_key_password` | The passphrase on that key. Kept out of `repr` |
+| `server_name` | The name to check the certificate against, when it is not the one in the URL — an IP address, a tunnel, a container's internal name |
+| `credentials` | The login, or a source asked for it at connection time |
+
+Everything above works the same on the blocking API — `sync.connect(url,
+security=...)` — because a program that is not running an event loop has exactly
+the same broker to reach.
+
+### Credentials that do not end up in a log
+
+A password in a connection string reaches every log line, crash report and `ps`
+listing that URL ever appears in. Supply it separately and the URL carries a host
+and nothing else:
+
+```python
+from acemq_amqp import Credentials, credentials_from_environment, credentials_from_file
+
+Credentials("app", password)                        # from wherever you already had it
+credentials_from_environment("MQ_USER", "MQ_PASSWORD")
+credentials_from_file("/run/secrets/broker", username="app")
+```
+
+`Credentials` never renders its secret — `repr`, `str` and an f-string all give
+back `Credentials(username='app', secret=<secret>)` — and a test in the suite
+asserts it, because the whole value of the type is that it holds under a
+`print()` somebody added at three in the morning.
+
+The two file-reading sources are read **each time a connection is made**, not
+once at import. That is what makes a password rotated by a sidecar or a
+remounted Kubernetes secret take effect without a restart. A source is just a
+callable, so `lambda: Credentials("app", vault.read())` is a complete
+implementation of one.
+
+### The way out, and what it costs
+
+```python
+from acemq_amqp import without_verifying_the_broker
+
+mq = await connect("amqps://localhost:5671/", security=without_verifying_the_broker())
+```
+
+This encrypts the traffic and checks nothing at all about who is on the other
+end. Any certificate is accepted, from any issuer, for any name, so somebody who
+can answer on the address in your URL receives every message you publish and
+every password you log in with — over a connection that looks encrypted in every
+log and every metric.
+
+It is a function with a long name rather than a `verify=False` on purpose: there
+is no keyword argument anywhere in this library that turns verification off, so
+it should be impossible to end up here by pasting one, and hard to leave in a
+file nobody rereads. **It is wrong in production, always.** The alternative is
+one line — `Security(certificate_authority="ca.crt")` — and gives back
+everything this gives up.
+
+Settings that describe TLS are **refused against an `amqp://` URL** rather than
+ignored, and that is deliberate too: a service that was handed a certificate
+authority, connected in plaintext and reported success is the failure this whole
+module exists to prevent. Credentials alone are welcome on either scheme.
+
 ## What is identical, and what is not
 
 **Identical**, because a message crosses languages: the reserved header names
@@ -249,6 +346,24 @@ ruff check . && mypy
 # And against a real one:
 ACEMQ_TEST_BROKER=amqp://guest:guest@localhost:5672/ pytest -m integration
 ```
+
+The TLS tests need a broker with a TLS listener, and skip when they are not told
+where one is. Two are wanted, because one broker cannot both accept a client
+that has no certificate and refuse it:
+
+```bash
+export ACEMQ_TEST_TLS_CERTIFICATES=/path/to/certs   # ca.crt, client.crt, client.key,
+                                                    # other-ca.crt, stranger.crt, stranger.key
+export ACEMQ_TEST_TLS_BROKER=amqps://localhost:25891/          # ssl_options.verify = verify_none
+export ACEMQ_TEST_TLS_MUTUAL_BROKER=amqps://localhost:25893/   # verify_peer, fail_if_no_peer_cert
+pytest -m integration
+```
+
+They prove the handshake rather than the configuration: the certificate the
+broker presented, the version and cipher that were agreed, that a broker the
+system trust store does not vouch for is **refused**, and that a client
+certificate signed by the wrong authority gets no further than one signed by
+none.
 
 The fixtures under `tests/fixtures/` are generated by the Java implementation
 and shared with Go and .NET. They are the definition of "the same wire
