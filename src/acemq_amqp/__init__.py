@@ -26,10 +26,11 @@ production.
 The API shape is Python's, deliberately. The contract is portable; the
 ergonomics are native.
 
-Importing this package needs nothing installed. Reaching a broker needs
-aio-pika, and it is reached for at the moment a connection is opened rather than
-at import, so a program that only reads an envelope off a message somebody else
-delivered never has to have an AMQP client at all.
+Importing this package needs nothing installed. :func:`connect` reaches for
+aio-pika at the moment it is called rather than at import, so a program that
+only reads an envelope off a message somebody else delivered never has to have
+an AMQP client at all. The blocking API lives in :mod:`acemq_amqp.sync` for
+programs that are not running an event loop.
 """
 
 from __future__ import annotations
@@ -50,6 +51,7 @@ from .codec import (
     codec_names,
     register_codec,
 )
+from .connection import Connection, Consumer, Handler, Message, Publisher, connect
 from .envelope import Envelope
 from .errors import AceMQError, PublishError
 from .naming import dead_letter_queue, parked_queue, retry_queue
@@ -86,15 +88,20 @@ __all__ = [
     "BytesCodec",
     "Codec",
     "CompositeCodec",
+    "Connection",
     "ConsumeSpec",
+    "Consumer",
     "Delivery",
     "Envelope",
     "ExchangeSpec",
     "FatalError",
+    "Handler",
     "JsonCodec",
+    "Message",
     "Outbound",
     "PublishError",
     "PublishResult",
+    "Publisher",
     "QueueSpec",
     "RetryPolicy",
     "TextCodec",
@@ -104,6 +111,7 @@ __all__ = [
     "accept",
     "codec_by_name",
     "codec_names",
+    "connect",
     "dead_letter_queue",
     "exponential_retry",
     "fixed_retry",
