@@ -48,17 +48,35 @@ from .outbox import (
     OutboxStore,
     record,
 )
+from .requestreply import (
+    DEFAULT_TIMEOUT,
+    HEADER_ERROR,
+    HEADER_REPLY_TO,
+    Requester,
+    RequestTimeoutError,
+    Responder,
+    ResponderError,
+    serve,
+)
 
 __all__ = [
     "DEFAULT_BATCH",
     "DEFAULT_INTERVAL",
     "DEFAULT_MEMORY",
+    "DEFAULT_TIMEOUT",
+    "HEADER_ERROR",
+    "HEADER_REPLY_TO",
     "IdempotencyStore",
     "InMemoryIdempotencyStore",
     "InMemoryOutboxStore",
     "OutboxRecord",
     "OutboxRelay",
     "OutboxStore",
+    "RequestTimeoutError",
+    "Requester",
+    "Responder",
+    "ResponderError",
     "idempotent",
     "record",
+    "serve",
 ]

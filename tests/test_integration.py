@@ -62,8 +62,11 @@ from acemq_amqp.patterns import (
     InMemoryIdempotencyStore,
     InMemoryOutboxStore,
     OutboxRelay,
+    Requester,
+    ResponderError,
     idempotent,
     record,
+    serve,
 )
 
 pytestmark = pytest.mark.integration
@@ -439,6 +442,34 @@ async def test_a_duplicate_is_accepted_without_running_the_handler_again(
     # Accepted, not dead-lettered: the work was done, so the message has been
     # handled and nothing should be raising an alarm about it.
     assert await mq.message_count(dead_letter_queue(queue)) == 0
+
+
+async def test_a_question_over_a_queue_comes_back_answered(
+    mq: Connection, workspace: Workspace
+) -> None:
+    requests = await workspace.queue("price-requests")
+    # Named rather than generated, so the name carries this suite's prefix on a
+    # broker it is sharing. A service of its own would take the generated one.
+    replies = workspace.name("price-replies")
+    workspace.register(replies)
+
+    async def price(message: Message) -> dict[str, object]:
+        if message.payload["sku"] == "gone":
+            raise LookupError("no such sku")
+        return {"sku": message.payload["sku"], "pence": 250}
+
+    async with (
+        await serve(mq, requests, price),
+        await Requester.open(
+            mq, "", requests, reply_queue=replies, timeout=timedelta(seconds=15)
+        ) as caller,
+    ):
+        assert await caller.ask({"sku": "A-1"}) == {"sku": "A-1", "pence": 250}
+
+        # A failure comes back as a failure, in milliseconds, rather than as a
+        # caller waiting out its whole timeout to learn nothing.
+        with pytest.raises(ResponderError, match="no such sku"):
+            await caller.ask({"sku": "gone"})
 
 
 @pytest.fixture
