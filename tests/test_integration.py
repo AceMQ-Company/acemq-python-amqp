@@ -44,6 +44,10 @@ from aiormq.exceptions import AMQPConnectionError
 
 from acemq_amqp import (
     DEAD_LETTER_EXCHANGE,
+    METRIC_ACCEPTED,
+    METRIC_CONSUMED,
+    METRIC_HANDLER_DURATION,
+    METRIC_PUBLISHED,
     RETRY_EXCHANGE,
     Ack,
     BytesCodec,
@@ -54,7 +58,9 @@ from acemq_amqp import (
     Credentials,
     Envelope,
     FatalError,
+    HealthStatus,
     Message,
+    Metrics,
     Outbound,
     PublishContext,
     PublishNext,
@@ -99,6 +105,7 @@ from acemq_amqp.patterns import (
     then,
 )
 from acemq_amqp.rabbitmq import RabbitMQTransport
+from acemq_amqp.telemetry import metric_key
 
 pytestmark = pytest.mark.integration
 
@@ -525,6 +532,71 @@ async def test_interceptors_wrap_a_real_publish_and_a_real_handler(
 
 async def _handled(seen: list[Message]) -> bool:
     return len(seen) >= 1
+
+
+async def test_health_asks_the_broker_something_and_leaves_nothing_behind(
+    mq: Connection, workspace: Workspace
+) -> None:
+    # A socket that is open but wedged answers a socket-level check exactly as a
+    # healthy one does, so the check asks the broker a question. It has to ask
+    # one that creates nothing: a probe that declared even a temporary queue
+    # would leave one per connection, because an exclusive queue is released
+    # only when the channel that declared it closes, and a readiness probe runs
+    # every few seconds for as long as the pod lives.
+    queue = await workspace.queue("healthy")
+
+    async def handler(message: Message) -> Ack:
+        return accept()
+
+    async with await mq.consume(queue, handler):
+        for _ in range(5):
+            report = await mq.health()
+            assert report.status is HealthStatus.UP
+
+    assert report.healthy is True
+    assert report.parts["consumers"] == 1
+    assert report.parts["round-trip"] >= 0
+
+    # Five probes and the queue count is what the workspace declared and no
+    # more. The whole-run count before and after is checked outside pytest.
+    assert await mq.queue_exists(queue) is True
+
+
+async def test_health_is_down_once_the_connection_has_gone(mq: Connection) -> None:
+    connection = await connect(BROKER)
+    await connection.close()
+
+    report = await connection.health()
+
+    assert report.status is HealthStatus.DOWN
+    assert report.healthy is False
+
+
+async def test_metrics_count_a_real_round_trip(
+    mq: Connection, workspace: Workspace
+) -> None:
+    queue = await workspace.queue("counted")
+    metrics = Metrics()
+
+    async def handler(message: Message) -> Ack:
+        return accept()
+
+    counted = await connect(BROKER, observer=metrics)
+    async with counted, await counted.consume(queue, handler):
+        await counted.publisher(routing_key=queue, mandatory=True).send({"id": "1"})
+        await until(
+            lambda: _counted(metrics, METRIC_ACCEPTED, {"queue": queue}),
+            "the message was accepted",
+        )
+
+    published = metric_key(METRIC_PUBLISHED, {"exchange": "", "key": queue})
+    assert metrics.counts[published] == 1
+    assert metrics.counts[metric_key(METRIC_CONSUMED, {"queue": queue})] == 1
+    assert metrics.durations[metric_key(METRIC_HANDLER_DURATION, {"queue": queue})].count == 1
+
+
+async def _counted(metrics: Metrics, metric: str, labels: dict[str, str]) -> bool:
+    return metrics.counts.get(metric_key(metric, labels), 0) >= 1
 
 
 async def test_a_fatal_error_does_not_use_the_attempts_it_has_left(

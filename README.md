@@ -63,8 +63,9 @@ The transport is an extra, because reading an AceMQ envelope should not require
 installing a broker client:
 
 ```bash
-pip install acemq-amqp              # the contract, no dependencies at all
-pip install "acemq-amqp[rabbitmq]"  # and a way to talk to a broker
+pip install acemq-amqp                # the contract, no dependencies at all
+pip install "acemq-amqp[rabbitmq]"    # and a way to talk to a broker
+pip install "acemq-amqp[prometheus]"  # and a registry to report into
 ```
 
 ### Not running an event loop?
@@ -396,6 +397,84 @@ door: anything an interceptor can do, application code could have done.
 The blocking API inherits them — `sync.connect(...).connection` is the
 asynchronous connection underneath, and registering there applies to everything
 above it.
+
+## Telemetry and health
+
+How much is going through, how much is failing and how long a handler takes are
+numbers nobody outside the process can see. Whether the connection is really up
+— as opposed to a socket that is open and wedged — is a question only something
+holding the connection can ask. So the library answers both.
+
+**No hard dependency.** The library calls a three-method `Observer` and nothing
+else; a metrics client is an extra, exactly as the broker client is. Taking one
+would put every user of this package on whichever was picked.
+
+```python
+from acemq_amqp import Metrics, prometheus_text
+
+metrics = Metrics()                       # keeps the numbers in memory
+mq = await connect(url, observer=metrics)
+...
+print(prometheus_text(metrics))           # a scrape body, nothing installed
+```
+
+```python
+# Or into a registry the rest of the application already writes to:
+#   pip install "acemq-amqp[prometheus]"
+from acemq_amqp.prometheus import PrometheusObserver
+
+mq = await connect(url, observer=PrometheusObserver())
+```
+
+The names are the same in Java, Go, .NET and here, so a dashboard built against
+one reads against another:
+
+| Metric | |
+|---|---|
+| `acemq.messages.published` / `.publish.failed` | Handed to the broker, and not. Labelled by exchange and key |
+| `acemq.messages.consumed` | Delivered to a handler. Labelled by queue |
+| `acemq.messages.accepted` / `.retried` / `.rejected` | What handlers decided. A retry says `where`: `consumer` or `broker` |
+| `acemq.messages.dead.lettered` | Ran out of attempts and went to `{queue}.dlq` |
+| `acemq.messages.parked` | Never reached the handler and went to `{queue}.parked` |
+| `acemq.handler.duration` | Seconds, timed around the interceptors as well as the handler |
+| `acemq.messages.in.flight` | Being handled right now |
+| `acemq.retry.rung.missing` | **Worth an alert.** A long retry that had to wait in the consumer because its rung queue is not on the broker |
+| `acemq.messages.set.aside.failed` | Could not be moved to a dead-letter or parking queue, so was rejected to the broker instead |
+
+`acemq.retry.rung.missing` is the one to alert on, because nothing else shows
+it. The message is still retried and the wait still happens, so a dashboard
+reads as normal — while the reason the rung exists is gone, and a consumer
+restart mid-wait shortens a five-minute backoff to nothing.
+
+### Health
+
+```python
+from acemq_amqp import BrokerHealth, aggregate_health
+
+report = await mq.health()
+report.status     # HealthStatus.UP / DOWN / DEGRADED
+report.healthy    # what a readiness probe should return; degraded passes
+
+# Combined with the application's own checks, worst wins:
+report = await aggregate_health(BrokerHealth(mq), my_database_check)
+```
+
+Two halves. The broker half asks the broker a question — a socket that is open
+but wedged answers a socket-level check exactly as a healthy one does, right up
+until something is asked of it. It asks one that **creates nothing**: an
+exclusive queue is released only when the channel that declared it closes, so a
+probe that declared one would leave a queue behind on every connection.
+
+The consumer half is the one nothing outside can see. A consumer whose workers
+have died without it being closed is one the broker is still sending messages to
+and nothing is reading — indistinguishable from a quiet queue, and reported as
+**degraded**: the connection works, and a replacement instance would almost
+certainly stall the same way, so it is worth an alert and not worth taking out
+of rotation.
+
+`aggregate_health` runs checks at once rather than in turn, under a deadline, so
+one that hangs cannot hang the probe with it — and a probe that hangs is a pod
+that never comes back.
 
 ## Patterns
 

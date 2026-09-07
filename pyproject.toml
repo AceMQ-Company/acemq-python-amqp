@@ -31,9 +31,14 @@ dependencies = []
 
 [project.optional-dependencies]
 rabbitmq = ["aio-pika>=9.4"]
+# The library calls its own Observer interface and depends on no metrics
+# client. This extra is one adapter for it; telemetry.prometheus_text renders
+# the same format with nothing installed at all.
+prometheus = ["prometheus-client>=0.20"]
 dev = [
   "aio-pika>=9.4",
   "mypy>=1.11",
+  "prometheus-client>=0.20",
   "pytest>=8.0",
   "pytest-asyncio>=0.24",
   "ruff>=0.6",

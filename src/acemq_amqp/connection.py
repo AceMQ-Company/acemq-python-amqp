@@ -28,9 +28,11 @@ import asyncio
 import inspect
 import logging
 import socket
+import time
+import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, TypeAlias
 from urllib.parse import urlsplit
 
@@ -49,6 +51,24 @@ from .interceptors import (
 )
 from .retry import ZERO, RetryPolicy, no_retry
 from .security import Security
+from .telemetry import (
+    METRIC_ACCEPTED,
+    METRIC_CONSUMED,
+    METRIC_DEAD_LETTERED,
+    METRIC_HANDLER_DURATION,
+    METRIC_IN_FLIGHT,
+    METRIC_PARKED,
+    METRIC_PUBLISH_FAILED,
+    METRIC_PUBLISHED,
+    METRIC_REJECTED,
+    METRIC_RETRIED,
+    METRIC_RUNG_MISSING,
+    METRIC_SET_ASIDE_FAILED,
+    HealthReport,
+    HealthStatus,
+    NullObserver,
+    Observer,
+)
 from .topology import Topology
 from .transport import (
     ConsumeSpec,
@@ -57,6 +77,7 @@ from .transport import (
     Outbound,
     PublishResult,
     QueueAdmin,
+    QueueSpec,
     Subscription,
     Transport,
 )
@@ -181,25 +202,32 @@ class Publisher:
         # change the payload as well as its metadata. A codec that has already
         # run leaves an interceptor with bytes and nothing it can do to them.
         body = self._codec.encode(context.payload)
+        observer = self._connection.observer
+        labels = {"exchange": context.exchange, "key": context.routing_key}
 
-        result = await self._connection.publish_raw(
-            context.exchange,
-            context.routing_key,
-            Outbound(
-                body=body,
-                content_type=self._codec.content_type,
-                message_id=context.envelope.id,
-                headers=context.envelope.to_headers(routing_key=context.routing_key),
-                persistent=context.persistent,
-                mandatory=context.mandatory,
-            ),
-        )
+        try:
+            result = await self._connection.publish_raw(
+                context.exchange,
+                context.routing_key,
+                Outbound(
+                    body=body,
+                    content_type=self._codec.content_type,
+                    message_id=context.envelope.id,
+                    headers=context.envelope.to_headers(routing_key=context.routing_key),
+                    persistent=context.persistent,
+                    mandatory=context.mandatory,
+                ),
+            )
+        except Exception:
+            observer.count(METRIC_PUBLISH_FAILED, 1, labels)
+            raise
 
         # Raised rather than left in the result, because a caller who does not
         # read the result would otherwise carry on believing the message went
         # somewhere. Unroutable is the quietest failure AMQP has: the publish
         # succeeds, the consumer waits, and nothing anywhere says why.
         if context.mandatory and not result.routed:
+            observer.count(METRIC_PUBLISH_FAILED, 1, labels)
             raise PublishError(
                 context.envelope.id,
                 context.exchange,
@@ -207,6 +235,8 @@ class Publisher:
                 result.return_reason or "no queue is bound to receive it",
                 unroutable=True,
             )
+
+        observer.count(METRIC_PUBLISHED, 1, labels)
         return result
 
 
@@ -239,12 +269,47 @@ class Consumer:
         self._work: asyncio.Queue[Delivery | None] = asyncio.Queue()
         self._workers: list[asyncio.Task[None]] = []
         self._subscription: Subscription | None = None
+        self._in_flight = 0
         self._closed = False
 
     @property
     def queue(self) -> str:
         """The queue this consumer reads."""
         return self._queue
+
+    @property
+    def closed(self) -> bool:
+        """Whether this consumer has been stopped."""
+        return self._closed
+
+    @property
+    def running(self) -> bool:
+        """Whether this consumer is subscribed and still has workers to hand a
+        delivery to.
+
+        What a health check reads. A consumer whose workers have all finished
+        without it being closed is a consumer the broker is still sending
+        messages to and nothing is reading — which looks identical to a quiet
+        queue from outside, and is the failure worth telling a probe about.
+        """
+        return (
+            not self._closed
+            and self._subscription is not None
+            and any(not worker.done() for worker in self._workers)
+        )
+
+    @property
+    def in_flight(self) -> int:
+        """How many messages this consumer is working on right now."""
+        return self._in_flight
+
+    @property
+    def _labels(self) -> dict[str, str]:
+        return {"queue": self._queue}
+
+    @property
+    def _observer(self) -> Observer:
+        return self._connection.observer
 
     async def _start(self, prefetch: int, tag: str, args: Mapping[str, Any]) -> None:
         self._workers = [
@@ -292,7 +357,16 @@ class Consumer:
 
     async def _handle(self, delivery: Delivery) -> None:
         envelope = Envelope.from_headers(delivery.headers, delivery.routing_key)
+        self._observer.count(METRIC_CONSUMED, 1, self._labels)
+        self._in_flight += 1
+        self._observer.gauge(METRIC_IN_FLIGHT, self._in_flight, self._labels)
+        try:
+            await self._handle_one(delivery, envelope)
+        finally:
+            self._in_flight -= 1
+            self._observer.gauge(METRIC_IN_FLIGHT, self._in_flight, self._labels)
 
+    async def _handle_one(self, delivery: Delivery, envelope: Envelope) -> None:
         try:
             payload = self._codec.decode(delivery.body, delivery.content_type)
         except Exception as failure:
@@ -319,6 +393,7 @@ class Consumer:
             redelivered=delivery.redelivered,
         )
 
+        started = time.monotonic()
         try:
             decision = await consume_chain(
                 self._connection.consume_interceptors, self._run_handler
@@ -335,6 +410,14 @@ class Consumer:
             # refused message is retried and then dead-lettered rather than
             # acknowledged as though something had processed it.
             decision = Ack(Action.RETRY, failure)
+        finally:
+            # Timed around the interceptors as well as the handler, because
+            # what an operator wants to know is how long a message takes to
+            # deal with, and an interceptor that opens a transaction is part of
+            # dealing with it.
+            self._observer.observe(
+                METRIC_HANDLER_DURATION, time.monotonic() - started, self._labels
+            )
 
         # Whatever the interceptors left, rather than what arrived: one that
         # rewrote the envelope on the way in meant that rewrite for the retry
@@ -378,10 +461,12 @@ class Consumer:
 
     async def _settle(self, delivery: Delivery, envelope: Envelope, decision: Ack) -> None:
         if decision.action is Action.ACCEPT:
+            self._observer.count(METRIC_ACCEPTED, 1, self._labels)
             await delivery.ack()
             return
 
         if decision.action is Action.REJECT:
+            self._observer.count(METRIC_REJECTED, 1, self._labels)
             await self._dead_letter(
                 delivery, envelope, f"the handler rejected it: {_describe(decision.error)}"
             )
@@ -463,6 +548,11 @@ class Consumer:
             # rungs. Loud, because a topology that declares the queue without its
             # rungs will otherwise look like it works right up until a long
             # backoff quietly becomes a held prefetch slot.
+            # Counted as well as logged, because this is the one failure here
+            # that nothing else shows: the message is still retried and the wait
+            # still happens, so a dashboard reads as normal while the reason the
+            # rung exists is quietly gone.
+            self._observer.count(METRIC_RUNG_MISSING, 1, {**self._labels, "rung": rung})
             log.error(
                 "acemq: %s is not on the broker, so %s will wait %s in this consumer "
                 "instead; declare it with Topology().queue(%r, retry=policy)",
@@ -473,6 +563,7 @@ class Consumer:
             )
             return False
 
+        self._observer.count(METRIC_RETRIED, 1, {**self._labels, "where": "broker"})
         log.info(
             "acemq: retrying %s from %s, attempt %d of %d, after %s in %s",
             envelope.id,
@@ -515,6 +606,7 @@ class Consumer:
             await delivery.nack(True)
             return
 
+        self._observer.count(METRIC_RETRIED, 1, {**self._labels, "where": "consumer"})
         log.info(
             "acemq: retrying %s from %s, attempt %d of %d, after %s",
             envelope.id,
@@ -532,6 +624,7 @@ class Consumer:
         has to look at it, and what they need to know first is that it was
         unreadable rather than unlucky.
         """
+        self._observer.count(METRIC_PARKED, 1, self._labels)
         await self._set_aside(delivery, envelope, naming.parked_queue(self._queue), reason)
 
     async def _dead_letter(self, delivery: Delivery, envelope: Envelope, reason: str) -> None:
@@ -549,6 +642,7 @@ class Consumer:
         dead-letter queue reads it back through the API rather than having to
         know the wire header name.
         """
+        self._observer.count(METRIC_DEAD_LETTERED, 1, self._labels)
         await self._set_aside(
             delivery, envelope, naming.dead_letter_queue(self._queue), reason
         )
@@ -563,6 +657,9 @@ class Consumer:
             # Rejected rather than acknowledged: without a dead-letter queue to
             # put it in, the broker's own dead-lettering is the last thing left
             # between this message and nothing.
+            self._observer.count(
+                METRIC_SET_ASIDE_FAILED, 1, {**self._labels, "target": target}
+            )
             log.error(
                 "acemq: cannot move %s to %s (%s); rejecting it to the broker instead",
                 envelope.id,
@@ -670,6 +767,8 @@ class Connection:
         connection in, outermost first. See :mod:`acemq_amqp.interceptors`
     :param on_consume: the same around every handler.
         :meth:`intercept_publish` and :meth:`intercept_consume` add more later
+    :param observer: where the numbers go. Nothing by default, so a service
+        that wants none pays for none. See :mod:`acemq_amqp.telemetry`
     """
 
     def __init__(
@@ -682,10 +781,12 @@ class Connection:
         prefetch: int = DEFAULT_PREFETCH,
         on_publish: Sequence[PublishInterceptor] = (),
         on_consume: Sequence[ConsumeInterceptor] = (),
+        observer: Observer | None = None,
     ) -> None:
         if prefetch < 0:
             raise ValueError(f"acemq: prefetch must not be negative, got {prefetch}")
         self._transport = transport
+        self._observer: Observer = observer or NullObserver()
         self._codec = codec or JsonCodec()
         self._origin = origin or default_origin()
         self._retry = retry or no_retry()
@@ -714,6 +815,102 @@ class Connection:
     def retry(self) -> RetryPolicy:
         """The retry policy consumers use unless told otherwise."""
         return self._retry
+
+    @property
+    def observer(self) -> Observer:
+        """Where this connection's numbers go."""
+        return self._observer
+
+    @property
+    def consumers(self) -> tuple[Consumer, ...]:
+        """The consumers running on this connection.
+
+        A snapshot, and public because a health check that has to say whether
+        the consumers are alive should not need private access to find them —
+        the same rule an interceptor follows.
+        """
+        return tuple(self._consumers)
+
+    @property
+    def closed(self) -> bool:
+        """Whether this connection has been closed."""
+        return self._closed
+
+    async def health(self) -> HealthReport:
+        """Whether this connection can reach its broker, and its consumers run.
+
+        The broker half is a declaration of a temporary queue, which is the
+        cheapest thing AMQP offers that actually proves the connection works. A
+        TCP connection that is open but wedged — the broker paused, the network
+        black-holing — answers a socket-level check exactly as a healthy one
+        does, right up until something is asked of it.
+
+        The consumer half is the one a probe usually wants and nothing outside
+        can see. A consumer whose workers have died without it being closed is
+        one the broker is still sending messages to and nothing is reading, and
+        from outside that is indistinguishable from a quiet queue.
+
+        It costs a round trip, so it is not something to call per request. Wire
+        it to a readiness probe and let the probe's interval decide how often.
+
+        :returns: the report. Degraded means working but worth an alert
+        """
+        checked = datetime.now(timezone.utc)
+        consumers = self.consumers
+        stalled = [consumer.queue for consumer in consumers if not consumer.running]
+        parts: dict[str, Any] = {
+            "consumers": len(consumers),
+            "in-flight": sum(consumer.in_flight for consumer in consumers),
+        }
+
+        if self._closed:
+            return HealthReport(
+                HealthStatus.DOWN, "the connection has been closed", checked, parts
+            )
+
+        # Asking whether a queue nothing has ever declared exists, rather than
+        # declaring a temporary one. It is the same round trip and it proves the
+        # same thing, and it creates nothing at all: an exclusive queue is only
+        # released when the channel that declared it closes, so a probe that
+        # declared one would leave a queue on the broker for the life of the
+        # connection and a new one behind every restart.
+        probe = f"acemq-health-{uuid.uuid4().hex}"
+        started = time.monotonic()
+        try:
+            await self._probe(probe)
+        except Exception as failure:
+            parts["error"] = _describe(failure)
+            return HealthReport(
+                HealthStatus.DOWN, f"the broker did not answer: {failure}", checked, parts
+            )
+        parts["round-trip"] = round(time.monotonic() - started, 4)
+
+        if stalled:
+            # Degraded rather than down: the connection works, and a replacement
+            # instance would almost certainly stall the same way. Worth waking
+            # somebody; not worth taking this one out of rotation.
+            return HealthReport(
+                HealthStatus.DEGRADED,
+                "these consumers have stopped reading: " + ", ".join(sorted(stalled)),
+                checked,
+                {**parts, "stalled": sorted(stalled)},
+            )
+        return HealthReport(HealthStatus.UP, "", checked, parts)
+
+    async def _probe(self, name: str) -> None:
+        """One round trip to the broker that leaves nothing behind.
+
+        A transport that cannot be asked whether a queue exists gets the next
+        cheapest thing: a temporary queue, removed again straight away. Both
+        prove the same thing, which is that the connection answers rather than
+        merely being open.
+        """
+        if isinstance(self._transport, QueueAdmin):
+            await self._transport.queue_exists(name)
+            return
+        await self._transport.declare_queue(
+            name, QueueSpec(durable=False, auto_delete=True, exclusive=True)
+        )
 
     @property
     def publish_interceptors(self) -> tuple[PublishInterceptor, ...]:
@@ -932,6 +1129,30 @@ class Connection:
         await self.close()
 
 
+@dataclass(frozen=True, slots=True)
+class BrokerHealth:
+    """A connection as a :class:`~acemq_amqp.telemetry.HealthCheck`.
+
+    So that a broker check and an application's own — a database, a downstream
+    service — can be handed to
+    :func:`~acemq_amqp.telemetry.aggregate_health` together, which is what a
+    readiness endpoint actually needs.
+
+    :param connection: what to ask
+    :param label: what to call it in a combined report
+    """
+
+    connection: Connection
+    label: str = "broker"
+
+    @property
+    def name(self) -> str:
+        return self.label
+
+    async def check(self) -> HealthReport:
+        return await self.connection.health()
+
+
 async def connect(
     url: str,
     *,
@@ -942,6 +1163,7 @@ async def connect(
     security: Security | None = None,
     on_publish: Sequence[PublishInterceptor] = (),
     on_consume: Sequence[ConsumeInterceptor] = (),
+    observer: Observer | None = None,
     **transport_options: Any,
 ) -> Connection:
     """Opens a connection to a broker.
@@ -968,6 +1190,7 @@ async def connect(
     :param on_publish: what to wrap every publish in, outermost first. See
         :mod:`acemq_amqp.interceptors`
     :param on_consume: what to wrap every handler in
+    :param observer: where the numbers go. See :mod:`acemq_amqp.telemetry`
     :param transport_options: passed to the transport, which for RabbitMQ is
         :func:`aio_pika.connect_robust`
     :returns: the connection
@@ -1009,6 +1232,7 @@ async def connect(
         prefetch=prefetch,
         on_publish=on_publish,
         on_consume=on_consume,
+        observer=observer,
     )
 
 
