@@ -67,6 +67,7 @@ class RabbitMQTransport:
         self._connection = connection
         self._admin: AbstractChannel | None = None
         self._publishing: AbstractChannel | None = None
+        self._pulling: AbstractChannel | None = None
         self._lock = asyncio.Lock()
 
     @classmethod
@@ -222,6 +223,28 @@ class RabbitMQTransport:
             arguments=dict(spec.args) or None,
         )
         return _Subscription(channel, source, tag)
+
+    async def pull(self, queue: str) -> Delivery | None:
+        channel = await self._pull_channel()
+        source = await channel.get_queue(queue)
+        # fail=False so an empty queue is an answer rather than an exception.
+        # no_ack stays off: a pulled message that vanished the moment it was read
+        # would make a replay that crashes half way through lose everything it
+        # had not yet republished.
+        incoming = await source.get(fail=False, no_ack=False)
+        return None if incoming is None else _delivery(incoming)
+
+    async def _pull_channel(self) -> AbstractChannel:
+        """The channel pulled messages live on.
+
+        Its own, and long-lived, because a pulled message can only be settled on
+        the channel it arrived on — and a replay deliberately holds the messages
+        it declined unsettled until its pass is over.
+        """
+        async with self._lock:
+            if self._pulling is None or self._pulling.is_closed:
+                self._pulling = await self._connection.channel()
+            return self._pulling
 
     async def queue_exists(self, name: str) -> bool:
         # A passive declaration is the only way to ask AMQP whether a queue is

@@ -48,6 +48,15 @@ from .outbox import (
     OutboxStore,
     record,
 )
+from .replay import (
+    HEADER_REPLAY_COUNT,
+    HEADER_REPLAYED_AT,
+    HEADER_REPLAYED_FROM,
+    ReplayError,
+    ReplayFilter,
+    ReplayResult,
+    replay,
+)
 from .requestreply import (
     DEFAULT_TIMEOUT,
     HEADER_ERROR,
@@ -65,6 +74,9 @@ __all__ = [
     "DEFAULT_MEMORY",
     "DEFAULT_TIMEOUT",
     "HEADER_ERROR",
+    "HEADER_REPLAYED_AT",
+    "HEADER_REPLAYED_FROM",
+    "HEADER_REPLAY_COUNT",
     "HEADER_REPLY_TO",
     "IdempotencyStore",
     "InMemoryIdempotencyStore",
@@ -72,11 +84,15 @@ __all__ = [
     "OutboxRecord",
     "OutboxRelay",
     "OutboxStore",
+    "ReplayError",
+    "ReplayFilter",
+    "ReplayResult",
     "RequestTimeoutError",
     "Requester",
     "Responder",
     "ResponderError",
     "idempotent",
     "record",
+    "replay",
     "serve",
 ]

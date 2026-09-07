@@ -63,6 +63,16 @@ class Sent:
         return self.message.headers
 
 
+@dataclass
+class Staged:
+    """A message sitting on a fake queue, waiting to be pulled."""
+
+    body: bytes
+    content_type: str | None
+    routing_key: str
+    headers: dict[str, Any]
+
+
 class FakeSubscription:
     """A subscription that does nothing but stop delivering."""
 
@@ -87,6 +97,7 @@ class FakeTransport:
     bindings: list[tuple[str, str, str]] = field(default_factory=list)
     sent: list[Sent] = field(default_factory=list)
     consumers: dict[str, Callable[[Delivery], Awaitable[None]]] = field(default_factory=dict)
+    waiting: dict[str, list[Staged]] = field(default_factory=dict)
     closed: bool = False
 
     async def declare_queue(self, name: str, spec: QueueSpec) -> None:
@@ -125,6 +136,56 @@ class FakeTransport:
 
     async def close(self) -> None:
         self.closed = True
+
+    def stage(
+        self,
+        queue: str,
+        body: bytes,
+        *,
+        headers: Mapping[str, Any] | None = None,
+        content_type: str | None = "application/json",
+        routing_key: str | None = None,
+    ) -> None:
+        """Puts a message on a queue for :meth:`pull` to find."""
+        self.waiting.setdefault(queue, []).append(
+            Staged(
+                body=body,
+                content_type=content_type,
+                routing_key=queue if routing_key is None else routing_key,
+                headers=dict(headers or {}),
+            )
+        )
+
+    async def pull(self, queue: str) -> Delivery | None:
+        """Hands over the message at the head of a queue, unsettled.
+
+        A rejected message goes back to the *head*, which is what RabbitMQ does
+        and is the detail everything about replay turns on: returning a message
+        one at a time means reading the same one for ever and never seeing what
+        is behind it.
+        """
+        waiting = self.waiting.setdefault(queue, [])
+        if not waiting:
+            return None
+        entry = waiting.pop(0)
+
+        async def ack() -> None:
+            return None
+
+        async def nack(requeue: bool) -> None:
+            if requeue:
+                waiting.insert(0, entry)
+
+        return Delivery(
+            body=entry.body,
+            content_type=entry.content_type,
+            routing_key=entry.routing_key,
+            message_id="",
+            headers=entry.headers,
+            redelivered=False,
+            ack=ack,
+            nack=nack,
+        )
 
     async def queue_exists(self, name: str) -> bool:
         return name in self.queues

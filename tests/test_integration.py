@@ -59,6 +59,8 @@ from acemq_amqp import (
     sync,
 )
 from acemq_amqp.patterns import (
+    HEADER_REPLAY_COUNT,
+    HEADER_REPLAYED_FROM,
     InMemoryIdempotencyStore,
     InMemoryOutboxStore,
     OutboxRelay,
@@ -66,6 +68,7 @@ from acemq_amqp.patterns import (
     ResponderError,
     idempotent,
     record,
+    replay,
     serve,
 )
 
@@ -442,6 +445,47 @@ async def test_a_duplicate_is_accepted_without_running_the_handler_again(
     # Accepted, not dead-lettered: the work was done, so the message has been
     # handled and nothing should be raising an alarm about it.
     assert await mq.message_count(dead_letter_queue(queue)) == 0
+
+
+async def test_a_replay_moves_dead_letters_back_and_leaves_the_rest(
+    mq: Connection, workspace: Workspace
+) -> None:
+    queue = await workspace.queue("replayed")
+    dead = dead_letter_queue(queue)
+
+    publisher = mq.publisher(routing_key=dead, mandatory=True)
+    for n, reason in enumerate(["disk full", "the database timed out", "disk full"]):
+        await publisher.send(
+            {"id": n},
+            envelope=Envelope(id=f"order-{n}", attempt=5, error=reason),
+        )
+    await until(lambda: _count(mq, dead, 3), "the dead letters were all written")
+
+    # The routing key is overridden because these were published to the
+    # dead-letter queue: keeping their own would put them straight back on it.
+    result = await replay(
+        mq,
+        dead,
+        routing_key=queue,
+        only=lambda envelope, body: "timed out" in envelope.error,
+    )
+
+    assert (result.moved, result.skipped, result.reason) == (1, 2, "drained")
+
+    back = (await collect(mq, queue))[0]
+    assert back.payload == {"id": 1}
+    assert back.envelope.id == "order-1"
+    # A fresh set of attempts, or the five-attempt policy that killed it would
+    # kill it again before a handler saw it.
+    assert back.envelope.attempt == 1
+    assert back.envelope.error == ""
+    assert back.envelope.headers[HEADER_REPLAYED_FROM] == dead
+    assert back.envelope.headers[HEADER_REPLAY_COUNT] == 1
+
+    # The two it declined are back on the dead-letter queue rather than lost:
+    # holding them unsettled is what stops a pass reading the same message for
+    # ever, and the broker returns them when the pass ends.
+    await until(lambda: _count(mq, dead, 2), "the declined messages went back")
 
 
 async def test_a_question_over_a_queue_comes_back_answered(

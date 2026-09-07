@@ -44,6 +44,7 @@ from .topology import Topology
 from .transport import (
     ConsumeSpec,
     Delivery,
+    MessageSource,
     Outbound,
     PublishResult,
     QueueAdmin,
@@ -742,6 +743,22 @@ class Connection:
         """
         return await self._transport.publish(exchange, routing_key, message)
 
+    async def pull(self, queue: str) -> Delivery | None:
+        """Takes one message off a queue, or ``None`` when there is none waiting.
+
+        For tools rather than for services: it is a round trip per message where
+        :meth:`consume` gets a stream. What it can do that a consumer cannot is
+        say that a queue is empty, which is what anything working through a
+        backlog and then stopping — a replay, a drain — has to know.
+
+        The delivery comes back unsettled, so the caller decides whether it is
+        gone or goes back.
+
+        :param queue: what to read from
+        :returns: the delivery, or ``None``
+        """
+        return await self._source().pull(queue)
+
     async def queue_exists(self, queue: str) -> bool:
         """Whether a queue is on the broker, creating nothing."""
         return await self._admin().queue_exists(queue)
@@ -758,6 +775,14 @@ class Connection:
         if not isinstance(self._transport, QueueAdmin):
             raise AceMQError(
                 f"acemq: the {type(self._transport).__name__} transport cannot manage queues"
+            )
+        return self._transport
+
+    def _source(self) -> MessageSource:
+        if not isinstance(self._transport, MessageSource):
+            raise AceMQError(
+                f"acemq: the {type(self._transport).__name__} transport cannot be "
+                "asked for one message at a time"
             )
         return self._transport
 

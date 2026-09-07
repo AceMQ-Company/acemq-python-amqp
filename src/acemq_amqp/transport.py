@@ -216,6 +216,31 @@ class Transport(Protocol):
 
 
 @runtime_checkable
+class MessageSource(Protocol):
+    """A transport that can be asked for one message instead of subscribed to.
+
+    Separate from :class:`Transport` because it answers a question a
+    subscription cannot: *is there anything left*. A consumer is told when a
+    message arrives and never told that none will, so a tool that has to work
+    through what is on a queue and then stop — a replay, a drain, a one-off
+    inspection — cannot be built on one.
+
+    It is for tools rather than for services. Pulling one message at a time is a
+    round trip per message where a consumer gets a stream, so a service built on
+    this is a slow service.
+    """
+
+    async def pull(self, queue: str) -> Delivery | None:
+        """Takes the message at the head of a queue, unsettled.
+
+        :param queue: what to read from
+        :returns: the delivery, or ``None`` when the queue has nothing waiting.
+            It comes back unsettled, so a caller that neither acknowledges nor
+            rejects it is holding it until the connection goes
+        """
+
+
+@runtime_checkable
 class QueueAdmin(Protocol):
     """A transport that can also report on and remove queues.
 
