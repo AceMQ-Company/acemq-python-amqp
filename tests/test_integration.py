@@ -682,7 +682,10 @@ def test_the_blocking_api_publishes_and_consumes(blocking: sync.SyncConnection) 
         assert got[0].payload == {"id": "7"}
         assert got[0].envelope.origin.startswith("acemq@")
     finally:
-        with contextlib.suppress(Exception):
-            blocking.delete_queue(queue)
-        with contextlib.suppress(Exception):
-            blocking.delete_queue(dead_letter_queue(queue))
+        # All three, because declaring with dead_letter=True declares all three.
+        # This test names its own queue rather than going through the workspace,
+        # so nothing else is going to tidy up after it, and one queue left on
+        # somebody's broker per run adds up quietly.
+        for name in (queue, dead_letter_queue(queue), parked_queue(queue)):
+            with contextlib.suppress(Exception):
+                blocking.delete_queue(name)
