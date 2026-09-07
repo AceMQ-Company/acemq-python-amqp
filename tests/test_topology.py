@@ -16,13 +16,16 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 from fake_transport import FakeTransport
 
-from acemq_amqp import dead_letter_queue
+from acemq_amqp import dead_letter_queue, exponential_retry, fixed_retry
 from acemq_amqp.topology import (
     DEAD_LETTER_EXCHANGE_ARG,
     DEAD_LETTER_ROUTING_KEY_ARG,
+    MESSAGE_TTL_ARG,
     Topology,
 )
 
@@ -50,6 +53,50 @@ def test_the_dead_letter_queue_does_not_dead_letter() -> None:
 
     target = next(action for action in plan if action.name == "orders.new.dlq")
     assert DEAD_LETTER_EXCHANGE_ARG not in target.detail
+
+
+def test_a_policy_declares_a_rung_for_each_of_its_long_waits() -> None:
+    # One value produces both the queues and the delays a consumer publishes to,
+    # so the two cannot drift into a retry addressed to a queue nobody declared.
+    policy = exponential_retry(6, timedelta(seconds=10))
+    topology = Topology().queue("orders.new", dead_letter=True, retry=policy)
+
+    assert topology.queues == [
+        "orders.new",
+        "orders.new.dlq",
+        "orders.new.parked",
+        "orders.new.retry.40s",
+        "orders.new.retry.80s",
+        "orders.new.retry.160s",
+    ]
+
+
+def test_a_rung_holds_a_message_for_its_delay_and_then_returns_it() -> None:
+    topology = Topology().queue("orders.new", retry=fixed_retry(3, timedelta(minutes=2)))
+    rung = next(action for action in topology.plan() if "retry" in action.name)
+
+    # The TTL is on the queue, never on the message: RabbitMQ expires only from
+    # the head, so one queue of per-message TTLs would let a long wait at the
+    # front hold back every shorter one behind it.
+    assert f"{MESSAGE_TTL_ARG}=120000" in rung.detail
+    assert f"{DEAD_LETTER_EXCHANGE_ARG}=''" in rung.detail
+    assert f"{DEAD_LETTER_ROUTING_KEY_ARG}='orders.new'" in rung.detail
+
+
+def test_a_policy_whose_waits_are_all_short_needs_no_rungs() -> None:
+    topology = Topology().queue("orders.new", retry=fixed_retry(5, timedelta(seconds=2)))
+
+    assert topology.queues == ["orders.new"]
+
+
+async def test_the_rungs_reach_the_broker_when_the_topology_is_applied() -> None:
+    transport = FakeTransport()
+    policy = fixed_retry(3, timedelta(minutes=1))
+
+    await Topology().queue("orders.new", dead_letter=True, retry=policy).apply(transport)
+
+    assert "orders.new.retry.1m" in transport.queues
+    assert transport.queues["orders.new.retry.1m"].args[MESSAGE_TTL_ARG] == 60_000
 
 
 def test_asking_for_dead_lettering_twice_is_refused_rather_than_resolved() -> None:

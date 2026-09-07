@@ -78,6 +78,79 @@ def test_an_old_message_is_given_up_on_however_few_attempts_it_has_had() -> None
     assert policy.next_delay(1, timedelta(hours=4)) is None
 
 
+def test_a_short_wait_is_spent_in_the_consumer() -> None:
+    # Below the threshold the seconds a restart loses are only seconds, and a
+    # held prefetch slot is cheaper than a queue nobody asked for.
+    wait = fixed_retry(2, timedelta(seconds=5)).next_wait(1)
+
+    assert wait is not None
+    assert wait.in_broker is False
+
+
+def test_a_long_wait_is_spent_in_the_broker() -> None:
+    # A consumer sleeping on a five-minute backoff loses the whole wait when it
+    # restarts: the broker redelivers the unacknowledged message at once, so a
+    # five-minute policy delivers in none.
+    wait = fixed_retry(2, timedelta(minutes=5)).next_wait(1)
+
+    assert wait is not None
+    assert wait.in_broker is True
+    assert wait.delay == timedelta(minutes=5)
+
+
+def test_the_threshold_is_reached_rather_than_passed() -> None:
+    at_it = fixed_retry(2, timedelta(seconds=30)).next_wait(1)
+    below_it = fixed_retry(2, timedelta(seconds=29)).next_wait(1)
+
+    assert at_it is not None and at_it.in_broker is True
+    assert below_it is not None and below_it.in_broker is False
+
+
+def test_a_broker_wait_is_never_jittered() -> None:
+    # A rung queue's TTL is fixed when it is declared, so a moved delay would
+    # name a queue that is not there. The spread is free anyway: each message's
+    # TTL starts when it arrives rather than when the batch failed.
+    policy = exponential_retry(2, timedelta(minutes=1))
+    waits = [policy.next_wait(1) for _ in range(50)]
+
+    assert all(w is not None and w.delay == timedelta(minutes=1) for w in waits)
+
+
+def test_the_threshold_moves_and_zero_turns_the_rungs_off() -> None:
+    policy = fixed_retry(2, timedelta(seconds=5)).wait_in_broker_from(timedelta(seconds=1))
+    moved = policy.next_wait(1)
+    assert moved is not None and moved.in_broker is True
+
+    # Zero is the way out, for a service that may not declare queues on its
+    # broker: nothing is long enough to reach one.
+    off = policy.wait_in_broker_from(timedelta(0)).next_wait(1)
+    assert off is not None and off.in_broker is False
+    assert off.delay == timedelta(seconds=5)
+
+
+def test_the_rungs_are_the_schedule_above_the_threshold_without_repeats() -> None:
+    # Finite, because the schedule is. That is what lets the queues be declared
+    # with the topology rather than conjured when a consumer first fails.
+    policy = exponential_retry(6, timedelta(seconds=10))
+
+    assert policy.schedule() == [
+        timedelta(seconds=10),
+        timedelta(seconds=20),
+        timedelta(seconds=40),
+        timedelta(seconds=80),
+        timedelta(seconds=160),
+    ]
+    assert policy.broker_rungs() == [
+        timedelta(seconds=40),
+        timedelta(seconds=80),
+        timedelta(seconds=160),
+    ]
+
+    # A fixed policy that waits a minute three times needs one queue, not three.
+    assert fixed_retry(4, timedelta(minutes=1)).broker_rungs() == [timedelta(minutes=1)]
+    assert no_retry().broker_rungs() == []
+
+
 def test_jitter_moves_both_ways_and_stays_inside_the_factor() -> None:
     policy = exponential_retry(2, timedelta(seconds=10))
     delays = [policy.next_delay(1) for _ in range(200)]

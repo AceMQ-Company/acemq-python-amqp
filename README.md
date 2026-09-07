@@ -145,6 +145,41 @@ advances and the count lives on the message rather than in the memory of the
 process that has been failing. The trade is that a retried message goes to the
 back of its queue rather than the front.
 
+### Where the waiting happens
+
+A short wait is spent in the consumer, which holds the delivery and one prefetch
+slot. A long one is spent in the broker, on a `{queue}.retry.{delay}` queue whose
+`x-message-ttl` is the wait and whose dead-letter target is the source queue.
+The line between them is 30 seconds by default:
+
+```python
+policy = exponential_retry(6, timedelta(seconds=10))
+policy.schedule()      # [10s, 20s, 40s, 80s, 160s]
+policy.broker_rungs()  # [40s, 80s, 160s] — one queue each
+
+await mq.declare(Topology().queue("shipping.orders", dead_letter=True, retry=policy))
+```
+
+`queue()` takes the **policy**, not a list of delays, because the rungs a
+consumer publishes to are derived from the policy it runs: a second copy of the
+list is free to drift from the first, and the way that drift shows up is a retry
+addressed to a queue nobody declared, at the moment the service is already
+failing.
+
+The threshold is there because neither answer is right at both scales. A
+consumer sleeping on a five-minute backoff loses the whole wait when it
+restarts — the broker redelivers the unacknowledged message at once, so a
+five-minute policy delivers in none. But a queue's TTL is fixed at declaration
+and cannot express a jittered delay, so **jitter applies below the threshold
+only**; above it the spread is free, because each message's TTL starts when it
+enters the rung. Move the line with `wait_in_broker_from(...)`, and pass zero to
+keep every wait in the consumer.
+
+Per-message TTL is never used, and is the trap worth naming: RabbitMQ expires
+messages only from the **head** of a queue, so one queue of per-message TTLs
+lets a ten-minute wait at the front hold back every thirty-second wait behind
+it. That is why a policy needs one queue per delay rather than one queue.
+
 **The default policy is one delivery and no second chance.** A `retry()` on a
 connection with no policy dead-letters the message and says so in the reason,
 which is louder than the alternative default — an immediate requeue, which is a

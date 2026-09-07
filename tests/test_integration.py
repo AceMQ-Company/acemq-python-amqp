@@ -32,7 +32,7 @@ import contextlib
 import os
 import threading
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from datetime import timedelta
 
 import pytest
@@ -46,6 +46,7 @@ from acemq_amqp import (
     FatalError,
     Message,
     Outbound,
+    RetryPolicy,
     Topology,
     accept,
     connect,
@@ -54,6 +55,7 @@ from acemq_amqp import (
     parked_queue,
     reject,
     retry,
+    retry_queue,
     sync,
 )
 
@@ -80,16 +82,20 @@ class Workspace:
         """A name nothing else on the broker will be using."""
         return f"{PREFIX}{self._run}.{what}"
 
-    def register(self, queue: str) -> None:
+    def register(self, queue: str, policy: RetryPolicy | None = None) -> None:
         """Remembers a queue this test declared, so it is removed afterwards."""
         self._queues += [queue, dead_letter_queue(queue), parked_queue(queue)]
+        if policy is not None:
+            self._queues += [retry_queue(queue, rung) for rung in policy.broker_rungs()]
 
-    async def queue(self, what: str) -> str:
-        """Declares a queue with its dead-letter and parked queues, and returns
-        the name."""
+    async def queue(self, what: str, policy: RetryPolicy | None = None) -> str:
+        """Declares a queue with its dead-letter, parked and rung queues, and
+        returns the name."""
         name = self.name(what)
-        await self.connection.declare(Topology().queue(name, dead_letter=True))
-        self.register(name)
+        await self.connection.declare(
+            Topology().queue(name, dead_letter=True, retry=policy)
+        )
+        self.register(name, policy)
         return name
 
     async def cleanup(self) -> None:
@@ -241,6 +247,64 @@ async def test_a_retry_really_comes_round_again_and_then_dead_letters(
     assert dead.envelope.attempt == 3
     assert "exhausted 3 attempts" in dead.envelope.error
     assert "RuntimeError: the database is down" in dead.envelope.error
+
+
+async def until(check: Callable[[], Awaitable[bool]], what: str, timeout: float = 15.0) -> None:
+    """Waits for something a broker will do in its own time.
+
+    A queue's counters move when the broker gets round to it, so a test that
+    reads one immediately after causing it reads the number from before.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if await check():
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"waited {timeout}s and {what} never happened")
+
+
+async def test_a_long_retry_waits_in_the_broker_and_comes_back(
+    mq: Connection, workspace: Workspace
+) -> None:
+    # A threshold of a second and a two-second wait, so this finishes in seconds
+    # rather than in the half hour a policy with a realistic long delay takes.
+    # The arithmetic being tested is the same at either scale.
+    policy = fixed_retry(2, timedelta(seconds=2)).wait_in_broker_from(timedelta(seconds=1))
+    queue = await workspace.queue("slow", policy)
+    rung = retry_queue(queue, timedelta(seconds=2))
+
+    assert policy.broker_rungs() == [timedelta(seconds=2)]
+    assert await mq.queue_exists(rung) is True
+
+    attempts: list[int] = []
+
+    async def handler(message: Message) -> Ack:
+        attempts.append(message.envelope.attempt)
+        return retry(RuntimeError("the warehouse is not answering"))
+
+    consumer = await mq.consume(queue, handler, retry=policy)
+    try:
+        await mq.publisher(routing_key=queue, mandatory=True).send({"id": "7"})
+
+        # The wait is the broker's: the message is sitting on the rung, and this
+        # consumer is holding nothing at all while it does.
+        await until(lambda: _count(mq, rung, 1), "the message reached the rung queue")
+        assert await mq.message_count(queue) == 0
+
+        # And the rung gives it back when the TTL expires, one attempt further on.
+        dead = (await collect(mq, dead_letter_queue(queue)))[0]
+    finally:
+        await consumer.close()
+
+    assert attempts == [1, 2]
+    assert dead.payload == {"id": "7"}
+    assert dead.envelope.attempt == 2
+    assert "exhausted 2 attempts" in dead.envelope.error
+    await until(lambda: _count(mq, rung, 0), "the rung queue emptied")
+
+
+async def _count(mq: Connection, queue: str, expected: int) -> bool:
+    return await mq.message_count(queue) == expected
 
 
 async def test_a_fatal_error_does_not_use_the_attempts_it_has_left(

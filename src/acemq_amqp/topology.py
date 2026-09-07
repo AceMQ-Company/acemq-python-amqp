@@ -38,9 +38,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any
 
 from . import naming
+from .retry import RetryPolicy
 from .transport import ExchangeSpec, QueueSpec, Transport
 
 #: Where the broker sends a message this queue rejects or expires.
@@ -49,6 +51,10 @@ DEAD_LETTER_EXCHANGE_ARG = "x-dead-letter-exchange"
 #: What routing key it is sent under, which the default exchange reads as a
 #: queue name.
 DEAD_LETTER_ROUTING_KEY_ARG = "x-dead-letter-routing-key"
+
+#: How long a message may sit on a queue before the broker expires it, in
+#: milliseconds. On the queue, never on the message: see :meth:`Topology.queue`.
+MESSAGE_TTL_ARG = "x-message-ttl"
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,9 +152,10 @@ class Topology:
         auto_delete: bool = False,
         exclusive: bool = False,
         dead_letter: bool = False,
+        retry: RetryPolicy | None = None,
         args: Mapping[str, Any] | None = None,
     ) -> Topology:
-        """Adds a queue.
+        """Adds a queue, and the queues that catch what it cannot handle.
 
         ``dead_letter`` declares ``{name}.dlq`` alongside it and points the
         broker at it, so a message this queue rejects or lets expire lands
@@ -164,12 +171,27 @@ class Topology:
         routing key, so it needs no exchange of its own. A service that already
         has a dead-letter exchange should pass it in ``args`` instead.
 
+        ``retry`` declares the rung queues that policy's long waits need: one
+        ``{name}.retry.{delay}`` per distinct delay at or above the policy's
+        threshold, each with ``x-message-ttl`` set to that delay and its
+        dead-letter target set back to this queue, so a message parked on a rung
+        returns here when its time is up.
+
+        It takes the policy rather than a list of delays on purpose. The rungs a
+        consumer will publish to are derived from the policy it is running, so
+        anything else here would be a second copy of the same list, free to drift
+        from the first — and the way that drift shows up is a retry published to
+        a queue nobody declared, at the moment the service is already failing.
+        One value produces both, or the topology is not a description of what the
+        service needs.
+
         :param name: what to call it
         :param durable: survives a broker restart
         :param auto_delete: goes away when its last consumer does
         :param exclusive: usable only by the connection that declared it
         :param dead_letter: also declare and wire ``{name}.dlq``, and declare
             ``{name}.parked``
+        :param retry: also declare the rung queues this policy's long waits use
         :param args: broker-specific arguments
         :returns: this topology
         """
@@ -212,6 +234,14 @@ class Topology:
             self._queues.append(
                 _NamedQueue(naming.parked_queue(name), QueueSpec(durable=durable))
             )
+        if retry is not None:
+            for rung in retry.broker_rungs():
+                self._queues.append(
+                    _NamedQueue(
+                        naming.retry_queue(name, rung),
+                        QueueSpec(durable=durable, args=_rung_args(name, rung)),
+                    )
+                )
         return self
 
     def binding(self, queue: str, exchange: str, routing_key: str = "") -> Topology:
@@ -338,6 +368,26 @@ class Topology:
             f"{len(self._queues)} queues, {len(self._bindings)} bindings"
         )
         return "\n".join([header, *(f"  {action}" for action in actions)])
+
+
+def _rung_args(source: str, delay: timedelta) -> dict[str, Any]:
+    """What makes a queue a rung: nothing consumes it, and it expires into
+    ``source``.
+
+    The TTL is on the queue rather than on each message, which is the whole
+    reason a policy needs several queues instead of one. RabbitMQ expires
+    messages only from the head of a queue, so a single queue holding
+    per-message TTLs releases nothing while a message with a long one sits at
+    the front: a thirty-second wait queued behind a ten-minute wait becomes a
+    ten-minute wait. The delays that come out would bear no relation to the ones
+    that went in, and the bug would only appear under the load that puts two
+    different waits on the queue at once.
+    """
+    return {
+        MESSAGE_TTL_ARG: int(delay.total_seconds() * 1000),
+        DEAD_LETTER_EXCHANGE_ARG: "",
+        DEAD_LETTER_ROUTING_KEY_ARG: source,
+    }
 
 
 def _describe(spec: QueueSpec | ExchangeSpec) -> str:

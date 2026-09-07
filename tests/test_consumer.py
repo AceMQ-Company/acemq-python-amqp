@@ -52,6 +52,7 @@ from acemq_amqp.topology import Topology
 QUEUE = "orders.new"
 DLQ = "orders.new.dlq"
 PARKED = "orders.new.parked"
+RUNG = "orders.new.retry.2m"
 
 
 @asynccontextmanager
@@ -61,11 +62,21 @@ async def running(
     policy: RetryPolicy | None = None,
     codec: Codec | None = None,
     declare_dead_letter: bool = True,
+    declare_rungs: bool = True,
 ) -> AsyncIterator[FakeTransport]:
     """A consumer on a fake broker, closed again afterwards."""
     transport = FakeTransport()
-    await Topology().queue(QUEUE, dead_letter=declare_dead_letter).apply(transport)
-    connection = Connection(transport, retry=policy or no_retry(), codec=codec or JsonCodec())
+    policy = policy or no_retry()
+    await (
+        Topology()
+        .queue(
+            QUEUE,
+            dead_letter=declare_dead_letter,
+            retry=policy if declare_rungs else None,
+        )
+        .apply(transport)
+    )
+    connection = Connection(transport, retry=policy, codec=codec or JsonCodec())
     await connection.consume(QUEUE, handler)
     try:
         yield transport
@@ -144,6 +155,52 @@ async def test_a_retry_puts_the_message_back_one_attempt_further_on() -> None:
     assert again[0].message.body == b'{"id": "7"}'
     assert settlement.acked is True
     assert transport.sent_to(DLQ) == []
+
+
+async def test_a_long_wait_is_handed_to_the_broker_rather_than_slept_through() -> None:
+    # Two minutes is longer than a consumer should hold an unacknowledged
+    # message: a restart in the middle of that wait would lose all of it.
+    policy = fixed_retry(3, timedelta(minutes=2))
+    async with running(always(retry(RuntimeError("not yet"))), policy=policy) as transport:
+        settlement = await transport.deliver(
+            QUEUE, b'{"id": "7"}', headers=wire(Envelope(id="abc"))
+        )
+
+    rung = transport.sent_to(RUNG)
+    assert len(rung) == 1
+    # The attempt advances on a rung publish exactly as it does on an immediate
+    # retry: the counter belongs to the message, not to the path it took.
+    assert rung[0].headers[headers.ATTEMPT] == 2
+    assert rung[0].headers[headers.ID] == "abc"
+    assert rung[0].message.body == b'{"id": "7"}'
+    assert transport.sent_to(QUEUE) == []
+    assert settlement.acked is True
+
+
+async def test_a_short_wait_still_goes_straight_back_to_the_queue() -> None:
+    policy = fixed_retry(3, timedelta(milliseconds=1))
+    async with running(always(retry(RuntimeError("not yet"))), policy=policy) as transport:
+        await transport.deliver(QUEUE, b"{}", headers=wire(Envelope()))
+
+    assert transport.sent_to(QUEUE)[0].headers[headers.ATTEMPT] == 2
+    assert [sent for sent in transport.sent if ".retry." in sent.routing_key] == []
+
+
+async def test_a_missing_rung_is_waited_out_here_rather_than_losing_the_message() -> None:
+    # A topology that declared the queue without its rungs is a mistake, not a
+    # reason to drop a message. The wait degrades to what this library did before
+    # there were rungs — held here, loudly — and the message still arrives. The
+    # delay is a millisecond so the test does not have to wait out a real one.
+    policy = fixed_retry(3, timedelta(milliseconds=1)).wait_in_broker_from(
+        timedelta(milliseconds=1)
+    )
+    async with running(
+        always(retry(RuntimeError("not yet"))), policy=policy, declare_rungs=False
+    ) as transport:
+        settlement = await transport.deliver(QUEUE, b"{}", headers=wire(Envelope()))
+
+    assert transport.sent_to(QUEUE)[0].headers[headers.ATTEMPT] == 2
+    assert settlement.acked is True
 
 
 async def test_the_last_attempt_dead_letters_rather_than_retrying_again() -> None:

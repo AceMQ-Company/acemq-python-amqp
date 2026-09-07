@@ -55,7 +55,14 @@ from .connection import Connection, Consumer, Handler, Message, Publisher, conne
 from .envelope import Envelope
 from .errors import AceMQError, PublishError
 from .naming import dead_letter_queue, parked_queue, retry_queue
-from .retry import RetryPolicy, exponential_retry, fixed_retry, no_retry
+from .retry import (
+    DEFAULT_BROKER_WAIT_THRESHOLD,
+    RetryPolicy,
+    Wait,
+    exponential_retry,
+    fixed_retry,
+    no_retry,
+)
 from .topology import Topology
 from .transport import (
     ConsumeSpec,
@@ -80,6 +87,7 @@ __version__ = "0.1.0"
 
 __all__ = [
     "BYTES_CONTENT_TYPE",
+    "DEFAULT_BROKER_WAIT_THRESHOLD",
     "JSON_CONTENT_TYPE",
     "TEXT_CONTENT_TYPE",
     "AceMQError",
@@ -107,6 +115,7 @@ __all__ = [
     "TextCodec",
     "Topology",
     "Transport",
+    "Wait",
     "__version__",
     "accept",
     "codec_by_name",

@@ -318,8 +318,8 @@ class Consumer:
             )
             return
 
-        delay = self._retry.next_delay(envelope.attempt, envelope.age)
-        if delay is None:
+        wait = self._retry.next_wait(envelope.attempt, envelope.age)
+        if wait is None:
             await self._dead_letter(
                 delivery,
                 envelope,
@@ -327,15 +327,18 @@ class Consumer:
             )
             return
 
-        if delay > ZERO:
-            # Waiting here holds the delivery, and so holds one of this
-            # consumer's prefetch slots. That is the honest cost of delaying a
-            # retry without a queue per delay: the alternative is a rung of
-            # timed queues, which is more moving parts than most services want
-            # and is what naming.retry_queue is there for when they do.
-            await asyncio.sleep(delay.total_seconds())
+        if wait.in_broker and await self._retry_in_broker(delivery, envelope, wait.delay):
+            return
 
-        await self._retry_again(delivery, envelope, delay)
+        if wait.delay > ZERO:
+            # Waiting here holds the delivery, and so holds one of this
+            # consumer's prefetch slots. For a wait of a few seconds that is the
+            # cheaper of the two costs; for a longer one it is not, which is why
+            # the policy has a threshold and the long waits went to a rung queue
+            # a few lines above.
+            await asyncio.sleep(wait.delay.total_seconds())
+
+        await self._retry_again(delivery, envelope, wait.delay)
 
     def _exhausted(self, envelope: Envelope) -> str:
         """Why there is no next attempt, in words an operator can act on."""
@@ -343,6 +346,64 @@ class Consumer:
             attempts = self._retry.max_attempts
             return f"exhausted {attempts} attempt{'' if attempts == 1 else 's'}"
         return f"exceeded the maximum message age of {self._retry.max_message_age}"
+
+    async def _retry_in_broker(
+        self, delivery: Delivery, envelope: Envelope, delay: timedelta
+    ) -> bool:
+        """Parks the message on ``{queue}.retry.{delay}`` and lets the broker
+        return it.
+
+        The rung's ``x-message-ttl`` is the delay and its dead-letter target is
+        this queue, so the wait costs nothing here: no delivery held, no prefetch
+        slot spent, and — the reason it exists — nothing lost when this process
+        restarts halfway through. A consumer sleeping on a five-minute backoff
+        that dies at minute one does not resume at minute one; the broker
+        redelivers the unacknowledged message immediately, and the policy that
+        said five minutes delivers in none.
+
+        The obvious simplification is one rung queue and a per-message
+        ``expiration`` instead of several with fixed TTLs. It does not work.
+        RabbitMQ only ever expires the message at the *head* of a queue, so a
+        message with a ten-minute TTL at the front holds back every thirty-second
+        one behind it, and the delays that come out bear no resemblance to the
+        ones that went in. Never set a per-message TTL for this.
+
+        The attempt advances here exactly as it does on an immediate retry: the
+        counter belongs to the message, and a message that has been round the
+        broker is no less on its second attempt than one that waited here.
+
+        :returns: whether the rung took it. ``False`` means no such queue, and
+            the caller should fall back to waiting here
+        """
+        rung = naming.retry_queue(self._queue, delay)
+        next_attempt = envelope.with_(attempt=envelope.attempt + 1)
+        if not await self._republish(delivery, rung, next_attempt):
+            # Degraded rather than fatal: the message is still deliverable, and
+            # waiting for it here is what this library did before there were
+            # rungs. Loud, because a topology that declares the queue without its
+            # rungs will otherwise look like it works right up until a long
+            # backoff quietly becomes a held prefetch slot.
+            log.error(
+                "acemq: %s is not on the broker, so %s will wait %s in this consumer "
+                "instead; declare it with Topology().queue(%r, retry=policy)",
+                rung,
+                envelope.id,
+                delay,
+                self._queue,
+            )
+            return False
+
+        log.info(
+            "acemq: retrying %s from %s, attempt %d of %d, after %s in %s",
+            envelope.id,
+            self._queue,
+            next_attempt.attempt,
+            self._retry.max_attempts,
+            delay,
+            rung,
+        )
+        await delivery.ack()
+        return True
 
     async def _retry_again(
         self, delivery: Delivery, envelope: Envelope, delay: timedelta
