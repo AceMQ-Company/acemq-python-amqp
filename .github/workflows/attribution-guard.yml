@@ -1,0 +1,31 @@
+name: attribution-guard
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Runs the same script contributors run locally, so a clean local check and
+      # a clean CI check cannot disagree. It already excludes the enforcement
+      # files, which by their nature must name the strings they forbid.
+      - name: Scan commit messages and working tree
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -n "$BASE_SHA" ] && git cat-file -e "$BASE_SHA" 2>/dev/null; then
+            range="$BASE_SHA..HEAD"
+          else
+            range="HEAD"
+          fi
+          echo "scanning range: $range"
+          ./scripts/attribution-guard.sh --range "$range"

@@ -1,0 +1,82 @@
+# Build and test on every Python this library promises to run on.
+#
+# The contract layer has no dependencies and needs no broker, so it runs on the
+# whole matrix and takes seconds. Anything that needs a broker is marked
+# `integration` and runs in its own job against a service container, once —
+# running it four times would learn the same thing four times.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 is the floor and the one the type hints are written against;
+        # the rest are what people actually run.
+        python: ['3.10', '3.11', '3.12', '3.13']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Test
+        # Not the integration tests: they need a broker, and they have a job.
+        run: pytest -m "not integration" -q
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Types
+        # Strict, and on the tests as well as the source: a library whose type
+        # hints are wrong is worse than one with none, because the wrong ones
+        # are believed.
+        run: mypy
+
+  integration:
+    name: against a real broker
+    runs-on: ubuntu-latest
+    services:
+      broker:
+        image: rabbitmq:4-alpine
+        ports: ['5672:5672']
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Test against the broker
+        env:
+          ACEMQ_TEST_BROKER: amqp://guest:guest@localhost:5672/
+        run: pytest -m integration -q

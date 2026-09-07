@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "acemq-amqp"
+version = "0.1.0"
+description = "AceMQ messaging over AMQP for Python, speaking the same wire contract as the Java, Go and .NET libraries"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "AceMQ" }]
+keywords = ["amqp", "rabbitmq", "messaging", "acemq"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: System :: Networking",
+  "Typing :: Typed",
+]
+
+# The contract layer has no dependencies at all: headers, retry arithmetic and
+# naming are pure Python, and a project that only wants to read an AceMQ
+# envelope should not be made to install a broker client to do it. The
+# transport arrives as an extra.
+dependencies = []
+
+[project.optional-dependencies]
+rabbitmq = ["aio-pika>=9.4"]
+dev = [
+  "aio-pika>=9.4",
+  "mypy>=1.11",
+  "pytest>=8.0",
+  "pytest-asyncio>=0.24",
+  "ruff>=0.6",
+]
+
+[project.urls]
+Homepage = "https://acemq.org"
+Source = "https://github.com/AceMQ-Company/acemq-python-amqp"
+Issues = "https://github.com/AceMQ-Company/acemq-python-amqp/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/acemq_amqp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Integration tests need a broker and are marked, so `pytest` on a laptop with
+# no Docker runs everything that does not.
+markers = ["integration: needs a running broker"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 96
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+files = ["src", "tests"]

@@ -1,0 +1,40 @@
+{
+  "generatedBy": "acemq-java-amqp FixtureGen",
+  "contract": "the headers an AceMQ publish puts on the wire",
+  "cases": [
+    {
+      "case": "minimal",
+      "routingKey": "fx.plain",
+      "messageId": "d0ab571d-b32e-4fb3-8619-82893eae827b",
+      "body": "\"{\\\"id\\\":\\\"o-1\\\"}\"",
+      "contentType": "application/json",
+      "headers": {
+        "x-acemq-attempt": 1  ,
+        "x-acemq-correlation": "d0ab571d-b32e-4fb3-8619-82893eae827b"  ,
+        "x-acemq-first-seen": 1788487649870  ,
+        "x-acemq-id": "d0ab571d-b32e-4fb3-8619-82893eae827b"  ,
+        "x-acemq-origin": "acemq@Kenshi.local"  ,
+        "x-acemq-type": "fx.plain"  ,
+        "x-acemq-version": 1  
+      }
+    },
+    {
+      "case": "populated",
+      "routingKey": "fx.rich",
+      "messageId": "11111111-2222-3333-4444-555555555555",
+      "body": "\"{\\\"id\\\":\\\"o-2\\\"}\"",
+      "contentType": "application/json",
+      "headers": {
+        "x-acemq-attempt": 1  ,
+        "x-acemq-causation": "cause-1"  ,
+        "x-acemq-correlation": "corr-1"  ,
+        "x-acemq-first-seen": 1767323045678  ,
+        "x-acemq-id": "11111111-2222-3333-4444-555555555555"  ,
+        "x-acemq-origin": "orders@host-7"  ,
+        "x-acemq-type": "order.placed"  ,
+        "x-acemq-version": 3  ,
+        "x-tenant": "acme"  
+      }
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+# One grep -E pattern per line; # for comments.
+#
+# A virtualenv holds other people's packages, and their documentation is theirs
+# to word. Scanning it says nothing about what this repository wrote.
+^\./\.venv/
