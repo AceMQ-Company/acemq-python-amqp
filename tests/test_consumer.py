@@ -51,6 +51,7 @@ from acemq_amqp.topology import Topology
 
 QUEUE = "orders.new"
 DLQ = "orders.new.dlq"
+PARKED = "orders.new.parked"
 
 
 @asynccontextmanager
@@ -230,10 +231,14 @@ async def test_a_body_that_will_not_decode_never_reaches_the_handler() -> None:
         await transport.deliver(QUEUE, b"{not json", headers=wire(Envelope()))
 
     assert seen == []
-    # Dead-lettered rather than retried: a body that will not decode decodes no
-    # better next time, and the attempts left would all be spent the same way.
+    # Not retried: a body that will not decode decodes no better next time, and
+    # the attempts left would all be spent the same way.
     assert transport.sent_to(QUEUE) == []
-    assert "could not be decoded" in transport.sent_to(DLQ)[0].headers[headers.ERROR]
+    # Parked, not dead-lettered. A message that failed five times and a message
+    # nothing could read are different problems with different answers, and
+    # whoever drains the dead letters should not have to sort them by hand.
+    assert transport.sent_to(DLQ) == []
+    assert "could not be decoded" in transport.sent_to(PARKED)[0].headers[headers.ERROR]
 
 
 async def test_a_handler_sees_the_envelope_that_travelled_with_the_message() -> None:

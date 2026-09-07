@@ -252,10 +252,15 @@ class Consumer:
         try:
             payload = self._codec.decode(delivery.body, delivery.content_type)
         except Exception as failure:
-            # A body that will not decode decodes no better next time, so this
-            # goes straight to the dead-letter queue rather than round the retry
-            # schedule until it ages out.
-            await self._dead_letter(
+            # A body that will not decode decodes no better next time, so it
+            # does not go round the retry schedule until it ages out.
+            #
+            # Parked rather than dead-lettered: a message that failed five times
+            # and a message nothing could read are different problems with
+            # different answers — one is usually the world, the other is usually
+            # a producer — and whoever drains the dead letters should not have
+            # to sort them by hand.
+            await self._park(
                 delivery, envelope, f"could not be decoded: {_describe(failure)}"
             )
             return
@@ -379,6 +384,15 @@ class Consumer:
         )
         await delivery.ack()
 
+    async def _park(self, delivery: Delivery, envelope: Envelope, reason: str) -> None:
+        """Sends the message to ``{queue}.parked`` with the reason attached.
+
+        Where a message goes when it never reached the handler at all. Somebody
+        has to look at it, and what they need to know first is that it was
+        unreadable rather than unlucky.
+        """
+        await self._set_aside(delivery, envelope, naming.parked_queue(self._queue), reason)
+
     async def _dead_letter(self, delivery: Delivery, envelope: Envelope, reason: str) -> None:
         """Sends the message to ``{queue}.dlq`` with the reason attached, and
         acknowledges the original.
@@ -394,7 +408,14 @@ class Consumer:
         dead-letter queue reads it back through the API rather than having to
         know the wire header name.
         """
-        target = naming.dead_letter_queue(self._queue)
+        await self._set_aside(
+            delivery, envelope, naming.dead_letter_queue(self._queue), reason
+        )
+
+    async def _set_aside(
+        self, delivery: Delivery, envelope: Envelope, target: str, reason: str
+    ) -> None:
+        """Republishes to ``target`` with the reason, then acknowledges."""
         failed = envelope.with_(error=reason)
         delivered = await self._republish(delivery, target, failed)
         if not delivered:
@@ -402,7 +423,7 @@ class Consumer:
             # put it in, the broker's own dead-lettering is the last thing left
             # between this message and nothing.
             log.error(
-                "acemq: cannot dead-letter %s to %s (%s); rejecting it to the broker instead",
+                "acemq: cannot move %s to %s (%s); rejecting it to the broker instead",
                 envelope.id,
                 target,
                 reason,
@@ -411,7 +432,7 @@ class Consumer:
             return
 
         log.warning(
-            "acemq: dead-lettered %s from %s after %d attempts to %s: %s",
+            "acemq: set aside %s from %s after %d attempts, into %s: %s",
             envelope.id,
             self._queue,
             envelope.attempt,

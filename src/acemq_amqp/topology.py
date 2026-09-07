@@ -152,10 +152,13 @@ class Topology:
 
         ``dead_letter`` declares ``{name}.dlq`` alongside it and points the
         broker at it, so a message this queue rejects or lets expire lands
-        somewhere an operator can find by name rather than disappearing. The
-        dead-letter queue gets no wiring of its own: a dead-letter queue that
-        dead-letters is a loop, and a loop is how a poison message becomes an
-        outage.
+        somewhere an operator can find by name rather than disappearing. It
+        declares ``{name}.parked`` too, because a consumer on this queue sends
+        anything it cannot decode there — and a library that parks messages into
+        a queue nobody declared has only moved the disappearance somewhere else.
+
+        Neither gets wiring of its own: a dead-letter queue that dead-letters is
+        a loop, and a loop is how a poison message becomes an outage.
 
         The wiring goes through the default exchange, with the queue name as the
         routing key, so it needs no exchange of its own. A service that already
@@ -165,7 +168,8 @@ class Topology:
         :param durable: survives a broker restart
         :param auto_delete: goes away when its last consumer does
         :param exclusive: usable only by the connection that declared it
-        :param dead_letter: also declare and wire ``{name}.dlq``
+        :param dead_letter: also declare and wire ``{name}.dlq``, and declare
+            ``{name}.parked``
         :param args: broker-specific arguments
         :returns: this topology
         """
@@ -204,6 +208,9 @@ class Topology:
         if dead_letter:
             self._queues.append(
                 _NamedQueue(naming.dead_letter_queue(name), QueueSpec(durable=durable))
+            )
+            self._queues.append(
+                _NamedQueue(naming.parked_queue(name), QueueSpec(durable=durable))
             )
         return self
 

@@ -30,7 +30,7 @@ from acemq_amqp.topology import (
 def test_dead_letter_declares_the_queue_it_names() -> None:
     topology = Topology().queue("orders.new", dead_letter=True)
 
-    assert topology.queues == ["orders.new", "orders.new.dlq"]
+    assert topology.queues == ["orders.new", "orders.new.dlq", "orders.new.parked"]
     assert topology.queues[1] == dead_letter_queue("orders.new")
 
 
@@ -111,7 +111,11 @@ async def test_applying_declares_exchanges_then_queues_then_bindings() -> None:
     await topology.apply(transport)
 
     assert list(transport.exchanges) == ["orders-events"]
-    assert list(transport.queues) == ["shipping.orders", "shipping.orders.dlq"]
+    assert list(transport.queues) == [
+        "shipping.orders",
+        "shipping.orders.dlq",
+        "shipping.orders.parked",
+    ]
     assert transport.bindings == [("shipping.orders", "orders-events", "order.placed")]
 
 

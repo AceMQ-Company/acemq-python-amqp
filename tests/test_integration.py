@@ -51,6 +51,7 @@ from acemq_amqp import (
     connect,
     dead_letter_queue,
     fixed_retry,
+    parked_queue,
     reject,
     retry,
     sync,
@@ -81,10 +82,11 @@ class Workspace:
 
     def register(self, queue: str) -> None:
         """Remembers a queue this test declared, so it is removed afterwards."""
-        self._queues += [queue, dead_letter_queue(queue)]
+        self._queues += [queue, dead_letter_queue(queue), parked_queue(queue)]
 
     async def queue(self, what: str) -> str:
-        """Declares a queue and its dead-letter queue, and returns the name."""
+        """Declares a queue with its dead-letter and parked queues, and returns
+        the name."""
         name = self.name(what)
         await self.connection.declare(Topology().queue(name, dead_letter=True))
         self.register(name)
@@ -282,15 +284,20 @@ async def test_a_body_the_codec_cannot_read_never_reaches_the_handler(
             queue,
             Outbound(body=b"not json at all", content_type="application/json"),
         )
-        dead = (await collect(mq, dead_letter_queue(queue), codec=BytesCodec()))[0]
+        parked = (await collect(mq, parked_queue(queue), codec=BytesCodec()))[0]
+        dead_letters = await mq.message_count(dead_letter_queue(queue))
     finally:
         await consumer.close()
 
     assert reached == []
-    assert "could not be decoded" in dead.envelope.error
-    # The bytes that could not be read are the bytes that arrive in the
-    # dead-letter queue, so somebody can look at what was actually sent.
-    assert dead.body == b"not json at all"
+    assert "could not be decoded" in parked.envelope.error
+    # Parked, not dead-lettered: a message that failed five times and a message
+    # nothing could read are different problems, and whoever drains the dead
+    # letters should not have to sort them by hand.
+    assert dead_letters == 0
+    # The bytes that could not be read are the bytes that arrive, so somebody
+    # can look at what was actually sent.
+    assert parked.body == b"not json at all"
 
 
 async def test_rejecting_dead_letters_without_a_second_attempt(
