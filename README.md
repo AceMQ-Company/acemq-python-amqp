@@ -13,9 +13,9 @@ consumer reads what a Java producer writes, and the fixtures generated from the
 Java implementation pin that rather than leaving it to be discovered in
 production.
 
-> **Status: in build.** The contract layer and the transport are implemented and
-> tested, the transport against a real broker as well as a fake one. Nothing is
-> published to PyPI yet.
+> **Status: in build.** The contract layer, the transport and the pattern
+> library are implemented and tested, against a real broker as well as a fake
+> one. Nothing is published to PyPI yet.
 
 ## Sending and receiving
 
@@ -202,6 +202,37 @@ candidate and the first that can actually read the body wins. `BytesCodec`
 answers for everything and hands back the bytes unchanged, which is what to read
 a dead-letter queue with: the message that went there may be exactly the one
 nothing could decode.
+
+## Patterns
+
+`acemq_amqp.patterns` holds the things every service that consumes a queue ends
+up writing for itself. They mean the same as the Go library's, because a routing
+slip written by a Go service has to be readable by a Python one; the API shape is
+Python's.
+
+```python
+from acemq_amqp.patterns import InMemoryIdempotencyStore, chain, idempotent, with_timeout
+```
+
+| | |
+|---|---|
+| `idempotent(store, handler)` | Handle a message once however many times it arrives. A duplicate is **accepted**, not rejected: the work was done |
+| `record(...)` / `OutboxRelay` | Write the message into the same transaction as the work, and let a relay publish what was committed |
+| `Requester` / `serve(...)` | Ask a question and wait for the answer. A responder's failure comes back as a failure, not as a timeout |
+| `replay(...)` | Put dead letters back, with a filter, a limit and a deadline, and a report of what it did and why it stopped |
+| `ordered(key, handler)` | Keep one entity's messages in sequence while everything else runs at once |
+| `ConsumerGroup` | Several consumers over one queue, started and stopped as one thing |
+| `RoutingSlip` / `follow_slip(...)` | An itinerary the message carries, instead of an orchestrator that knows it |
+| `chain(...)` / `then(...)` | Wrap a handler in a deadline, logging and the guards; publish what a step produced onwards |
+| `SchemaRegistry` | Remember what a message used to look like, so a producer can add a field without a synchronised deployment |
+| `read_stream(...)` | Read a queue that keeps what it has already handed out |
+
+Every one is built out of the public library — handlers, envelopes, publishers —
+so nothing is possible with a pattern that would not be possible without it. The
+storage seams (`IdempotencyStore`, `OutboxStore`, `SchemaRegistry`) are
+interfaces with in-memory implementations that say in their own docstrings why
+they are not the ones to use in production: an outbox store that does not share a
+transaction with your database has the gap the pattern exists to close.
 
 ## Requirements
 
