@@ -51,7 +51,15 @@ from .codec import (
     codec_names,
     register_codec,
 )
-from .connection import Connection, Consumer, Handler, Message, Publisher, connect
+from .connection import (
+    AsyncHandler,
+    Connection,
+    Consumer,
+    Handler,
+    Message,
+    Publisher,
+    connect,
+)
 from .envelope import Envelope
 from .errors import AceMQError, PublishError
 from .naming import dead_letter_queue, parked_queue, retry_queue
@@ -93,6 +101,7 @@ __all__ = [
     "AceMQError",
     "Ack",
     "Action",
+    "AsyncHandler",
     "BytesCodec",
     "Codec",
     "CompositeCodec",

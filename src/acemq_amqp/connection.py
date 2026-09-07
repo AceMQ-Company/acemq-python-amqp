@@ -86,6 +86,15 @@ class Message:
 #: should not have to pretend to be one.
 Handler: TypeAlias = Callable[[Message], "Ack | Awaitable[Ack]"]
 
+#: A handler that is definitely a coroutine function, which every handler
+#: :mod:`acemq_amqp.patterns` builds is.
+#:
+#: It is a :data:`Handler` and can be passed anywhere one can. The narrower name
+#: exists so that a caller who wants to run a wrapped handler directly — a test,
+#: usually — can await it without mypy pointing out that the wider type might not
+#: be awaitable.
+AsyncHandler: TypeAlias = Callable[[Message], Awaitable[Ack]]
+
 
 class Publisher:
     """Sends messages to one destination.
