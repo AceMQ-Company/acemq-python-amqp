@@ -277,6 +277,40 @@ messages only from the **head** of a queue, so one queue of per-message TTLs
 lets a ten-minute wait at the front hold back every thirty-second wait behind
 it. That is why a policy needs one queue per delay rather than one queue.
 
+### The two exchanges this library declares
+
+A rung is declared with exactly three arguments, and the same three in Java, Go
+and .NET. Two services consuming one queue declare the same rung by name, so a
+rung declared with anything else answers the second service
+`PRECONDITION_FAILED` and leaves it unable to consume at all — which is why the
+table is pinned by a test and why `rung_args(...)` is the only place it is
+written:
+
+```python
+rung_args("shipping.orders", timedelta(seconds=40))
+# {'x-message-ttl': 40000,
+#  'x-dead-letter-exchange': 'acemq.retry',
+#  'x-dead-letter-routing-key': 'shipping.orders'}
+```
+
+| Constant | Value | What it carries |
+| --- | --- | --- |
+| `RETRY_EXCHANGE` | `acemq.retry` | An expired rung message, back to the queue it came from |
+| `DEAD_LETTER_EXCHANGE` | `acemq.dlx` | The `{queue}.dlq` and `{queue}.parked` queues, each bound on its own name |
+
+Both are **direct** and **durable**, and both are declared by
+`Topology().queue(...)` when it is asked for retries or for dead-lettering — as
+is the one binding that brings an expired message home, `{queue}` to
+`acemq.retry` on `{queue}`. That binding is not optional and is not lazy: a
+direct exchange drops what it cannot route and says nothing, so a topology
+missing it loses every expired retry while the queue looks quiet.
+
+Python used to dead-letter a rung through the default exchange, which needs no
+exchange and no binding and works perfectly well on its own. Java has always
+used the named exchange, most of the released code follows Java, and two
+libraries cannot both be right about one queue. This is the settled answer, and
+a broker already carrying a Java service has the arrangement above on it.
+
 **The default policy is one delivery and no second chance.** A `retry()` on a
 connection with no policy dead-letters the message and says so in the reason,
 which is louder than the alternative default — an immediate requeue, which is a

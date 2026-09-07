@@ -86,7 +86,7 @@ from .security import (
     credentials_from_file,
     without_verifying_the_broker,
 )
-from .topology import Topology
+from .topology import DEAD_LETTER_EXCHANGE, RETRY_EXCHANGE, Topology, rung_args
 from .transport import (
     ConsumeSpec,
     Delivery,
@@ -110,8 +110,10 @@ __version__ = "0.1.0"
 
 __all__ = [
     "BYTES_CONTENT_TYPE",
+    "DEAD_LETTER_EXCHANGE",
     "DEFAULT_BROKER_WAIT_THRESHOLD",
     "JSON_CONTENT_TYPE",
+    "RETRY_EXCHANGE",
     "TEXT_CONTENT_TYPE",
     "AceMQError",
     "Ack",
@@ -162,5 +164,6 @@ __all__ = [
     "reject",
     "retry",
     "retry_queue",
+    "rung_args",
     "without_verifying_the_broker",
 ]

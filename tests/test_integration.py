@@ -43,6 +43,8 @@ import pytest
 from aiormq.exceptions import AMQPConnectionError
 
 from acemq_amqp import (
+    DEAD_LETTER_EXCHANGE,
+    RETRY_EXCHANGE,
     Ack,
     BytesCodec,
     Codec,
@@ -63,6 +65,7 @@ from acemq_amqp import (
     reject,
     retry,
     retry_queue,
+    rung_args,
     sync,
     without_verifying_the_broker,
 )
@@ -90,6 +93,7 @@ from acemq_amqp.patterns import (
     start,
     then,
 )
+from acemq_amqp.rabbitmq import RabbitMQTransport
 
 pytestmark = pytest.mark.integration
 
@@ -365,6 +369,115 @@ async def test_a_long_retry_waits_in_the_broker_and_comes_back(
 
 async def _count(mq: Connection, queue: str, expected: int) -> bool:
     return await mq.message_count(queue) == expected
+
+
+async def _consumers(mq: Connection, queue: str) -> int:
+    """How many consumers the broker thinks are attached to a queue.
+
+    Through the transport rather than through the connection, because this is
+    the one question the library does not wrap and the escape hatch is there
+    precisely for it. It is what turns "the source queue is empty" from a
+    statement about the queue into a statement about the whole system: a queue
+    can also be empty because a consumer is holding everything on it.
+    """
+    transport = mq.transport
+    assert isinstance(transport, RabbitMQTransport)
+    channel = await transport.connection.channel()
+    try:
+        found = await channel.get_queue(queue)
+        return int(found.declaration_result.consumer_count or 0)
+    finally:
+        await channel.close()
+
+
+async def _detached(mq: Connection, queue: str) -> bool:
+    return await _consumers(mq, queue) == 0
+
+
+async def test_a_rung_returns_a_message_through_the_named_retry_exchange(
+    mq: Connection, workspace: Workspace
+) -> None:
+    """The whole broker wait, one step at a time, through ``acemq.retry``.
+
+    The version of this above proves the arithmetic. This one proves the
+    routing, which is what changed: a rung no longer dead-letters through the
+    default exchange, and the binding that brings an expired message home is now
+    something the topology makes rather than something a caller remembers. A
+    missing binding does not fail — a direct exchange drops what it cannot route
+    and says nothing — so the failure it would cause is every retry disappearing
+    while the queue looks quiet.
+    """
+    delay = timedelta(seconds=5)
+    policy = fixed_retry(3, delay).wait_in_broker_from(timedelta(seconds=1))
+    queue = await workspace.queue("rung", policy)
+    rung = retry_queue(queue, delay)
+
+    # Printed so the declaration can be compared against Go, .NET and Java by
+    # eye, which is the only check that catches the three of them agreeing with
+    # each other and not with this.
+    print(f"\nrung declaration for {queue}")
+    print(f"  queue    {rung}")
+    for key, value in rung_args(queue, delay).items():
+        print(f"  argument {key} = {value!r}")
+    print(f"  exchange {RETRY_EXCHANGE} (direct, durable)")
+    print(f"  binding  {queue} -> {RETRY_EXCHANGE} -> {queue}")
+    print(f"  exchange {DEAD_LETTER_EXCHANGE} (direct, durable)")
+    print(
+        f"  binding  {dead_letter_queue(queue)} -> {DEAD_LETTER_EXCHANGE}"
+        f" -> {dead_letter_queue(queue)}"
+    )
+    print(
+        f"  binding  {parked_queue(queue)} -> {DEAD_LETTER_EXCHANGE}"
+        f" -> {parked_queue(queue)}"
+    )
+
+    # The binding is live on its own, before any retry needs it: a message put
+    # straight on the exchange under the source queue's name reaches the queue.
+    # Mandatory, so an exchange that routed it nowhere is an exception here
+    # rather than a silence in production.
+    probe = await mq.publisher(RETRY_EXCHANGE, queue, mandatory=True).send({"probe": True})
+    assert probe.routed is True
+    await until(lambda: _count(mq, queue, 1), "the probe reached the queue")
+    held = await mq.pull(queue)
+    assert held is not None
+    await held.ack()
+
+    attempts: list[int] = []
+
+    async def handler(message: Message) -> Ack:
+        attempts.append(message.envelope.attempt)
+        return retry(RuntimeError("the warehouse is not answering"))
+
+    consumer = await mq.consume(queue, handler, retry=policy)
+    await mq.publisher(routing_key=queue, mandatory=True).send({"id": "7"})
+    await until(lambda: _count(mq, rung, 1), "the message reached the rung queue")
+
+    # Closed before anything is counted. A zero on the source queue with a
+    # consumer still attached proves nothing: the consumer could be holding the
+    # message unacknowledged, which is exactly the failure the rung exists to
+    # avoid. With it gone, a zero is a zero.
+    await consumer.close()
+    await until(lambda: _detached(mq, queue), "the consumer detached")
+
+    assert attempts == [1]
+    assert await mq.message_count(rung) == 1
+    assert await mq.message_count(queue) == 0
+    assert await _consumers(mq, queue) == 0
+    print(f"  waiting  {rung} holds 1, {queue} holds 0, {queue} has 0 consumers")
+
+    # Nothing consumes a rung. The only thing that takes a message out of one is
+    # the time-to-live expiring, and the only thing that brings it back is the
+    # exchange and the binding printed above.
+    await until(lambda: _count(mq, queue, 1), "the rung returned the message", timeout=30.0)
+    assert await mq.message_count(rung) == 0
+
+    returned = await mq.pull(queue)
+    assert returned is not None
+    await returned.ack()
+    envelope = Envelope.from_headers(returned.headers, returned.routing_key)
+    assert envelope.attempt == 2
+    assert json.loads(returned.body) == {"id": "7"}
+    print(f"  returned {queue} holds 1, on attempt {envelope.attempt}, {rung} holds 0")
 
 
 async def test_a_fatal_error_does_not_use_the_attempts_it_has_left(
