@@ -68,6 +68,16 @@ from .connection import (
 )
 from .envelope import Envelope
 from .errors import AceMQError, PublishError, SecurityError
+from .interceptors import (
+    ConsumeContext,
+    ConsumeInterceptor,
+    ConsumeNext,
+    PublishContext,
+    PublishInterceptor,
+    PublishNext,
+    consume_chain,
+    publish_chain,
+)
 from .naming import dead_letter_queue, parked_queue, retry_queue
 from .retry import (
     DEFAULT_BROKER_WAIT_THRESHOLD,
@@ -123,6 +133,9 @@ __all__ = [
     "Codec",
     "CompositeCodec",
     "Connection",
+    "ConsumeContext",
+    "ConsumeInterceptor",
+    "ConsumeNext",
     "ConsumeSpec",
     "Consumer",
     "Credentials",
@@ -135,7 +148,10 @@ __all__ = [
     "JsonCodec",
     "Message",
     "Outbound",
+    "PublishContext",
     "PublishError",
+    "PublishInterceptor",
+    "PublishNext",
     "PublishResult",
     "Publisher",
     "QueueSpec",
@@ -152,6 +168,7 @@ __all__ = [
     "codec_by_name",
     "codec_names",
     "connect",
+    "consume_chain",
     "credentials_from_environment",
     "credentials_from_file",
     "dead_letter_queue",
@@ -160,6 +177,7 @@ __all__ = [
     "headers",
     "no_retry",
     "parked_queue",
+    "publish_chain",
     "register_codec",
     "reject",
     "retry",

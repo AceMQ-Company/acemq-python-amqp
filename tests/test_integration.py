@@ -49,11 +49,16 @@ from acemq_amqp import (
     BytesCodec,
     Codec,
     Connection,
+    ConsumeContext,
+    ConsumeNext,
     Credentials,
     Envelope,
     FatalError,
     Message,
     Outbound,
+    PublishContext,
+    PublishNext,
+    PublishResult,
     RetryPolicy,
     Security,
     Topology,
@@ -478,6 +483,48 @@ async def test_a_rung_returns_a_message_through_the_named_retry_exchange(
     assert envelope.attempt == 2
     assert json.loads(returned.body) == {"id": "7"}
     print(f"  returned {queue} holds 1, on attempt {envelope.attempt}, {rung} holds 0")
+
+
+async def test_interceptors_wrap_a_real_publish_and_a_real_handler(
+    mq: Connection, workspace: Workspace
+) -> None:
+    # The unit tests prove the chain composes. This proves the header an
+    # interceptor added really travels, and that the one on the way in really
+    # sees what came off the wire rather than what was handed to the publisher.
+    #
+    # On a connection of its own rather than the shared one, because an
+    # interceptor is registered for the life of a connection and stamping every
+    # later test in this file is not what it is here to show.
+    queue = await workspace.queue("intercepted")
+    order: list[str] = []
+    handled: list[Message] = []
+
+    async def stamping(context: PublishContext, send: PublishNext) -> PublishResult:
+        context.set_header("tenant", "acme")
+        return await send(context)
+
+    async def timing(context: ConsumeContext, handle: ConsumeNext) -> Ack:
+        order.append("in")
+        try:
+            return await handle(context)
+        finally:
+            order.append("out")
+
+    async def handler(message: Message) -> Ack:
+        handled.append(message)
+        return accept()
+
+    intercepted = await connect(BROKER, on_publish=[stamping], on_consume=[timing])
+    async with intercepted, await intercepted.consume(queue, handler):
+        await intercepted.publisher(routing_key=queue, mandatory=True).send({"id": "9"})
+        await until(lambda: _handled(handled), "the message was handled")
+
+    assert handled[0].envelope.headers["tenant"] == "acme"
+    assert order == ["in", "out"]
+
+
+async def _handled(seen: list[Message]) -> bool:
+    return len(seen) >= 1
 
 
 async def test_a_fatal_error_does_not_use_the_attempts_it_has_left(

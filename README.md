@@ -334,6 +334,69 @@ answers for everything and hands back the bytes unchanged, which is what to read
 a dead-letter queue with: the message that went there may be exactly the one
 nothing could decode.
 
+## Interceptors
+
+Every organisation has something every message needs and no library can guess: a
+tenant, a trace context, an authorisation token, a correlation identifier in the
+logging context, a timer, a size limit. Without a seam these get copied into
+every call site, where one of them is eventually forgotten and nobody finds out
+until the message that needed it is the one that went without.
+
+An interceptor is **one function handed the message and the rest of the work**:
+
+```python
+from acemq_amqp import Ack, ConsumeContext, ConsumeNext, PublishContext, PublishNext
+
+async def stamped(context: PublishContext, send: PublishNext):
+    context.set_header("tenant", tenant.current())
+    return await send(context)
+
+async def timed(context: ConsumeContext, handle: ConsumeNext) -> Ack:
+    started = time.monotonic()
+    try:
+        return await handle(context)
+    finally:
+        log.info("%s took %.3fs", context.queue, time.monotonic() - started)
+
+mq = await connect(url, on_publish=[stamped], on_consume=[timed])
+# or later, which still reaches publishers that already exist:
+mq.intercept_publish(stamped).intercept_consume(timed)
+```
+
+That shape rather than the pair of before-and-after hooks the Java library uses,
+because Python already has the construct. `try`/`finally` runs the way out in
+the reverse of the way in, nests correctly without anybody reversing a list, and
+makes an interceptor that opens something and closes it **one** function instead
+of two halves that have to agree. It composes the way ASGI middleware does.
+
+Interceptors run in the order they were registered — **first registered is
+outermost**, so it sees the message first on the way in and last on the way out.
+That matters as soon as one reads what another wrote.
+
+| | |
+|---|---|
+| `PublishContext` | `exchange`, `routing_key`, `envelope`, `payload`, `persistent`, `mandatory`, and `set_header(...)`. Seen **before the codec runs**, so the payload can be changed and not only its metadata |
+| `ConsumeContext` | `queue`, `envelope`, `payload`, `body`, `content_type`, `routing_key`, `redelivered`, and a `state` dict this library never reads |
+
+**Refusing is raising.** A publish interceptor that raises stops the publish and
+the caller sees the exception — the whole point of intercepting rather than
+observing. A consume interceptor that raises is treated exactly as a handler
+that raised: retried, then dead-lettered with the reason it gave. The
+alternative is acknowledging a message nothing processed.
+
+Whatever the interceptors left is what gets used: an envelope rewritten on the
+way in is the one the handler is given **and** the one that gets dead-lettered,
+so an operator reading `{queue}.dlq` is not missing the very field the
+interceptor exists to add.
+
+Everything an interceptor touches is public API. That is the same rule the
+patterns follow, and it is what keeps this a seam rather than a privileged back
+door: anything an interceptor can do, application code could have done.
+
+The blocking API inherits them — `sync.connect(...).connection` is the
+asynchronous connection underneath, and registering there applies to everything
+above it.
+
 ## Patterns
 
 `acemq_amqp.patterns` holds the things every service that consumes a queue ends

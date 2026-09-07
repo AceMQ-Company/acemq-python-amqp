@@ -28,7 +28,7 @@ import asyncio
 import inspect
 import logging
 import socket
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, TypeAlias
@@ -39,6 +39,14 @@ from .ack import Ack, Action, FatalError
 from .codec import Codec, JsonCodec
 from .envelope import Envelope
 from .errors import AceMQError, PublishError
+from .interceptors import (
+    ConsumeContext,
+    ConsumeInterceptor,
+    PublishContext,
+    PublishInterceptor,
+    consume_chain,
+    publish_chain,
+)
 from .retry import ZERO, RetryPolicy, no_retry
 from .security import Security
 from .topology import Topology
@@ -153,18 +161,37 @@ class Publisher:
             # origin naming the service before it would be a lie in a log line
             # somebody is going to trust.
             outgoing = outgoing.with_(origin=self._connection.origin)
-        body = self._codec.encode(payload)
+
+        context = PublishContext(
+            exchange=self._exchange,
+            routing_key=key,
+            envelope=outgoing,
+            payload=payload,
+            persistent=self._persistent,
+            mandatory=self._mandatory,
+        )
+        # Read here rather than at construction, so an interceptor registered
+        # during start-up applies to the publishers that already exist. Building
+        # the chain per message costs a few closures and buys that.
+        return await publish_chain(self._connection.publish_interceptors, self._send)(context)
+
+    async def _send(self, context: PublishContext) -> PublishResult:
+        """The innermost work: encode what the interceptors left, and send it."""
+        # Encoded here rather than before the chain ran, so an interceptor can
+        # change the payload as well as its metadata. A codec that has already
+        # run leaves an interceptor with bytes and nothing it can do to them.
+        body = self._codec.encode(context.payload)
 
         result = await self._connection.publish_raw(
-            self._exchange,
-            key,
+            context.exchange,
+            context.routing_key,
             Outbound(
                 body=body,
                 content_type=self._codec.content_type,
-                message_id=outgoing.id,
-                headers=outgoing.to_headers(routing_key=key),
-                persistent=self._persistent,
-                mandatory=self._mandatory,
+                message_id=context.envelope.id,
+                headers=context.envelope.to_headers(routing_key=context.routing_key),
+                persistent=context.persistent,
+                mandatory=context.mandatory,
             ),
         )
 
@@ -172,11 +199,11 @@ class Publisher:
         # read the result would otherwise carry on believing the message went
         # somewhere. Unroutable is the quietest failure AMQP has: the publish
         # succeeds, the consumer waits, and nothing anywhere says why.
-        if self._mandatory and not result.routed:
+        if context.mandatory and not result.routed:
             raise PublishError(
-                outgoing.id,
-                self._exchange,
-                key,
+                context.envelope.id,
+                context.exchange,
+                context.routing_key,
                 result.return_reason or "no queue is bound to receive it",
                 unroutable=True,
             )
@@ -282,18 +309,20 @@ class Consumer:
             )
             return
 
-        message = Message(
-            payload=payload,
+        context = ConsumeContext(
+            queue=self._queue,
             envelope=envelope,
-            routing_key=delivery.routing_key,
-            content_type=delivery.content_type,
-            redelivered=delivery.redelivered,
+            payload=payload,
             body=delivery.body,
+            content_type=delivery.content_type,
+            routing_key=delivery.routing_key,
+            redelivered=delivery.redelivered,
         )
 
         try:
-            returned = self._handler(message)
-            decision = await returned if inspect.isawaitable(returned) else returned
+            decision = await consume_chain(
+                self._connection.consume_interceptors, self._run_handler
+            )(context)
         except Exception as failure:
             # An exception is how Python says a thing failed, so a handler that
             # raises is asking for the retry policy rather than confessing a
@@ -301,7 +330,16 @@ class Consumer:
             # handler written without reading the documentation will expect.
             # Raising FatalError is how it says the opposite, and the retry path
             # below reads that mark before it reads the request.
+            #
+            # An interceptor that raises lands here too, and deliberately: a
+            # refused message is retried and then dead-lettered rather than
+            # acknowledged as though something had processed it.
             decision = Ack(Action.RETRY, failure)
+
+        # Whatever the interceptors left, rather than what arrived: one that
+        # rewrote the envelope on the way in meant that rewrite for the retry
+        # and the dead letter as much as for the handler.
+        envelope = context.envelope
 
         if not isinstance(decision, Ack):
             await self._dead_letter(
@@ -312,6 +350,31 @@ class Consumer:
             return
 
         await self._settle(delivery, envelope, decision)
+
+    async def _run_handler(self, context: ConsumeContext) -> Ack:
+        """The innermost work: build the message the interceptors left, and run
+        the handler on it.
+
+        The message is built here rather than before the chain, so that an
+        interceptor which changed the envelope or the payload changed what the
+        handler is given rather than a copy nobody reads.
+        """
+        message = Message(
+            payload=context.payload,
+            envelope=context.envelope,
+            routing_key=context.routing_key,
+            content_type=context.content_type,
+            redelivered=context.redelivered,
+            body=context.body,
+        )
+        returned = self._handler(message)
+        # Not an Ack is a mistake worth reporting, but it is not this method's
+        # to report: it is returned as it stands and _handle dead-letters it
+        # with a reason, which is where every other unhandleable delivery goes.
+        # An interceptor between here and there sees the same thing the handler
+        # returned, which is the honest thing to show it.
+        decision: Ack = await returned if inspect.isawaitable(returned) else returned
+        return decision
 
     async def _settle(self, delivery: Delivery, envelope: Envelope, decision: Ack) -> None:
         if decision.action is Action.ACCEPT:
@@ -603,6 +666,10 @@ class Connection:
         immediate requeue, which is a hot loop against a broker that nobody
         asked for
     :param prefetch: how many unacknowledged messages a consumer holds
+    :param on_publish: cross-cutting behaviour to wrap every publish on this
+        connection in, outermost first. See :mod:`acemq_amqp.interceptors`
+    :param on_consume: the same around every handler.
+        :meth:`intercept_publish` and :meth:`intercept_consume` add more later
     """
 
     def __init__(
@@ -613,6 +680,8 @@ class Connection:
         origin: str | None = None,
         retry: RetryPolicy | None = None,
         prefetch: int = DEFAULT_PREFETCH,
+        on_publish: Sequence[PublishInterceptor] = (),
+        on_consume: Sequence[ConsumeInterceptor] = (),
     ) -> None:
         if prefetch < 0:
             raise ValueError(f"acemq: prefetch must not be negative, got {prefetch}")
@@ -622,6 +691,8 @@ class Connection:
         self._retry = retry or no_retry()
         self._prefetch = prefetch
         self._consumers: list[Consumer] = []
+        self._publishing: list[PublishInterceptor] = list(on_publish)
+        self._consuming: list[ConsumeInterceptor] = list(on_consume)
         self._closed = False
 
     @property
@@ -643,6 +714,49 @@ class Connection:
     def retry(self) -> RetryPolicy:
         """The retry policy consumers use unless told otherwise."""
         return self._retry
+
+    @property
+    def publish_interceptors(self) -> tuple[PublishInterceptor, ...]:
+        """What wraps every publish, outermost first.
+
+        A snapshot rather than the list itself, so a publish in progress cannot
+        be handed a chain that is being edited underneath it.
+        """
+        return tuple(self._publishing)
+
+    @property
+    def consume_interceptors(self) -> tuple[ConsumeInterceptor, ...]:
+        """What wraps every handler, outermost first."""
+        return tuple(self._consuming)
+
+    def intercept_publish(self, interceptor: PublishInterceptor) -> Connection:
+        """Wraps every publish on this connection in ``interceptor``.
+
+        Registered ones run in the order they were added, so this one is
+        innermost until the next is added. Read at publish time rather than
+        copied into each publisher, so an interceptor registered during start-up
+        applies to publishers that already exist — which is what makes it usable
+        from a framework's wiring rather than only from the line that connects.
+
+        Adding at start-up is still what to do. A message already in flight will
+        not see it, and an interceptor whose whole job is to stamp every message
+        is not doing it if the first few went without.
+
+        :param interceptor: what to wrap the publish in. See
+            :mod:`acemq_amqp.interceptors`
+        :returns: this connection, so registrations read as one expression
+        """
+        self._publishing.append(interceptor)
+        return self
+
+    def intercept_consume(self, interceptor: ConsumeInterceptor) -> Connection:
+        """Wraps every handler on this connection in ``interceptor``.
+
+        :param interceptor: what to wrap the handler in
+        :returns: this connection
+        """
+        self._consuming.append(interceptor)
+        return self
 
     async def declare(self, topology: Topology) -> None:
         """Applies a topology to this connection's broker.
@@ -826,6 +940,8 @@ async def connect(
     retry: RetryPolicy | None = None,
     prefetch: int = DEFAULT_PREFETCH,
     security: Security | None = None,
+    on_publish: Sequence[PublishInterceptor] = (),
+    on_consume: Sequence[ConsumeInterceptor] = (),
     **transport_options: Any,
 ) -> Connection:
     """Opens a connection to a broker.
@@ -849,6 +965,9 @@ async def connect(
     :param prefetch: how many unacknowledged messages a consumer holds
     :param security: how to verify the broker and who to log in as. See
         :class:`~acemq_amqp.Security`
+    :param on_publish: what to wrap every publish in, outermost first. See
+        :mod:`acemq_amqp.interceptors`
+    :param on_consume: what to wrap every handler in
     :param transport_options: passed to the transport, which for RabbitMQ is
         :func:`aio_pika.connect_robust`
     :returns: the connection
@@ -882,7 +1001,15 @@ async def connect(
         ) from missing
 
     transport = await RabbitMQTransport.connect(url, **transport_options)
-    return Connection(transport, codec=codec, origin=origin, retry=retry, prefetch=prefetch)
+    return Connection(
+        transport,
+        codec=codec,
+        origin=origin,
+        retry=retry,
+        prefetch=prefetch,
+        on_publish=on_publish,
+        on_consume=on_consume,
+    )
 
 
 def default_origin() -> str:
