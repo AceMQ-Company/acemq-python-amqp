@@ -13,35 +13,77 @@ consumer reads what a Java producer writes, and the fixtures generated from the
 Java implementation pin that rather than leaving it to be discovered in
 production.
 
-> **Status: in build.** The contract layer — envelope, retry schedule, naming,
-> acknowledgement model — is implemented and tested against the shared
-> fixtures. The transport is next. Nothing is published to PyPI yet.
+> **Status: in build.** The contract layer and the transport are implemented and
+> tested, the transport against a real broker as well as a fake one. Nothing is
+> published to PyPI yet.
 
-## What is here today
+## Sending and receiving
 
 ```python
+import asyncio
 from datetime import timedelta
 
-from acemq_amqp import Envelope, exponential_retry, dead_letter_queue
+from acemq_amqp import (
+    Ack, Message, Topology, accept, connect, exponential_retry, retry,
+)
 
-# What travels with a message, and what another language will read back.
-envelope = Envelope(type="order.placed.v2", origin="checkout@pod-7")
-headers = envelope.to_headers(routing_key="order.placed")
 
-# The same schedule Java, Go and .NET produce for the same policy.
-policy = exponential_retry(5, timedelta(seconds=1), timedelta(minutes=1))
-policy.schedule()          # [1s, 2s, 4s, 8s]
+async def main() -> None:
+    async with await connect(
+        "amqp://guest:guest@localhost:5672/",
+        origin="checkout@pod-7",
+        retry=exponential_retry(5, timedelta(seconds=1), timedelta(minutes=1)),
+    ) as mq:
+        # Everything this service needs the broker to have, in one description
+        # somebody can read before it is applied.
+        await mq.declare(
+            Topology()
+            .exchange("orders-events", "topic")
+            .queue("shipping.orders", dead_letter=True)
+            .binding("shipping.orders", "orders-events", "order.placed")
+        )
 
-dead_letter_queue("orders.new")   # "orders.new.dlq"
+        async def ship(message: Message) -> Ack:
+            if not warehouse_is_up():
+                return retry(RuntimeError("the warehouse is not answering"))
+            place(message.payload)
+            return accept()
+
+        consumer = await mq.consume("shipping.orders", ship)
+
+        await mq.publisher("orders-events", "order.placed").send({"id": "7"})
+        await asyncio.sleep(5)
+        await consumer.close()
+
+
+asyncio.run(main())
 ```
 
-The contract layer has **no dependencies**. Reading an AceMQ envelope should
-not require installing a broker client, so the transport is an extra:
+The transport is an extra, because reading an AceMQ envelope should not require
+installing a broker client:
 
 ```bash
-pip install acemq-amqp              # the contract
+pip install acemq-amqp              # the contract, no dependencies at all
 pip install "acemq-amqp[rabbitmq]"  # and a way to talk to a broker
 ```
+
+### Not running an event loop?
+
+```python
+from acemq_amqp import Topology, accept, sync
+
+with sync.connect("amqp://guest:guest@localhost:5672/") as mq:
+    mq.declare(Topology().queue("shipping.orders", dead_letter=True))
+    mq.publisher(routing_key="shipping.orders").send({"id": "7"})
+
+    with mq.consume("shipping.orders", lambda message: accept()):
+        ...
+```
+
+It is a facade, not a second implementation: a loop runs on a thread of its own
+and every call is handed to it, so the envelope rules and the retry engine are
+the ones above rather than a copy that can drift. Handlers run on a worker
+thread, so a blocking handler blocks nothing but itself.
 
 ## What is identical, and what is not
 
@@ -75,7 +117,7 @@ headers is refused rather than dropped — silently discarding a header somebody
 set is worse than saying no — and unknown `x-acemq-` names from a newer version
 of another language's library are not handed back as yours.
 
-### Retry
+### Retry, and where a message goes when it runs out
 
 ```python
 policy = exponential_retry(5, timedelta(seconds=1), timedelta(minutes=1))
@@ -90,22 +132,64 @@ slower thundering herd.
 Giving up on **age** as well as attempts is the honest limit when a queue has
 been paused — a message can be on attempt one and four days old.
 
+A handler that returns `retry()` gets another delivery if the policy has one
+left. When it does not, the message is republished to `{queue}.dlq` with
+`x-acemq-error` saying which limit it hit and what the last failure was —
+`exhausted 5 attempts: RuntimeError: the warehouse is not answering` — and the
+original is acknowledged, because it has already been safely put somewhere else.
+Raising `FatalError`, or returning `retry(FatalError(...))`, skips the attempts
+that are left: they would all fail the same way.
+
+A retry is republished rather than requeued, so `x-acemq-attempt` really
+advances and the count lives on the message rather than in the memory of the
+process that has been failing. The trade is that a retried message goes to the
+back of its queue rather than the front.
+
+**The default policy is one delivery and no second chance.** A `retry()` on a
+connection with no policy dead-letters the message and says so in the reason,
+which is louder than the alternative default — an immediate requeue, which is a
+hot loop nobody asked for.
+
+### Codecs
+
+JSON by default. A codec declares the content type it writes and says which ones
+it will read, and a `CompositeCodec` tries them in order — which is what a queue
+carrying two formats during a migration needs:
+
+```python
+from acemq_amqp import BytesCodec, CompositeCodec, JsonCodec, TextCodec
+
+codec = CompositeCodec(JsonCodec(), TextCodec())
+```
+
+A message with **no** content type rules nothing out, so every codec is a
+candidate and the first that can actually read the body wins. `BytesCodec`
+answers for everything and hands back the bytes unchanged, which is what to read
+a dead-letter queue with: the message that went there may be exactly the one
+nothing could decode.
+
 ## Requirements
 
-Python 3.10 or newer. RabbitMQ for the transport, once it lands.
+Python 3.10 or newer, and RabbitMQ for the transport.
 
 ## Development
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
-pytest          # the contract, no broker needed
+pytest -m "not integration"     # the contract and the engine, no broker needed
 ruff check . && mypy
+
+# And against a real one:
+ACEMQ_TEST_BROKER=amqp://guest:guest@localhost:5672/ pytest -m integration
 ```
 
 The fixtures under `tests/fixtures/` are generated by the Java implementation
 and shared with Go and .NET. They are the definition of "the same wire
 contract", and they are checked here rather than assumed.
+
+The integration tests name everything they create `pyit.*` and delete it
+afterwards, so they can be pointed at a broker that is not theirs alone.
 
 ## Licence
 
