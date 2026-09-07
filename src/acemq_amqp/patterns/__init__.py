@@ -39,6 +39,14 @@ from .idempotency import (
     InMemoryIdempotencyStore,
     idempotent,
 )
+from .ordered import (
+    PartitionKey,
+    by_correlation,
+    by_header,
+    ordered,
+    partition,
+    partitioned_routing_key,
+)
 from .outbox import (
     DEFAULT_BATCH,
     DEFAULT_INTERVAL,
@@ -84,6 +92,7 @@ __all__ = [
     "OutboxRecord",
     "OutboxRelay",
     "OutboxStore",
+    "PartitionKey",
     "ReplayError",
     "ReplayFilter",
     "ReplayResult",
@@ -91,7 +100,12 @@ __all__ = [
     "Requester",
     "Responder",
     "ResponderError",
+    "by_correlation",
+    "by_header",
     "idempotent",
+    "ordered",
+    "partition",
+    "partitioned_routing_key",
     "record",
     "replay",
     "serve",
