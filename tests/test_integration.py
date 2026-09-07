@@ -61,6 +61,7 @@ from acemq_amqp import (
 from acemq_amqp.patterns import (
     HEADER_REPLAY_COUNT,
     HEADER_REPLAYED_FROM,
+    ConsumerGroup,
     InMemoryIdempotencyStore,
     InMemoryOutboxStore,
     OutboxRelay,
@@ -445,6 +446,33 @@ async def test_a_duplicate_is_accepted_without_running_the_handler_again(
     # Accepted, not dead-lettered: the work was done, so the message has been
     # handled and nothing should be raising an alarm about it.
     assert await mq.message_count(dead_letter_queue(queue)) == 0
+
+
+async def test_a_group_of_consumers_shares_one_queue_and_closes_as_one(
+    mq: Connection, workspace: Workspace
+) -> None:
+    queue = await workspace.queue("shared")
+    handled: list[int] = []
+    everything = asyncio.Event()
+
+    async def handler(message: Message) -> Ack:
+        handled.append(message.payload["id"])
+        if len(handled) >= 6:
+            everything.set()
+        return accept()
+
+    async with await ConsumerGroup.start(mq, queue, 3, handler) as group:
+        assert group.size == 3
+        publisher = mq.publisher(routing_key=queue, mandatory=True)
+        for n in range(6):
+            await publisher.send({"id": n})
+        await asyncio.wait_for(everything.wait(), 20.0)
+
+    # Each consumer has its own channel and its own prefetch, and the broker
+    # round-robins between them, so all six are handled and none is left held by
+    # a consumer nobody closed.
+    assert sorted(handled) == [0, 1, 2, 3, 4, 5]
+    assert await mq.message_count(queue) == 0
 
 
 async def test_a_replay_moves_dead_letters_back_and_leaves_the_rest(

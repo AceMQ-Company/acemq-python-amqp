@@ -33,6 +33,7 @@ without it. That is deliberate: a pattern you cannot walk away from is a trap.
 
 from __future__ import annotations
 
+from .consumergroup import ConsumerGroup
 from .idempotency import (
     DEFAULT_MEMORY,
     IdempotencyStore,
@@ -86,6 +87,7 @@ __all__ = [
     "HEADER_REPLAYED_FROM",
     "HEADER_REPLAY_COUNT",
     "HEADER_REPLY_TO",
+    "ConsumerGroup",
     "IdempotencyStore",
     "InMemoryIdempotencyStore",
     "InMemoryOutboxStore",
