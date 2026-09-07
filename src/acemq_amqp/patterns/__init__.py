@@ -57,6 +57,16 @@ from .outbox import (
     OutboxStore,
     record,
 )
+from .pipeline import (
+    NOTHING,
+    Middleware,
+    chain,
+    then,
+    with_idempotency,
+    with_logging,
+    with_ordering,
+    with_timeout,
+)
 from .replay import (
     HEADER_REPLAY_COUNT,
     HEADER_REPLAYED_AT,
@@ -97,10 +107,12 @@ __all__ = [
     "HEADER_REPLAY_COUNT",
     "HEADER_REPLY_TO",
     "HEADER_ROUTING_SLIP",
+    "NOTHING",
     "ConsumerGroup",
     "IdempotencyStore",
     "InMemoryIdempotencyStore",
     "InMemoryOutboxStore",
+    "Middleware",
     "OutboxRecord",
     "OutboxRelay",
     "OutboxStore",
@@ -117,6 +129,7 @@ __all__ = [
     "Step",
     "by_correlation",
     "by_header",
+    "chain",
     "follow_slip",
     "idempotent",
     "ordered",
@@ -127,4 +140,9 @@ __all__ = [
     "serve",
     "slip_from",
     "start",
+    "then",
+    "with_idempotency",
+    "with_logging",
+    "with_ordering",
+    "with_timeout",
 ]

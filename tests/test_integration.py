@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import threading
 import uuid
@@ -61,16 +62,22 @@ from acemq_amqp import (
 from acemq_amqp.patterns import (
     HEADER_REPLAY_COUNT,
     HEADER_REPLAYED_FROM,
+    HEADER_ROUTING_SLIP,
+    NOTHING,
     ConsumerGroup,
     InMemoryIdempotencyStore,
     InMemoryOutboxStore,
     OutboxRelay,
     Requester,
     ResponderError,
+    RoutingSlip,
+    follow_slip,
     idempotent,
     record,
     replay,
     serve,
+    start,
+    then,
 )
 
 pytestmark = pytest.mark.integration
@@ -542,6 +549,67 @@ async def test_a_question_over_a_queue_comes_back_answered(
         # caller waiting out its whole timeout to learn nothing.
         with pytest.raises(ResponderError, match="no such sku"):
             await caller.ask({"sku": "gone"})
+
+
+async def test_a_routing_slip_visits_every_stop_on_a_real_broker(
+    mq: Connection, workspace: Workspace
+) -> None:
+    validate = await workspace.queue("validate")
+    charge = await workspace.queue("charge")
+    ship = await workspace.queue("ship")
+
+    itinerary = (
+        RoutingSlip()
+        .then("", validate, name="validate")
+        .then("", charge, name="charge")
+        .then("", ship, name="ship")
+    )
+
+    async def stamp(message: Message) -> dict[str, object]:
+        """Each stop adds itself to the payload, so the route is visible at the
+        end as well as recorded on the slip."""
+        visited = list(message.payload.get("visited", []))
+        return {**message.payload, "visited": [*visited, message.routing_key]}
+
+    async with (
+        await mq.consume(validate, follow_slip(mq, stamp)),
+        await mq.consume(charge, follow_slip(mq, stamp)),
+    ):
+        await start(mq, itinerary, {"order": "order-1"})
+        arrived = (await collect(mq, ship))[0]
+
+    # The route was decided once, by whoever started the work, and travelled
+    # with the message rather than living in a component in the middle.
+    carried = json.loads(arrived.envelope.headers[HEADER_ROUTING_SLIP])
+    assert [step["name"] for step in carried["done"]] == ["validate", "charge"]
+    assert [step["name"] for step in carried["steps"]] == ["ship"]
+    assert all(step["completedAt"] for step in carried["done"])
+    assert arrived.payload["visited"] == [validate, charge]
+    assert arrived.envelope.causation_id != ""
+
+
+async def test_a_pipeline_step_publishes_onwards_or_stops(
+    mq: Connection, workspace: Workspace
+) -> None:
+    orders = await workspace.queue("orders")
+    shipments = await workspace.queue("shipments")
+
+    async def ship(message: Message) -> object:
+        if message.payload["digital"]:
+            return NOTHING
+        return {"shipment": message.payload["id"]}
+
+    async with await mq.consume(orders, then(mq.publisher("", shipments), ship)):
+        publisher = mq.publisher(routing_key=orders, mandatory=True)
+        await publisher.send({"id": "order-1", "digital": True})
+        await publisher.send({"id": "order-2", "digital": False})
+        shipped = (await collect(mq, shipments))[0]
+        await until(lambda: _count(mq, orders, 0), "both orders were handled")
+
+    # The digital one stopped here rather than becoming an empty message for the
+    # next service to handle.
+    assert shipped.payload == {"shipment": "order-2"}
+    assert await mq.message_count(shipments) == 0
 
 
 @pytest.fixture
