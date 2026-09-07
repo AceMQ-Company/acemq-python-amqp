@@ -58,6 +58,13 @@ from acemq_amqp import (
     retry_queue,
     sync,
 )
+from acemq_amqp.patterns import (
+    InMemoryIdempotencyStore,
+    InMemoryOutboxStore,
+    OutboxRelay,
+    idempotent,
+    record,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -382,6 +389,56 @@ async def test_rejecting_dead_letters_without_a_second_attempt(
 
     assert "the handler rejected it" in dead.envelope.error
     assert "ValueError: no customer on this order" in dead.envelope.error
+
+
+async def test_an_outbox_relay_publishes_what_was_committed(
+    mq: Connection, workspace: Workspace
+) -> None:
+    queue = await workspace.queue("outbox")
+    store = InMemoryOutboxStore()
+
+    # Written where the work is written, published later by something else. What
+    # a real store adds is that this line and the database write commit together.
+    await store.add(record(mq, "", queue, {"id": "7"}))
+
+    async with OutboxRelay(mq, store, interval=timedelta(milliseconds=20)):
+        got = (await collect(mq, queue))[0]
+
+    assert got.payload == {"id": "7"}
+    assert got.envelope.origin == "acemq-python-tests@ci"
+    assert len(store) == 0
+
+
+async def test_a_duplicate_is_accepted_without_running_the_handler_again(
+    mq: Connection, workspace: Workspace
+) -> None:
+    queue = await workspace.queue("once")
+    ran: list[str] = []
+    seen = asyncio.Event()
+
+    async def handler(message: Message) -> Ack:
+        ran.append(message.envelope.id)
+        seen.set()
+        return accept()
+
+    guarded = idempotent(InMemoryIdempotencyStore(), handler)
+    consumer = await mq.consume(queue, guarded)
+    try:
+        envelope = Envelope(id="order-1")
+        publisher = mq.publisher(routing_key=queue, mandatory=True)
+        # The same message twice, as a redelivery or a relay that swept twice
+        # would produce it.
+        await publisher.send({"id": "7"}, envelope=envelope)
+        await publisher.send({"id": "7"}, envelope=envelope)
+        await asyncio.wait_for(seen.wait(), 20.0)
+        await until(lambda: _count(mq, queue, 0), "both copies were consumed")
+    finally:
+        await consumer.close()
+
+    assert ran == ["order-1"]
+    # Accepted, not dead-lettered: the work was done, so the message has been
+    # handled and nothing should be raising an alarm about it.
+    assert await mq.message_count(dead_letter_queue(queue)) == 0
 
 
 @pytest.fixture

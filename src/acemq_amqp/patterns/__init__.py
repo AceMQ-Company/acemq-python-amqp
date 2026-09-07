@@ -39,10 +39,26 @@ from .idempotency import (
     InMemoryIdempotencyStore,
     idempotent,
 )
+from .outbox import (
+    DEFAULT_BATCH,
+    DEFAULT_INTERVAL,
+    InMemoryOutboxStore,
+    OutboxRecord,
+    OutboxRelay,
+    OutboxStore,
+    record,
+)
 
 __all__ = [
+    "DEFAULT_BATCH",
+    "DEFAULT_INTERVAL",
     "DEFAULT_MEMORY",
     "IdempotencyStore",
     "InMemoryIdempotencyStore",
+    "InMemoryOutboxStore",
+    "OutboxRecord",
+    "OutboxRelay",
+    "OutboxStore",
     "idempotent",
+    "record",
 ]
