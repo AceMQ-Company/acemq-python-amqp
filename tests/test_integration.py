@@ -71,8 +71,12 @@ from acemq_amqp.patterns import (
     Requester,
     ResponderError,
     RoutingSlip,
+    StreamRetention,
+    declare_stream,
     follow_slip,
+    from_first,
     idempotent,
+    read_stream,
     record,
     replay,
     serve,
@@ -610,6 +614,44 @@ async def test_a_pipeline_step_publishes_onwards_or_stops(
     # next service to handle.
     assert shipped.payload == {"shipment": "order-2"}
     assert await mq.message_count(shipments) == 0
+
+
+async def test_a_stream_hands_the_same_history_to_every_reader(
+    mq: Connection, workspace: Workspace
+) -> None:
+    name = workspace.name("events")
+    await declare_stream(mq, name, StreamRetention(max_age=timedelta(hours=1)))
+    workspace.register(name)
+
+    publisher = mq.publisher(routing_key=name, mandatory=True)
+    for n in range(3):
+        await publisher.send({"n": n})
+
+    async def reader() -> list[int]:
+        got: list[int] = []
+        everything = asyncio.Event()
+
+        async def handler(message: Message) -> Ack:
+            got.append(message.payload["n"])
+            if len(got) >= 3:
+                everything.set()
+            return accept()
+
+        consumer = await read_stream(mq, name, handler, offset=from_first())
+        try:
+            await asyncio.wait_for(everything.wait(), 20.0)
+        finally:
+            await consumer.close()
+        return got
+
+    assert await reader() == [0, 1, 2]
+    # Acknowledging advanced a position rather than removing anything, so a
+    # second reader starting from the beginning sees the same three messages.
+    # That is the whole difference between a stream and a queue, and reading it
+    # twice is the only way to show it: the broker reports a stream's message
+    # count as zero, because nothing on a stream is waiting for anybody.
+    assert await reader() == [0, 1, 2]
+    assert await mq.message_count(name) == 0
 
 
 @pytest.fixture

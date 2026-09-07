@@ -98,6 +98,7 @@ class FakeTransport:
     sent: list[Sent] = field(default_factory=list)
     consumers: dict[str, Callable[[Delivery], Awaitable[None]]] = field(default_factory=dict)
     waiting: dict[str, list[Staged]] = field(default_factory=dict)
+    specs: dict[str, ConsumeSpec] = field(default_factory=dict)
     closed: bool = False
 
     async def declare_queue(self, name: str, spec: QueueSpec) -> None:
@@ -132,6 +133,7 @@ class FakeTransport:
         deliver: Callable[[Delivery], Awaitable[None]],
     ) -> FakeSubscription:
         self.consumers[queue] = deliver
+        self.specs[queue] = spec
         return FakeSubscription(self, queue)
 
     async def close(self) -> None:
