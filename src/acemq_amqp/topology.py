@@ -1,0 +1,347 @@
+# Copyright 2026 AceMQ.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""The exchanges, queues and bindings a service expects to find.
+
+Declaring them one call at a time works, and stops working the moment somebody
+needs to know what a service will do to a broker *before* it does it. A topology
+can be printed, checked and applied, which is the difference between a
+deployment somebody approves and one they find out about::
+
+    topology = (
+        Topology()
+        .exchange("orders-events", "topic")
+        .queue("shipping-orders", dead_letter=True)
+        .binding("shipping-orders", "orders-events", "order.placed")
+    )
+    print(topology)
+    await topology.apply(transport)
+
+Mistakes are raised where they are made rather than collected for later. Go
+accumulates them on the builder because a Go builder has nowhere else to put
+them; Python has an exception and a traceback that points at the line that is
+wrong, which is more useful than a message that says a topology is bad.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from typing import Any
+
+from . import naming
+from .transport import ExchangeSpec, QueueSpec, Transport
+
+#: Where the broker sends a message this queue rejects or expires.
+DEAD_LETTER_EXCHANGE_ARG = "x-dead-letter-exchange"
+
+#: What routing key it is sent under, which the default exchange reads as a
+#: queue name.
+DEAD_LETTER_ROUTING_KEY_ARG = "x-dead-letter-routing-key"
+
+
+@dataclass(frozen=True, slots=True)
+class Binding:
+    """Messages matching a routing key going from an exchange to a queue."""
+
+    queue: str
+    exchange: str
+    routing_key: str = ""
+
+    def __str__(self) -> str:
+        return f"{self.exchange} -> {self.queue} ({self.routing_key})"
+
+
+@dataclass(frozen=True, slots=True)
+class PlanAction:
+    """One thing applying a topology would do."""
+
+    kind: str
+    name: str
+    detail: str = ""
+
+    def __str__(self) -> str:
+        if not self.detail:
+            return f"declare {self.kind} {self.name}"
+        return f"declare {self.kind} {self.name} ({self.detail})"
+
+
+@dataclass(frozen=True, slots=True)
+class _NamedQueue:
+    name: str
+    spec: QueueSpec
+
+
+@dataclass(frozen=True, slots=True)
+class _NamedExchange:
+    name: str
+    spec: ExchangeSpec
+
+
+@dataclass
+class Topology:
+    """A description of what a service needs a broker to have.
+
+    Every method that adds something returns the topology, so a description
+    reads as one expression. The order things are added in does not matter:
+    :meth:`apply` declares exchanges first, then queues, then the bindings
+    between them, because that is the order a broker will accept them in.
+    """
+
+    _exchanges: list[_NamedExchange] = field(default_factory=list)
+    _queues: list[_NamedQueue] = field(default_factory=list)
+    _bindings: list[Binding] = field(default_factory=list)
+
+    def exchange(
+        self,
+        name: str,
+        kind: str = "topic",
+        *,
+        durable: bool = True,
+        auto_delete: bool = False,
+        args: Mapping[str, Any] | None = None,
+    ) -> Topology:
+        """Adds an exchange.
+
+        :param name: what to call it
+        :param kind: ``direct``, ``topic``, ``fanout`` or ``headers``
+        :param durable: survives a broker restart
+        :param auto_delete: goes away when its last binding does
+        :param args: broker-specific arguments
+        :returns: this topology
+        """
+        if not name:
+            raise ValueError("acemq: an exchange needs a name")
+        if not kind:
+            raise ValueError(f"acemq: exchange {name!r} needs a kind (direct, topic, fanout)")
+        self._exchanges.append(
+            _NamedExchange(
+                name,
+                ExchangeSpec(
+                    kind=kind,
+                    durable=durable,
+                    auto_delete=auto_delete,
+                    args=dict(args or {}),
+                ),
+            )
+        )
+        return self
+
+    def queue(
+        self,
+        name: str,
+        *,
+        durable: bool = True,
+        auto_delete: bool = False,
+        exclusive: bool = False,
+        dead_letter: bool = False,
+        args: Mapping[str, Any] | None = None,
+    ) -> Topology:
+        """Adds a queue.
+
+        ``dead_letter`` declares ``{name}.dlq`` alongside it and points the
+        broker at it, so a message this queue rejects or lets expire lands
+        somewhere an operator can find by name rather than disappearing. The
+        dead-letter queue gets no wiring of its own: a dead-letter queue that
+        dead-letters is a loop, and a loop is how a poison message becomes an
+        outage.
+
+        The wiring goes through the default exchange, with the queue name as the
+        routing key, so it needs no exchange of its own. A service that already
+        has a dead-letter exchange should pass it in ``args`` instead.
+
+        :param name: what to call it
+        :param durable: survives a broker restart
+        :param auto_delete: goes away when its last consumer does
+        :param exclusive: usable only by the connection that declared it
+        :param dead_letter: also declare and wire ``{name}.dlq``
+        :param args: broker-specific arguments
+        :returns: this topology
+        """
+        if not name:
+            raise ValueError("acemq: a queue needs a name")
+
+        arguments: dict[str, Any] = dict(args or {})
+        if dead_letter:
+            # Refused rather than resolved, because either answer would be a
+            # guess about which of two conflicting instructions was meant.
+            conflicting = sorted(
+                key
+                for key in arguments
+                if key in (DEAD_LETTER_EXCHANGE_ARG, DEAD_LETTER_ROUTING_KEY_ARG)
+            )
+            if conflicting:
+                raise ValueError(
+                    f"acemq: queue {name!r} asks for dead_letter=True and also sets "
+                    + ", ".join(conflicting)
+                    + "; pick one"
+                )
+            arguments[DEAD_LETTER_EXCHANGE_ARG] = ""
+            arguments[DEAD_LETTER_ROUTING_KEY_ARG] = naming.dead_letter_queue(name)
+
+        self._queues.append(
+            _NamedQueue(
+                name,
+                QueueSpec(
+                    durable=durable,
+                    auto_delete=auto_delete,
+                    exclusive=exclusive,
+                    args=arguments,
+                ),
+            )
+        )
+        if dead_letter:
+            self._queues.append(
+                _NamedQueue(naming.dead_letter_queue(name), QueueSpec(durable=durable))
+            )
+        return self
+
+    def binding(self, queue: str, exchange: str, routing_key: str = "") -> Topology:
+        """Routes messages matching a key from an exchange to a queue.
+
+        :param queue: where messages end up, which this topology must declare
+        :param exchange: where they come from, which this topology must declare
+        :param routing_key: what to match, empty for a fanout
+        :returns: this topology
+        """
+        self._bindings.append(Binding(queue=queue, exchange=exchange, routing_key=routing_key))
+        return self
+
+    @property
+    def queues(self) -> list[str]:
+        """The queue names this topology declares, in declaration order."""
+        return [entry.name for entry in self._queues]
+
+    @property
+    def exchanges(self) -> list[str]:
+        """The exchange names this topology declares, in declaration order."""
+        return [entry.name for entry in self._exchanges]
+
+    @property
+    def bindings(self) -> list[Binding]:
+        """The bindings this topology declares."""
+        return list(self._bindings)
+
+    def validate(self) -> None:
+        """Reports what is wrong with the description itself.
+
+        A binding naming a queue the topology does not declare is the mistake
+        worth catching here. The broker would accept it if the queue happened to
+        exist already, and the service would then depend on something nothing
+        declares — which works until the day it is deployed somewhere new.
+
+        :raises ValueError: when the topology cannot be right
+        """
+        seen_queues: set[str] = set()
+        for queue in self._queues:
+            if queue.name in seen_queues:
+                raise ValueError(f"acemq: the topology declares queue {queue.name!r} twice")
+            seen_queues.add(queue.name)
+
+        seen_exchanges: set[str] = set()
+        for exchange in self._exchanges:
+            if exchange.name in seen_exchanges:
+                raise ValueError(
+                    f"acemq: the topology declares exchange {exchange.name!r} twice"
+                )
+            seen_exchanges.add(exchange.name)
+
+        for binding in self._bindings:
+            if binding.queue not in seen_queues:
+                raise ValueError(
+                    f"acemq: binding {binding} names queue {binding.queue!r}, "
+                    "which this topology does not declare"
+                )
+            if not binding.exchange:
+                raise ValueError(
+                    f"acemq: binding {binding} names the default exchange, "
+                    "which cannot be bound to"
+                )
+            if binding.exchange not in seen_exchanges:
+                raise ValueError(
+                    f"acemq: binding {binding} names exchange {binding.exchange!r}, "
+                    "which this topology does not declare"
+                )
+
+    def plan(self) -> list[PlanAction]:
+        """What :meth:`apply` would do, without doing it.
+
+        Deliberately not a difference against the live broker: AMQP offers no
+        way to enumerate what is there without the management API, and a plan
+        that quietly guessed would be worse than one that is honest about being
+        a statement of intent.
+
+        :returns: one action per thing that would be declared
+        :raises ValueError: when the topology cannot be right
+        """
+        self.validate()
+        actions = [
+            PlanAction("exchange", entry.name, _describe(entry.spec))
+            for entry in self._exchanges
+        ]
+        actions += [
+            PlanAction("queue", entry.name, _describe(entry.spec)) for entry in self._queues
+        ]
+        actions += [
+            PlanAction(
+                "binding", binding.queue, f"from {binding.exchange} on {binding.routing_key}"
+            )
+            for binding in self._bindings
+        ]
+        return actions
+
+    async def apply(self, transport: Transport) -> None:
+        """Declares everything, in the order a broker needs.
+
+        It stops at the first failure. A queue that already exists with
+        different settings is refused by the broker with ``PRECONDITION_FAILED``,
+        and that refusal is passed on rather than swallowed: it means this
+        service and the broker disagree about what the queue is, and carrying on
+        would leave the service using a queue that is not the one it asked for.
+
+        :param transport: where to declare it
+        :raises ValueError: when the topology cannot be right
+        """
+        self.validate()
+        for exchange in self._exchanges:
+            await transport.declare_exchange(exchange.name, exchange.spec)
+        for queue in self._queues:
+            await transport.declare_queue(queue.name, queue.spec)
+        for binding in self._bindings:
+            await transport.bind(binding.queue, binding.exchange, binding.routing_key)
+
+    def __str__(self) -> str:
+        try:
+            actions = self.plan()
+        except ValueError as failure:
+            return f"Topology(invalid: {failure})"
+        header = (
+            f"Topology: {len(self._exchanges)} exchanges, "
+            f"{len(self._queues)} queues, {len(self._bindings)} bindings"
+        )
+        return "\n".join([header, *(f"  {action}" for action in actions)])
+
+
+def _describe(spec: QueueSpec | ExchangeSpec) -> str:
+    """A spec as the line an operator would want in a deployment log."""
+    parts: list[str] = []
+    if isinstance(spec, ExchangeSpec):
+        parts.append(spec.kind)
+    parts.append("durable" if spec.durable else "transient")
+    if spec.auto_delete:
+        parts.append("auto-delete")
+    if isinstance(spec, QueueSpec) and spec.exclusive:
+        parts.append("exclusive")
+    parts += [f"{key}={spec.args[key]!r}" for key in sorted(spec.args)]
+    return ", ".join(parts)
