@@ -1,0 +1,82 @@
+# Says that a version is out.
+#
+# Without this the only notifications a repository sends are about failure, and
+# a channel that only ever carries bad news trains people to dread it and tells
+# them nothing about what shipped.
+#
+# On the release being published, and on request — the latter so a release that
+# went out before this existed can still be announced.
+name: release-notify
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to announce, for example v0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  # What is actually there, rather than what the release process is supposed to
+  # leave behind. A notification naming an artifact nobody can find sends
+  # somebody looking for a thing that is not there, and they trust the next one
+  # less.
+  what-shipped:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.look.outputs.tag }}
+      artifacts: ${{ steps.look.outputs.artifacts }}
+    steps:
+      - id: look
+        env:
+          # Everything reaches the shell through the environment. A name
+          # interpolated into a script is a command somebody else can write,
+          # and this job holds a webhook one step further on.
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ inputs.tag || github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          if ! printf '%s' "$REF" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "not a version tag: $REF" >&2
+            exit 1
+          fi
+          echo "tag=$REF" >> "$GITHUB_OUTPUT"
+
+          ASSETS="$(gh release view "$REF" --repo "$REPO" --json assets \
+            --jq '[.assets[].name] | join(", ")' 2>/dev/null || echo '')"
+
+          {
+            printf '%s' "The contract layer: envelope, retry schedule, naming and acks, held to the same fixtures as the Java, Go and .NET libraries. The transport is next."
+            if [ -n "$ASSETS" ]; then
+              printf ' On the release page: %s.' "$ASSETS"
+            fi
+          } > artifacts.txt
+
+          # A newline in an output would end the value early, so it goes as one
+          # line and Slack wraps it.
+          echo "artifacts=$(cat artifacts.txt)" >> "$GITHUB_OUTPUT"
+
+  notify:
+    needs: what-shipped
+    uses: AceMQ-Company/acemq-java-amqp/.github/workflows/slack-notify.yml@main
+    with:
+      status: success
+      # A rocket rather than the tick a passing job gets. The channel also
+      # carries builds, and "a thing passed" and "a version is out" should not
+      # look alike at a glance.
+      icon: ':rocket:'
+      title: >-
+        AceMQ for Python released ${{ needs.what-shipped.outputs.tag }}
+      message: ${{ needs.what-shipped.outputs.artifacts }}
+      url: https://github.com/AceMQ-Company/acemq-python-amqp/releases/tag/${{ needs.what-shipped.outputs.tag }}
+    secrets:
+      # Explicit, not `inherit`. A reusable workflow in another repository does
+      # not receive inherited secrets, and the shared workflow treats a missing
+      # webhook as "nothing to notify" and succeeds — so `inherit` here would be
+      # a green job that announced nothing.
+      SLACK_DELIVERY_WEBHOOK: ${{ secrets.SLACK_DELIVERY_WEBHOOK }}
