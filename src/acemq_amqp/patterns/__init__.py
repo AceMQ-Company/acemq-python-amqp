@@ -95,6 +95,13 @@ from .routingslip import (
     slip_from,
     start,
 )
+from .schema import (
+    InMemorySchemaRegistry,
+    SchemaDefinition,
+    SchemaNotFoundError,
+    SchemaRegistry,
+    fingerprint,
+)
 
 __all__ = [
     "DEFAULT_BATCH",
@@ -112,6 +119,7 @@ __all__ = [
     "IdempotencyStore",
     "InMemoryIdempotencyStore",
     "InMemoryOutboxStore",
+    "InMemorySchemaRegistry",
     "Middleware",
     "OutboxRecord",
     "OutboxRelay",
@@ -125,11 +133,15 @@ __all__ = [
     "Responder",
     "ResponderError",
     "RoutingSlip",
+    "SchemaDefinition",
+    "SchemaNotFoundError",
+    "SchemaRegistry",
     "Stage",
     "Step",
     "by_correlation",
     "by_header",
     "chain",
+    "fingerprint",
     "follow_slip",
     "idempotent",
     "ordered",
