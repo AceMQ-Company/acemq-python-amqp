@@ -76,6 +76,15 @@ from .requestreply import (
     ResponderError,
     serve,
 )
+from .routingslip import (
+    HEADER_ROUTING_SLIP,
+    RoutingSlip,
+    Stage,
+    Step,
+    follow_slip,
+    slip_from,
+    start,
+)
 
 __all__ = [
     "DEFAULT_BATCH",
@@ -87,6 +96,7 @@ __all__ = [
     "HEADER_REPLAYED_FROM",
     "HEADER_REPLAY_COUNT",
     "HEADER_REPLY_TO",
+    "HEADER_ROUTING_SLIP",
     "ConsumerGroup",
     "IdempotencyStore",
     "InMemoryIdempotencyStore",
@@ -102,8 +112,12 @@ __all__ = [
     "Requester",
     "Responder",
     "ResponderError",
+    "RoutingSlip",
+    "Stage",
+    "Step",
     "by_correlation",
     "by_header",
+    "follow_slip",
     "idempotent",
     "ordered",
     "partition",
@@ -111,4 +125,6 @@ __all__ = [
     "record",
     "replay",
     "serve",
+    "slip_from",
+    "start",
 ]

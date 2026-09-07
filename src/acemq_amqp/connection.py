@@ -146,6 +146,12 @@ class Publisher:
         """
         key = self._routing_key if routing_key is None else routing_key
         outgoing = envelope or Envelope(origin=self._connection.origin)
+        if not outgoing.origin:
+            # A message derived from another — a reply, a pipeline hop, the next
+            # stop on a routing slip — is still published by this process, and an
+            # origin naming the service before it would be a lie in a log line
+            # somebody is going to trust.
+            outgoing = outgoing.with_(origin=self._connection.origin)
         body = self._codec.encode(payload)
 
         result = await self._connection.publish_raw(
