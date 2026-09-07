@@ -38,6 +38,9 @@ prometheus = ["prometheus-client>=0.20"]
 dev = [
   "aio-pika>=9.4",
   "mypy>=1.11",
+  # Pinned, so a new pdoc cannot change the published API reference without
+  # somebody choosing it. The docs workflow installs the same version.
+  "pdoc==15.0.1",
   "prometheus-client>=0.20",
   "pytest>=8.0",
   "pytest-asyncio>=0.24",

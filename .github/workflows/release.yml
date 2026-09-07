@@ -1,0 +1,376 @@
+# Publish a release to PyPI.
+#
+# Triggered by a tag:  git tag v0.1.1 && git push origin v0.1.1
+#
+# There was no way to publish this library at all before this file, which is why
+# the v0.1.0 tag exists and nobody can install it. A tag is a statement that
+# something is available; without a publish step it is a statement about
+# nothing.
+#
+# # Trusted Publishing, not an API token
+#
+# PyPI is told, once, that this repository's `release` workflow running in the
+# `pypi` environment may publish the `acemq-amqp` project. The runner then mints
+# a short-lived OIDC token for that exact claim and PyPI checks it. Nothing is
+# stored here.
+#
+# That matters more for PyPI than for a feed we control: a leaked upload token
+# can publish any version of any project it is scoped to, to an index every
+# Python installation in the world resolves from, and a published version is
+# permanent. An OIDC token is minted per run, expires in minutes, and cannot be
+# replayed from anywhere but this workflow.
+#
+# Setting it up, once, before the first tag:
+#
+#   1. PyPI -> Your projects -> Publishing -> Add a pending publisher
+#        PyPI project name  acemq-amqp
+#        Owner              AceMQ-Company
+#        Repository         acemq-python-amqp
+#        Workflow           release.yml
+#        Environment        pypi
+#   2. This repository -> Settings -> Environments -> New environment: pypi
+#
+# Until step 1 is done a tag reaches the publish job and PyPI refuses it, which
+# is the right way round: nothing is published by accident, and the failure says
+# exactly what is missing. The rest of the file runs and checks the release
+# whether or not the project exists yet, so merging this before then is safe.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish, without the leading v (e.g. 0.1.1)'
+        required: true
+
+# Least privilege for every job that does not ask for more. The publish job
+# declares `id-token: write` itself, so the one privilege that can put something
+# on PyPI is reviewable in the file rather than inherited from an organisation
+# setting somebody can change later.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # The floor the type hints are written against, not the newest.
+          # Releasing something that only builds on a newer interpreter would
+          # break the promise requires-python makes.
+          python-version: '3.10'
+
+      - name: Work out the version
+        id: version
+        env:
+          # Through the environment rather than interpolated into the script. A
+          # tag name and a dispatch input are both caller-controlled text, and
+          # inlining either one lets whoever writes it run shell here.
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            VERSION="$INPUT_VERSION"
+          else
+            VERSION="${TAG_NAME#v}"
+          fi
+          # An allow-list, not a deny-list. The version reaches a file name, a
+          # commit message and a package version, so anything that is not
+          # plainly a version number is refused rather than escaped.
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([ab]|rc)?[0-9]*$'; then
+            echo "::error::not a release version: '$VERSION'"
+            exit 1
+          fi
+          # The line stays on 0.1.x until that is deliberately changed. Without
+          # this a mistyped tag ships a 0.2.0 or a 1.0.0, and a version on PyPI
+          # cannot be withdrawn -- yanking hides it from resolution and leaves
+          # every lockfile that already names it working. Lift this when the
+          # line moves on.
+          case "$VERSION" in
+            0.1.*) ;;
+            *)
+              echo "::error::this library releases 0.1.x only; '$VERSION' needs the guard in release.yml lifted first"
+              exit 1
+              ;;
+          esac
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "releasing $VERSION"
+
+      - name: Check the package agrees with the tag
+        # Two places say what version this is, and a release that disagrees with
+        # either of them ships a wheel whose metadata names something else --
+        # which a consumer only finds out from `pip show` telling them they have
+        # a version nobody released.
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          declared=$(grep -E '^version = ' pyproject.toml | head -1 | cut -d'"' -f2)
+          if [ "$declared" != "$VERSION" ]; then
+            echo "::error::pyproject.toml says $declared; the tag is $VERSION"
+            exit 1
+          fi
+          reported=$(grep -E '^__version__ = ' src/acemq_amqp/__init__.py | cut -d'"' -f2)
+          if [ "$reported" != "$VERSION" ]; then
+            echo "::error::acemq_amqp.__version__ is \"$reported\"; the tag is $VERSION"
+            exit 1
+          fi
+          echo "pyproject.toml and __version__ both say $VERSION"
+
+      - name: Install
+        run: pip install -e ".[dev]" build twine
+
+      - name: Test
+        # Not the integration tests: they need a broker, and they have a job.
+        run: pytest -m "not integration" -q
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Types
+        run: mypy
+
+      - name: Build the sdist and the wheel
+        # Both. A wheel alone leaves anyone on a platform or a Python it was not
+        # built for with nothing to fall back on, and an sdist alone makes every
+        # install a build.
+        run: python -m build --sdist --wheel --outdir "$RUNNER_TEMP/dist"
+
+      - name: Check what will be uploaded
+        # twine's own metadata check, run before the upload rather than
+        # discovering at upload time that PyPI will not render the README --
+        # which is a permanent version spent on a formatting mistake.
+        run: twine check --strict "$RUNNER_TEMP"/dist/*
+
+      - name: Check the sdist really builds the library
+        # An sdist that is missing a file installs cleanly and fails on import,
+        # and hatchling's file selection is configuration rather than a
+        # guarantee. Installed from the sdist alone, into an interpreter that
+        # has never seen this checkout.
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          python -m venv "$RUNNER_TEMP/sdist-check"
+          "$RUNNER_TEMP/sdist-check/bin/pip" install --quiet \
+            "$RUNNER_TEMP/dist/acemq_amqp-$VERSION.tar.gz"
+          "$RUNNER_TEMP/sdist-check/bin/python" -c "
+          import acemq_amqp
+          assert acemq_amqp.__version__ == '$VERSION', acemq_amqp.__version__
+          # The contract layer has no dependencies, and this proves it: nothing
+          # but the sdist went into this interpreter.
+          acemq_amqp.Topology().queue('orders.new', dead_letter=True).validate()
+          print('the sdist installs and imports')
+          "
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: ${{ runner.temp }}/dist
+          if-no-files-found: error
+
+  integration:
+    runs-on: ubuntu-latest
+
+    # A release runs the integration suite. It is the one moment where waiting
+    # for the slow tests is obviously worth it: this is the artifact people
+    # depend on.
+    services:
+      broker:
+        image: rabbitmq:4-alpine
+        ports: ['5672:5672']
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Test against the broker
+        env:
+          ACEMQ_TEST_BROKER: amqp://guest:guest@localhost:5672/
+        run: |
+          set -o pipefail
+          pytest -m integration -q -rs 2>&1 | tee "$RUNNER_TEMP/broker-tests.log"
+
+      - name: Check the broker tests really ran
+        # A suite that skipped everything reports the same green as one that
+        # passed everything. The TLS tests skip by design without a TLS broker;
+        # anything else skipping during a release is a test that was meant to
+        # check this artifact and did not.
+        run: |
+          log="$RUNNER_TEMP/broker-tests.log"
+          passed=$(sed -n 's/.*[^0-9]\([0-9]\+\) passed.*/\1/p' "$log" | head -1)
+          passed=${passed:-0}
+          if [ "$passed" -lt 20 ]; then
+            echo "::error::only $passed broker tests passed; expected at least 20"
+            exit 1
+          fi
+          echo "$passed broker tests passed"
+
+  publish:
+    needs: [verify, integration]
+    runs-on: ubuntu-latest
+    outputs:
+      published: ${{ steps.push.outputs.published }}
+
+    # The environment PyPI's pending publisher names. It is half the claim the
+    # OIDC token carries: without it the token says only which workflow ran, and
+    # the trust would be in the repository rather than in this file.
+    environment:
+      name: pypi
+      url: https://pypi.org/project/acemq-amqp/
+
+    permissions:
+      # The one privilege that can put something on PyPI, declared here and
+      # nowhere else. `contents: read` is repeated because a job's own block
+      # replaces the workflow default rather than adding to it.
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist
+
+      # `published` is the line between "nothing happened" and "something is out
+      # there". Everything before this leaves PyPI untouched; everything after
+      # is operating on a version the world can already resolve.
+      - name: Upload to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # A re-run of a good release is not a failed release. Without this a
+          # second attempt at the announce or verify steps fails at the upload
+          # instead of reaching them. It also means "already there" and "just
+          # uploaded" both count as published, which is what a consumer sees.
+          skip-existing: true
+
+      - name: Say that it is out there
+        id: push
+        run: echo "published=true" >> "$GITHUB_OUTPUT"
+
+  # The only check that asks what a consumer will actually get. Installing from
+  # PyPI, into an interpreter with nothing else in it, catches a release whose
+  # uploaded artifacts do not match what was built -- a failure that otherwise
+  # surfaces days later in somebody else's build.
+  verify-installed:
+    needs: [verify, publish]
+    if: needs.publish.outputs.published == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install it from PyPI and use it
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          echo "Waiting for PyPI to serve $VERSION"
+          for attempt in $(seq 1 20); do
+            code=$(curl -sL -o /dev/null -w '%{http_code}' \
+              "https://pypi.org/pypi/acemq-amqp/$VERSION/json")
+            [ "$code" = "200" ] && break
+            echo "  attempt $attempt: HTTP $code"
+            sleep 15
+          done
+          if [ "$code" != "200" ]; then
+            echo "::error::$VERSION was uploaded but PyPI is not serving it"
+            exit 1
+          fi
+
+          python -m venv "$RUNNER_TEMP/verify"
+          # No cache, so nothing can resolve from anything this run left behind.
+          "$RUNNER_TEMP/verify/bin/pip" install --no-cache-dir \
+            "acemq-amqp[rabbitmq]==$VERSION"
+          "$RUNNER_TEMP/verify/bin/python" -c "
+          import acemq_amqp
+          assert acemq_amqp.__version__ == '$VERSION', acemq_amqp.__version__
+          print('acemq-amqp', acemq_amqp.__version__, 'installs from PyPI')
+          "
+
+  # The GitHub release is what people subscribe to. Created after the upload, so
+  # it never advertises a version that failed to publish.
+  announce:
+    needs: [verify, publish]
+    if: needs.publish.outputs.published == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          gh release create "v$VERSION" \
+            --title "v$VERSION" \
+            --notes "AceMQ for Python $VERSION.
+
+          \`\`\`bash
+          pip install \"acemq-amqp[rabbitmq]==$VERSION\"
+          \`\`\`
+
+          Documentation: https://acemq.org/acemq-python-amqp/" \
+            || echo "release v$VERSION already exists"
+
+  # A version that is published but did not finish its release is the genuinely
+  # dangerous state: consumers can already install it while the release notes
+  # still name the previous one. That is worth interrupting somebody for, which
+  # is why this fires on success as well as failure.
+  notify:
+    needs: [verify, integration, publish, verify-installed, announce]
+    if: always() && needs.publish.outputs.published == 'true'
+    uses: AceMQ-Company/acemq-java-amqp/.github/workflows/slack-notify.yml@main
+    with:
+      status: >-
+        ${{ (needs.verify-installed.result == 'success' && needs.announce.result == 'success')
+            && 'success' || 'failure' }}
+      # Not "FAILED". By the time this runs the version is on PyPI and consumers
+      # can install it -- the release is out. What failed is the finishing, and
+      # calling that a failed release sends somebody looking for a broken
+      # artifact that does not exist. Go, Java and .NET word it the same way.
+      title: >-
+        ${{ (needs.verify-installed.result == 'success' && needs.announce.result == 'success')
+            && format('AceMQ for Python {0} released', github.ref_name)
+            || format('AceMQ for Python {0} is published but the release did not finish', github.ref_name) }}
+      message: >-
+        ${{ (needs.verify-installed.result == 'success' && needs.announce.result == 'success')
+            && 'On PyPI: pip install "acemq-amqp[rabbitmq]". Consumers need no credentials.'
+            || 'The distributions are on PyPI and consumers can install them, but a later step failed, so the release notes may still name the previous version. Check the run.' }}
+      # Roadworks rather than a red dot for the half-finished case: the release
+      # is usable and unfinished, which is a different thing from broken and
+      # reads differently at a glance.
+      #
+      # Both branches name an emoji. Leaving the success branch empty to fall
+      # back on the status-derived tick does not work -- in GitHub's expression
+      # language `a && '' || b` yields b, because an empty string is falsy, so
+      # every successful release would be announced with roadworks. That cost
+      # the Java library nine releases before anyone noticed.
+      icon: >-
+        ${{ (needs.verify-installed.result == 'success' && needs.announce.result == 'success')
+            && ':white_check_mark:' || ':construction:' }}
+      url: https://pypi.org/project/acemq-amqp/
+    secrets:
+      # Explicit, not `inherit`. A reusable workflow in another repository does
+      # not receive inherited secrets, so `inherit` produces a notify job that
+      # goes green while sending nothing at all.
+      SLACK_DELIVERY_WEBHOOK: ${{ secrets.SLACK_DELIVERY_WEBHOOK }}

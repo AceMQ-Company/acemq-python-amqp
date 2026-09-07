@@ -12,3 +12,8 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# The rendered documentation site, built by .github/scripts/build-docs-site.sh
+# and published from the workflow. Committing it would give the repository two
+# copies of every page, free to disagree.
+site/
