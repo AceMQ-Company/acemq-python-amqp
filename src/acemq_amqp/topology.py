@@ -539,9 +539,15 @@ def _queue_type(
 
     ``None`` is classic and is a real answer rather than a missing one: every
     AceMQ library declares a classic queue by sending no ``x-queue-type`` at
-    all, and a broker compares the argument tables it was given, so sending
-    ``classic`` where Java sends nothing would be a third spelling of the same
-    queue and would be refused as a fourth disagreement.
+    all, so this matches Java's ``QueueType.CLASSIC`` argument for argument.
+
+    RabbitMQ does in fact normalise the two — a queue declared with no
+    ``x-queue-type`` and one declared with ``classic`` are the same queue to
+    the broker, checked in both orders against a real one, while quorum against
+    either is refused. So sending ``classic`` would also work. Sending nothing
+    is still what this does, because "declare exactly what the other libraries
+    declare" is a rule that holds without anyone having to remember which
+    arguments the broker happens to normalise and which it compares literally.
 
     :param name: the queue, for the message when the answer is a refusal
     :param args: what the caller wrote down, which may already name a kind
