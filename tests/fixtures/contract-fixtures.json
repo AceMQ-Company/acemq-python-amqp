@@ -1,0 +1,643 @@
+{
+  "generatedBy": "acemq-java-amqp ContractFixtures",
+  "contract": "the retry schedule, the queue names and the topology every AceMQ library must agree on",
+  "defaultBrokerWaitThresholdMillis": 30000,
+  "deadLetterExchange": "acemq.dlx",
+  "retryExchange": "acemq.retry",
+  "retrySchedules": [
+    {
+      "name": "exponential-uncapped",
+      "how": "exponential(5, 1s, 24h)",
+      "maxAttempts": 5,
+      "maxMessageAgeMillis": 31536000000,
+      "jitterFactor": 0.2,
+      "brokerWaitThresholdMillis": 30000,
+      "scheduleMillis": [1000, 2000, 4000, 8000],
+      "brokerRungDelaysMillis": [],
+      "decisions": [
+        {
+          "attempt": 1,
+          "messageAgeMillis": 0,
+          "retries": true
+        },
+        {
+          "attempt": 1,
+          "messageAgeMillis": 31535999999,
+          "retries": true
+        },
+        {
+          "attempt": 1,
+          "messageAgeMillis": 31536000000,
+          "retries": false
+        },
+        {
+          "attempt": 4,
+          "messageAgeMillis": 0,
+          "retries": true
+        },
+        {
+          "attempt": 4,
+          "messageAgeMillis": 31535999999,
+          "retries": true
+        },
+        {
+          "attempt": 4,
+          "messageAgeMillis": 31536000000,
+          "retries": false
+        },
+        {
+          "attempt": 5,
+          "messageAgeMillis": 0,
+          "retries": false
+        },
+        {
+          "attempt": 5,
+          "messageAgeMillis": 31535999999,
+          "retries": false
+        },
+        {
+          "attempt": 5,
+          "messageAgeMillis": 31536000000,
+          "retries": false
+        }
+      ]
+    },
+    {
+      "name": "exponential-capped",
+      "how": "exponential(6, 10s, 1m)",
+      "maxAttempts": 6,
+      "maxMessageAgeMillis": 31536000000,
+      "jitterFactor": 0.2,
+      "brokerWaitThresholdMillis": 30000,
+      "scheduleMillis": [10000, 20000, 40000, 60000, 60000],
+      "brokerRungDelaysMillis": [40000, 60000],
+      "decisions": [
+        {
+          "attempt": 1,
+          "messageAgeMillis": 0,
+          "retries": true
+        },
+        {
+          "attempt": 1,
+          "messageAgeMillis": 31535999999,
+          "retries": true
+        },
+        {
+          "attempt": 1,
+          "messageAgeMillis": 31536000000,
+          "retries": false
+        },
+        {
+          "attempt": 5,
+          "messageAgeMillis": 0,
+          "retries": true
+        },
+        {
+          "attempt": 5,
+          "messageAgeMillis": 31535999999,
+          "retries": true
+        },
+        {
+          "attempt": 5,
+          "messageAgeMillis": 31536000000,
+          "retries": false
+        },
+        {
+          "attempt": 6,
+          "messageAgeMillis": 0,
+          "retries": false
+        },
+        {
+          "attempt": 6,
+          "messageAgeMillis": 31535999999,
+          "retries": false
+        },
+        {
+          "attempt": 6,
+          "messageAgeMillis": 31536000000,
+          "retries": false
+        }
+      ]
+    },
+    {
+      "name": "exponential-give-up-on-age",
+      "how": "exponential(5, 1s, 24h).giveUpAfter(2m)",
+      "maxAttempts": 5,
+      "maxMessageAgeMillis": 120000,
+      "jitterFactor": 0.2,
+      "brokerWaitThresholdMillis": 30000,
+      "scheduleMillis": [1000, 2000, 4000, 8000],
+      "brokerRungDelaysMillis": [],
+      "decisions": [
+        {
+          "attempt": 1,
+          "messageAgeMillis": 0,
+          "retries": true
+        },
+        {
+          "attempt": 1,
+          "messageAgeMillis": 119999,
+          "retries": true
+        },
+        {
+          "attempt": 1,
+          "messageAgeMillis": 120000,
+          "retries": false
+        },
+        {
+          "attempt": 4,
+          "messageAgeMillis": 0,
+          "retries": true
+        },
+        {
+          "attempt": 4,
+          "messageAgeMillis": 119999,
+          "retries": true
+        },
+        {
+          "attempt": 4,
+          "messageAgeMillis": 120000,
+          "retries": false
+        },
+        {
+          "attempt": 5,
+          "messageAgeMillis": 0,
+          "retries": false
+        },
+        {
+          "attempt": 5,
+          "messageAgeMillis": 119999,
+          "retries": false
+        },
+        {
+          "attempt": 5,
+          "messageAgeMillis": 120000,
+          "retries": false
+        }
+      ]
+    },
+    {
+      "name": "fixed",
+      "how": "fixed(4, 30s)",
+      "maxAttempts": 4,
+      "maxMessageAgeMillis": 31536000000,
+      "jitterFactor": 0,
+      "brokerWaitThresholdMillis": 30000,
+      "scheduleMillis": [30000, 30000, 30000],
+      "brokerRungDelaysMillis": [30000],
+      "decisions": [
+        {
+          "attempt": 1,
+          "messageAgeMillis": 0,
+          "retries": true
+        },
+        {
+          "attempt": 1,
+          "messageAgeMillis": 31535999999,
+          "retries": true
+        },
+        {
+          "attempt": 1,
+          "messageAgeMillis": 31536000000,
+          "retries": false
+        },
+        {
+          "attempt": 3,
+          "messageAgeMillis": 0,
+          "retries": true
+        },
+        {
+          "attempt": 3,
+          "messageAgeMillis": 31535999999,
+          "retries": true
+        },
+        {
+          "attempt": 3,
+          "messageAgeMillis": 31536000000,
+          "retries": false
+        },
+        {
+          "attempt": 4,
+          "messageAgeMillis": 0,
+          "retries": false
+        },
+        {
+          "attempt": 4,
+          "messageAgeMillis": 31535999999,
+          "retries": false
+        },
+        {
+          "attempt": 4,
+          "messageAgeMillis": 31536000000,
+          "retries": false
+        }
+      ]
+    },
+    {
+      "name": "none",
+      "how": "none()",
+      "maxAttempts": 1,
+      "maxMessageAgeMillis": 31536000000,
+      "jitterFactor": 0,
+      "brokerWaitThresholdMillis": 30000,
+      "scheduleMillis": [],
+      "brokerRungDelaysMillis": [],
+      "decisions": [
+        {
+          "attempt": 1,
+          "messageAgeMillis": 0,
+          "retries": false
+        },
+        {
+          "attempt": 1,
+          "messageAgeMillis": 31535999999,
+          "retries": false
+        },
+        {
+          "attempt": 1,
+          "messageAgeMillis": 31536000000,
+          "retries": false
+        }
+      ]
+    }
+  ],
+  "jitter": {
+    "policy": "exponential-uncapped",
+    "factor": 0.2,
+    "appliesInBothDirections": true,
+    "minMultiplier": 0.8,
+    "maxMultiplier": 1.2,
+    "appliesToConsumerWaits": true,
+    "appliesToBrokerWaits": false,
+    "flooredAtMillis": 1,
+    "howToAssert": "a wait spent in the consumer must land in [delay * minMultiplier, delay * maxMultiplier] and never below flooredAtMillis; a wait spent in the broker must equal the scheduled delay exactly, because it names a rung queue"
+  },
+  "brokerWaitThreshold": {
+    "defaultMillis": 30000,
+    "rule": "a wait at or above the threshold is held on a rung queue; anything below it, and anything zero or negative, is held in the consumer. A threshold of zero sends nothing to the broker, so no rung queue is ever declared",
+    "cases": [
+      {
+        "thresholdMillis": 30000,
+        "delayMillis": 0,
+        "waitsInBroker": false
+      },
+      {
+        "thresholdMillis": 30000,
+        "delayMillis": 1,
+        "waitsInBroker": false
+      },
+      {
+        "thresholdMillis": 30000,
+        "delayMillis": 500,
+        "waitsInBroker": false
+      },
+      {
+        "thresholdMillis": 30000,
+        "delayMillis": 1000,
+        "waitsInBroker": false
+      },
+      {
+        "thresholdMillis": 30000,
+        "delayMillis": 29999,
+        "waitsInBroker": false
+      },
+      {
+        "thresholdMillis": 30000,
+        "delayMillis": 30000,
+        "waitsInBroker": true
+      },
+      {
+        "thresholdMillis": 30000,
+        "delayMillis": 30001,
+        "waitsInBroker": true
+      },
+      {
+        "thresholdMillis": 30000,
+        "delayMillis": 60000,
+        "waitsInBroker": true
+      },
+      {
+        "thresholdMillis": 30000,
+        "delayMillis": 90000,
+        "waitsInBroker": true
+      },
+      {
+        "thresholdMillis": 30000,
+        "delayMillis": 300000,
+        "waitsInBroker": true
+      },
+      {
+        "thresholdMillis": 60000,
+        "delayMillis": 0,
+        "waitsInBroker": false
+      },
+      {
+        "thresholdMillis": 60000,
+        "delayMillis": 1,
+        "waitsInBroker": false
+      },
+      {
+        "thresholdMillis": 60000,
+        "delayMillis": 500,
+        "waitsInBroker": false
+      },
+      {
+        "thresholdMillis": 60000,
+        "delayMillis": 1000,
+        "waitsInBroker": false
+      },
+      {
+        "thresholdMillis": 60000,
+        "delayMillis": 29999,
+        "waitsInBroker": false
+      },
+      {
+        "thresholdMillis": 60000,
+        "delayMillis": 30000,
+        "waitsInBroker": false
+      },
+      {
+        "thresholdMillis": 60000,
+        "delayMillis": 30001,
+        "waitsInBroker": false
+      },
+      {
+        "thresholdMillis": 60000,
+        "delayMillis": 60000,
+        "waitsInBroker": true
+      },
+      {
+        "thresholdMillis": 60000,
+        "delayMillis": 90000,
+        "waitsInBroker": true
+      },
+      {
+        "thresholdMillis": 60000,
+        "delayMillis": 300000,
+        "waitsInBroker": true
+      },
+      {
+        "thresholdMillis": 0,
+        "delayMillis": 0,
+        "waitsInBroker": false
+      },
+      {
+        "thresholdMillis": 0,
+        "delayMillis": 1,
+        "waitsInBroker": false
+      },
+      {
+        "thresholdMillis": 0,
+        "delayMillis": 500,
+        "waitsInBroker": false
+      },
+      {
+        "thresholdMillis": 0,
+        "delayMillis": 1000,
+        "waitsInBroker": false
+      },
+      {
+        "thresholdMillis": 0,
+        "delayMillis": 29999,
+        "waitsInBroker": false
+      },
+      {
+        "thresholdMillis": 0,
+        "delayMillis": 30000,
+        "waitsInBroker": false
+      },
+      {
+        "thresholdMillis": 0,
+        "delayMillis": 30001,
+        "waitsInBroker": false
+      },
+      {
+        "thresholdMillis": 0,
+        "delayMillis": 60000,
+        "waitsInBroker": false
+      },
+      {
+        "thresholdMillis": 0,
+        "delayMillis": 90000,
+        "waitsInBroker": false
+      },
+      {
+        "thresholdMillis": 0,
+        "delayMillis": 300000,
+        "waitsInBroker": false
+      }
+    ]
+  },
+  "naming": {
+    "queue": "orders.new",
+    "deadLetterQueue": "orders.new.dlq",
+    "parkedQueue": "orders.new.parked",
+    "retryQueues": [
+      {
+        "delayMillis": 500,
+        "queue": "orders.new.retry.500ms"
+      },
+      {
+        "delayMillis": 1000,
+        "queue": "orders.new.retry.1s"
+      },
+      {
+        "delayMillis": 30000,
+        "queue": "orders.new.retry.30s"
+      },
+      {
+        "delayMillis": 90000,
+        "queue": "orders.new.retry.90s"
+      },
+      {
+        "delayMillis": 300000,
+        "queue": "orders.new.retry.5m"
+      },
+      {
+        "delayMillis": 7200000,
+        "queue": "orders.new.retry.2h"
+      }
+    ],
+    "subSecondDisagreement": "Java renders a sub-second delay in milliseconds — orders.new.retry.500ms — where the Go, Python and Ruby libraries render orders.new.retry.0s. Recorded rather than resolved. It is unreachable through the default thirty-second threshold and only appears for a policy that deliberately lowers the threshold below a second, but the two names are not the same queue and the libraries do not agree yet"
+  },
+  "rungArguments": [
+    {
+      "queue": "orders.new.retry.500ms",
+      "delayMillis": 500,
+      "arguments": {
+        "x-message-ttl": 500,
+        "x-dead-letter-exchange": "acemq.retry",
+        "x-dead-letter-routing-key": "orders.new"
+      }
+    },
+    {
+      "queue": "orders.new.retry.1s",
+      "delayMillis": 1000,
+      "arguments": {
+        "x-message-ttl": 1000,
+        "x-dead-letter-exchange": "acemq.retry",
+        "x-dead-letter-routing-key": "orders.new"
+      }
+    },
+    {
+      "queue": "orders.new.retry.30s",
+      "delayMillis": 30000,
+      "arguments": {
+        "x-message-ttl": 30000,
+        "x-dead-letter-exchange": "acemq.retry",
+        "x-dead-letter-routing-key": "orders.new"
+      }
+    },
+    {
+      "queue": "orders.new.retry.90s",
+      "delayMillis": 90000,
+      "arguments": {
+        "x-message-ttl": 90000,
+        "x-dead-letter-exchange": "acemq.retry",
+        "x-dead-letter-routing-key": "orders.new"
+      }
+    },
+    {
+      "queue": "orders.new.retry.5m",
+      "delayMillis": 300000,
+      "arguments": {
+        "x-message-ttl": 300000,
+        "x-dead-letter-exchange": "acemq.retry",
+        "x-dead-letter-routing-key": "orders.new"
+      }
+    },
+    {
+      "queue": "orders.new.retry.2h",
+      "delayMillis": 7200000,
+      "arguments": {
+        "x-message-ttl": 7200000,
+        "x-dead-letter-exchange": "acemq.retry",
+        "x-dead-letter-routing-key": "orders.new"
+      }
+    }
+  ],
+  "topology": {
+    "sourceQueue": "orders.new",
+    "policy": "exponential(6, 10s, 5m) at the default threshold",
+    "policyScheduleMillis": [10000, 20000, 40000, 80000, 160000],
+    "policyRungDelaysMillis": [40000, 80000, 160000],
+    "exchanges": [
+      {
+        "name": "orders",
+        "type": "topic",
+        "durable": true,
+        "declaredBy": "topology"
+      },
+      {
+        "name": "acemq.dlx",
+        "type": "direct",
+        "durable": true,
+        "declaredBy": "both"
+      },
+      {
+        "name": "acemq.retry",
+        "type": "direct",
+        "durable": true,
+        "declaredBy": "consumer"
+      }
+    ],
+    "queues": [
+      {
+        "name": "orders.new",
+        "type": "quorum",
+        "durable": true,
+        "arguments": {
+          "x-dead-letter-exchange": "acemq.dlx",
+          "x-dead-letter-routing-key": "orders.new.dlq"
+        },
+        "declaredBy": "topology"
+      },
+      {
+        "name": "orders.new.dlq",
+        "type": "classic",
+        "durable": true,
+        "arguments": {},
+        "declaredBy": "both"
+      },
+      {
+        "name": "orders.new.parked",
+        "type": "classic",
+        "durable": true,
+        "arguments": {},
+        "declaredBy": "both"
+      },
+      {
+        "name": "orders.new.retry.40s",
+        "type": "classic",
+        "durable": true,
+        "arguments": {
+          "x-message-ttl": 40000,
+          "x-dead-letter-exchange": "acemq.retry",
+          "x-dead-letter-routing-key": "orders.new"
+        },
+        "declaredBy": "consumer"
+      },
+      {
+        "name": "orders.new.retry.80s",
+        "type": "classic",
+        "durable": true,
+        "arguments": {
+          "x-message-ttl": 80000,
+          "x-dead-letter-exchange": "acemq.retry",
+          "x-dead-letter-routing-key": "orders.new"
+        },
+        "declaredBy": "consumer"
+      },
+      {
+        "name": "orders.new.retry.160s",
+        "type": "classic",
+        "durable": true,
+        "arguments": {
+          "x-message-ttl": 160000,
+          "x-dead-letter-exchange": "acemq.retry",
+          "x-dead-letter-routing-key": "orders.new"
+        },
+        "declaredBy": "consumer"
+      }
+    ],
+    "bindings": [
+      {
+        "queue": "orders.new.dlq",
+        "exchange": "acemq.dlx",
+        "routingKey": "orders.new.dlq",
+        "declaredBy": "both"
+      },
+      {
+        "queue": "orders.new.parked",
+        "exchange": "acemq.dlx",
+        "routingKey": "orders.new.parked",
+        "declaredBy": "both"
+      },
+      {
+        "queue": "orders.new",
+        "exchange": "orders",
+        "routingKey": "order.*",
+        "declaredBy": "topology"
+      },
+      {
+        "queue": "orders.new",
+        "exchange": "acemq.retry",
+        "routingKey": "orders.new",
+        "declaredBy": "consumer"
+      }
+    ]
+  },
+  "queueTypeDefaults": {
+    "sourceQueue": "quorum",
+    "sourceQueueWithDeadLetter": "quorum",
+    "explicitClassicQueue": "classic",
+    "explicitClassicQueueWithDeadLetter": "classic",
+    "deadLetterQueue": "classic",
+    "parkedQueue": "classic",
+    "retryRung": "classic",
+    "durability": {
+      "everyDeclaredQueueIsDurable": true,
+      "exclusiveAutoDeleteOrTransient": "not declarable through the Java API at all: Topology offers quorum, classic and dead-lettering variants and every one of them is durable, so the rule that an exclusive, auto-delete or transient queue stays classic has nothing to attach to here. The ports that do offer those flags must keep them classic; Java cannot be asked the question"
+    }
+  }
+}

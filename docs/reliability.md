@@ -142,6 +142,15 @@ paused overnight hands back messages that are on attempt one and four days old,
 and delivering them now is usually worse than not. `max_message_age` is checked
 against `envelope.age` before every retry decision.
 
+There is **no age limit unless you ask for one**. `max_message_age` defaults to
+zero, and zero means never — the attempt count is the only thing stopping a
+message that nobody bounded by age. Go, .NET and Ruby read zero the same way.
+Java does not: its default is 365 days and it is compared against
+unconditionally, so a message exactly a year old is abandoned there and retried
+here. That is a real divergence, and it is
+[recorded as one](testing.md#where-the-libraries-do-not-agree-yet) rather than
+hidden, but it is not one a service will meet by accident.
+
 ## Errors that will not improve
 
 ```python
