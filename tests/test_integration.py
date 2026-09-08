@@ -587,7 +587,12 @@ async def test_a_retry_goes_round_a_quorum_source_queue_and_a_classic_rung(
     from a classic one, and the rung it goes to is classic while the queue it
     comes home to is not, so every hop in this cycle crosses between the two.
     """
-    delay = timedelta(seconds=5)
+    # Eight seconds rather than five. The test has to detach the consumer before
+    # the rung gives the message back, or a second delivery would arrive while
+    # it was still counting the first; on a broker with a cold node the steps in
+    # between take long enough to make five a race this test would lose
+    # occasionally and confusingly.
+    delay = timedelta(seconds=8)
     policy = fixed_retry(2, delay).wait_in_broker_from(timedelta(seconds=1))
     queue = await workspace.queue("mixed", policy)
     rung = retry_queue(queue, delay)
