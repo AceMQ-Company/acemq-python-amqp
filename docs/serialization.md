@@ -31,6 +31,9 @@ JSON is the default. Nothing has to be configured to get it.
 | `ProtobufCodec` | `application/x-protobuf` | that, `application/protobuf`, `application/vnd.google.protobuf`, any `+protobuf` type | `[protobuf]` |
 | `AvroCodec` | `avro/binary`, or `application/vnd.acemq.avro` with a registry | see [Avro](#avro) | `[avro]` |
 
+`EncryptedCodec` is a sixth, and a different shape: it wraps one of the others
+rather than replacing it. See [Encryption](#encryption).
+
 **None of the five answers for a message with no content type.** Only
 `JsonCodec` does that, and it is the only one that should: JSON is the default
 format, so an untyped message is far more likely to be JSON than anything else.
@@ -381,14 +384,104 @@ returns a new one each time. Registering the same name twice replaces the first,
 which is what lets a test override a default. `codec_by_name` raises `KeyError`
 listing the names it does know.
 
+## Encryption
+
+`EncryptedCodec` wraps another codec and encrypts what it produced, so the
+broker, its disk, its backups and everybody who can read its management
+interface hold ciphertext.
+
+```bash
+pip install "acemq-amqp[crypto]"
+```
+
+```python
+from acemq_amqp import JsonCodec, connect
+from acemq_amqp.codecs.encrypted import EncryptedCodec, Keyring, generate_key
+
+keyring = Keyring.of("2026-01", generate_key())
+mq = await connect(url, codec=EncryptedCodec(JsonCodec(), keyring))
+```
+
+It wraps a delegate rather than serialising anything itself, so choosing a format
+and choosing to encrypt stay independent: JSON in, AES-GCM out, and Avro just as
+well. The content type on the wire is `application/vnd.acemq.encrypted` —
+deliberately not `...+json`, whatever the plaintext underneath is, because a
+`+json` suffix would make every JSON-aware consumer volunteer to parse
+ciphertext.
+
+### What is on the wire
+
+```
+0xAE  0x01  len  key identifier   12-byte nonce   ciphertext + 16-byte tag
+```
+
+**The key identifier travels in the clear.** That is the point: a consumer reads
+which key a message needs rather than assuming the current one, so a key can be
+rotated while messages written with the old one are still queued. `key_id_of()`
+reads it back from the bytes alone, which is what an operator staring at a
+dead-letter queue they can no longer read actually wants — and it needs no key
+to do it.
+
+The header is authenticated but not encrypted: GCM binds all ten-or-so bytes of
+it as associated data, so a key identifier altered in flight makes the message
+fail to open rather than quietly opening as something else.
+
+### Rotation
+
+```python
+keyring.add(EncryptionKey("2026-02", generate_key()))   # every consumer first
+keyring.use("2026-02")                                  # then one publisher
+```
+
+That order, always. A keyring holding one key cannot rotate without an outage.
+
+### Interoperability, and a divergence worth knowing about
+
+All four AceMQ libraries write `application/vnd.acemq.encrypted` and **four
+different things underneath it**. This is a real bug in the family, recorded here
+rather than smoothed over, because a consumer cannot tell which it is about to be
+handed:
+
+| | magic | version | id length | iv | cipher | tag |
+|---|---|---|---|---|---|---|
+| Java | `0xAE` | `0x01` | 1 byte | 12-byte nonce | AES-GCM | 16 bytes |
+| **Python** | `0xAE` | `0x01` | 1 byte | 12-byte nonce | AES-GCM | 16 bytes |
+| Go | none | `0x01` | 2 bytes, big-endian | 12-byte nonce | AES-GCM | 16 bytes |
+| .NET | none | `0x01` | 1 byte | 16-byte IV | AES-256-CBC | HMAC-SHA-256, 32 bytes |
+
+**Python interoperates with Java, and with nothing else.** A body written by Go
+or .NET is refused here — visibly, saying it was not written by this codec —
+rather than being decrypted into something wrong.
+
+Java's is the framing to converge on. It is the only one whose first byte
+identifies the format at all, which is what lets a body that was never encrypted
+be refused rather than misparsed; Go needs the magic byte and a one-byte length,
+and .NET needs both of those plus AES-GCM in place of encrypt-then-MAC.
+`tests/test_encrypted.py` holds a complete test vector — a known key, a known
+nonce and a known plaintext, with the exact bytes written out — for whoever does
+that work.
+
+### What it does not do
+
+The broker can no longer read the message, and neither can the people who operate
+it. **Decide what they do instead before turning this on**: a dead-letter queue
+full of ciphertext is a queue nobody can triage.
+
+Encryption is not authorisation — every service holding the keyring reads every
+message, so separate audiences mean separate keys — and it is not a signature:
+anybody holding a key can write a message this codec will decrypt without
+complaint. It does not hide the routing either. Exchange, routing key, headers
+and message size stay in the clear, and for many systems the routing key is the
+sensitive part.
+
+Nothing in the module ever puts a plaintext, a key, or any part of either into an
+exception, a log line or a `repr`, and a failure to decrypt says the same thing
+whether the key was wrong or the bytes were altered. Both are pinned by tests.
+
 ## What is not here
 
-Encryption. A codec that encrypts is a codec, and so is a codec that compresses;
-both wrap another one and neither needs anything from
-this library that is not on this page. An [interceptor](interceptors.md) is the
-alternative for encryption specifically, because it sees the payload before the
-codec runs and applies to every publisher without being remembered at each call
-site.
+Compression. A codec that compresses is a codec; it wraps another one and needs
+nothing from this library that is not on this page.
 
 A payload too large for a broker is also a codec's problem, and it does ship:
 `ClaimCheckCodec` wraps another codec, sends anything over a threshold to a

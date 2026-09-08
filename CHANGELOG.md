@@ -10,6 +10,121 @@ While the version is `0.x` the public API may change in any release.
 
 ### Added
 
+- **Payload encryption: `acemq_amqp.codecs.encrypted`, behind the `[crypto]`
+  extra.** `EncryptedCodec` wraps any other codec and encrypts what it produced,
+  so the broker, its disk, its backups and its management interface hold
+  ciphertext. AES-GCM through `cryptography`, a fresh 12-byte nonce per message
+  from `os.urandom`, and a 128-bit tag. The framing is
+  `0xAE | 0x01 | keyIdLen | keyId | nonce | ciphertext+tag`, and the whole header
+  is bound in as associated data, so a key identifier altered in flight makes the
+  message fail to open rather than open as something else.
+
+- The key identifier travels **in the clear**, which is what makes rotation
+  possible: a consumer reads which key a message needs instead of assuming the
+  current one, so a new key can be introduced while messages written with the old
+  one are still queued. `key_id_of(body)` answers that question from the bytes
+  alone, without holding any key — which is what an operator looking at a
+  dead-letter queue they can no longer read actually needs. `Keyring` holds
+  several keys with one current; `add` then `use` is the order to rotate in.
+
+- No failure message, log line or `repr` in that module ever contains the
+  plaintext, the key, or any part of either, and a wrong key and a tampered body
+  produce the identical `FatalError` — GCM authenticates before it returns
+  anything, and nothing was added that would tell the two apart. Both properties
+  are pinned by tests that sweep every failure path rather than by one assertion
+  each.
+
+- **A cross-language divergence, recorded rather than smoothed over.** All four
+  libraries write `application/vnd.acemq.encrypted` and four different things
+  underneath it. Java uses a `0xAE` magic byte, a one-byte identifier length and
+  AES-GCM; Go omits the magic byte and writes a two-byte big-endian length; .NET
+  omits the magic byte and uses AES-256-CBC with an HMAC-SHA-256 tag over a
+  16-byte IV. **This library implements Java's, byte for byte, and interoperates
+  with Java alone** — a Go or .NET body is refused visibly rather than misread.
+  Java's is the one to converge on, being the only framing whose first byte
+  identifies the format at all. `tests/test_encrypted.py` carries a complete test
+  vector — known key, known nonce, known plaintext, exact bytes — to converge
+  against, and a body produced by the compiled Java codec that is decrypted here.
+
+- **Development certificates: `acemq_amqp.devcerts`, behind the `[crypto]`
+  extra.** `python -m acemq_amqp.devcerts` writes a certificate authority, a
+  broker certificate, a client certificate and a `rabbitmq.conf` pointing the
+  broker at them — the same file names Go's `acemq-certs` writes, so it is a
+  drop-in replacement for it in a script such as `scripts/tls-broker.sh`. ECDSA
+  on P-256, thirty days by default, an hour of slack at the front for a
+  container's clock, private keys written `0600`.
+
+- **Every certificate carries `ACEMQ DEVELOPMENT ONLY - DO NOT TRUST` in its
+  subject organisation, and `acemq_amqp.security` now refuses any certificate
+  carrying it — however trust is configured, `without_verifying_the_broker()`
+  included.** That is what stops a development certificate reaching production: a
+  generated authority's private key sits next to its certificate and usually ends
+  up in a repository, so one that could reach production would be an authority
+  anybody who can read that repository can issue against, and the connection
+  would succeed. Java, Go and .NET stamp the same string and enforce it the same
+  way.
+
+- The refusal happens twice, because a development certificate arrives from two
+  directions. Files this configuration *names* are checked when the TLS context
+  is built, where the error can point at the setting to change; what the broker
+  *presents* is checked at the handshake through `SSLContext.sslobject_class`,
+  which is the only seam `ssl` offers — there is no verify callback of the sort
+  Go's `VerifyPeerCertificate` and Java's `X509TrustManager` give. The handshake
+  check reads the encoded certificate rather than a verified chain, because under
+  `CERT_NONE` there is no verified chain and that is precisely the configuration
+  in which a development certificate is most likely to be reached for.
+
+- `Security(allow_development_certificates=True)` is the way through, named the
+  same as in the other three libraries. It counts as a TLS setting, so it is
+  refused against an `amqp://` URL alongside the rest.
+
+- `DEVELOPMENT_MARKER` and `is_development_certificate` are exported from
+  `acemq_amqp`. The latter reads DER, and reads PEM by decoding it first — the
+  marker is plain ASCII inside a DER certificate and nowhere to be seen in the
+  Base64 that wraps it, so a PEM file searched as it stands comes back clean
+  every time.
+
+- **OpenTelemetry tracing: `acemq_amqp.tracing`, behind the `[opentelemetry]`
+  extra.** `OpenTelemetryTracing().install(mq)` registers a publish interceptor
+  and a consume interceptor. Written against `opentelemetry-api` and not the SDK,
+  which is the package a library is supposed to depend on: without an SDK
+  installed and configured by the application, the API's no-op implementation
+  runs and nothing is exported.
+
+- **A consumer's span is a child of the publish that caused it**, extracted from
+  the message's own headers rather than from ambient context. That join — across
+  processes and minutes — is the entire reason to trace a message system, and
+  reading the ambient context instead would produce traces that look joined up
+  and join the wrong things.
+
+- Trace context travels in `traceparent` and `tracestate`, now in
+  `acemq_amqp.headers` and **deliberately not `x-acemq-` prefixed** unlike every
+  other name in that module: they are the W3C names other tooling already
+  recognises, and prefixing them would have made the context private to AceMQ.
+  Java, Go and .NET write the same two.
+
+- Spans are `<destination> publish` (PRODUCER), `<queue> process` (CONSUMER) and
+  `<destination> request` (CLIENT). CLIENT for the request because that span
+  waits for an answer, so its duration measures a responder rather than a broker.
+  Attributes are `messaging.system`, `messaging.destination.name`,
+  `messaging.operation`, `messaging.message.id`,
+  `messaging.message.conversation_id`,
+  `messaging.rabbitmq.destination.routing_key`, `messaging.acemq.message_type`,
+  `messaging.acemq.attempt` and `messaging.acemq.outcome` — the same names in all
+  four libraries. `unroutable`, `failed` and `dead_lettered` set the span status
+  to ERROR; the others, `retried` included, do not.
+
+- `outbox.publish_failed`, `pipeline.run_finished`, `message.retried` and
+  `message.dead_lettered` are **events on the current span rather than spans of
+  their own**, because a zero-length span at the end of a trace adds a row and no
+  information. `propagation_headers()` injects the current context into a fresh
+  carrier for a message this library does not publish.
+
+- The tracing tests use the SDK's `InMemorySpanExporter` and assert on spans that
+  were really emitted, not on mock calls — a mocked tracer is satisfied by an
+  adapter whose spans never end, are never parented and never reach an exporter.
+  An integration test proves the same join survives a real broker round trip.
+
 - **The five codecs Java and Go ship: YAML, TOML, XML, Protobuf and Avro.** One
   module each under `acemq_amqp.codecs`, one extra each, and nothing added to the
   core's dependencies. The gap they close is not capability — Python could always

@@ -53,10 +53,24 @@ yaml = ["PyYAML>=6.0"]
 toml = ["tomli-w>=1.0", "tomli>=2.0; python_version < '3.11'"]
 protobuf = ["protobuf>=4.25"]
 avro = ["fastavro>=1.9"]
+# AES-GCM for codecs.encrypted, and X.509 for devcerts. Both are cryptography's
+# whole reason to exist and neither is in the standard library: hashlib and hmac
+# are there, an authenticated cipher and a certificate builder are not. One
+# extra rather than two, because it is one dependency either way and a project
+# that has it installed has both.
+crypto = ["cryptography>=42.0"]
+# The tracing adapter is written against the OpenTelemetry *API* alone, which is
+# the package a library is supposed to depend on: it is inert until an
+# application installs an SDK and configures it, so importing this cannot start
+# exporting anything an application did not ask for.
+opentelemetry = ["opentelemetry-api>=1.20"]
 dev = [
   "aio-pika>=9.4",
+  "cryptography>=42.0",
   "fastavro>=1.9",
   "mypy>=1.11",
+  "opentelemetry-api>=1.20",
+  "opentelemetry-sdk>=1.20",
   # Pinned, so a new pdoc cannot change the published API reference without
   # somebody choosing it. The docs workflow installs the same version.
   "pdoc==15.0.1",

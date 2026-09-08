@@ -1,12 +1,14 @@
-# Metrics and health
+# Metrics, health and tracing
 
-Two questions an operator asks about a service that consumes a queue, and the
-library is the only thing that can answer either.
+Three questions an operator asks about a service that consumes a queue, and the
+library is the only thing that can answer any of them.
 
 How much is going through, how much is failing and how long a handler takes are
 numbers nobody outside the process can see. Whether the connection is really up
 — as opposed to a socket that is open and wedged — is a question only something
-holding the connection can ask.
+holding the connection can ask. And what happened to *one particular message*,
+across the two services and the several minutes it took, is a question nothing
+outside the library can even join up: see [Tracing](#tracing).
 
 ## No hard dependency
 
@@ -237,3 +239,111 @@ Neither is authenticated by anything here. A metrics endpoint says which queues
 exist, how much traffic each carries and when a service started failing, and a
 health endpoint says which dependencies it has. Put both behind whatever the
 rest of the service is behind, or on a port that is not published.
+
+## Tracing
+
+Metrics answer *how much*. A trace answers *what happened to this message* — and
+the two are not substitutes. A counter says a thousand messages were
+dead-lettered; a trace says this one was published by checkout, retried twice
+over four minutes and given up on, which is the question somebody is actually
+holding when they open a dashboard.
+
+```bash
+pip install "acemq-amqp[opentelemetry]"
+```
+
+```python
+from acemq_amqp import connect
+from acemq_amqp.tracing import OpenTelemetryTracing
+
+mq = await connect(url)
+OpenTelemetryTracing().install(mq)
+```
+
+`install` registers a publish interceptor and a consume interceptor. Nothing else
+changes.
+
+The dependency is `opentelemetry-api`, not the SDK — the package a library is
+supposed to depend on. Without an SDK installed and configured by the
+application, the API's no-op implementation runs and this exports nothing at all,
+so importing it can never start sending data nobody asked for. The application
+picks the SDK, the exporter and the sampler.
+
+### The join is the point
+
+A consumer's span is a child of the **publish that caused it**, taken from the
+message's own headers rather than from whatever context happened to be current
+when the delivery arrived. Those are different processes, different machines and
+often minutes apart, and joining them is the one thing a messaging system needs
+from tracing that an HTTP client does not.
+
+Reading the ambient context instead would produce a trace that looks joined up
+and joins the wrong things — a delivery attached to the connection's context, or
+to the *previous* message's.
+
+### The headers
+
+`traceparent` and `tracestate`. Deliberately **not** `x-acemq-` prefixed, unlike
+every other header this library writes: they are the W3C names every piece of
+tracing tooling already reads, so a message published here joins up in a consumer
+that has never heard of AceMQ, and one published by such a consumer joins up
+here. Java, Go and .NET write the same two names for the same reason.
+
+### The spans
+
+| Name | Kind | When |
+|---|---|---|
+| `<destination> publish` | `PRODUCER` | a message goes out |
+| `<queue> process` | `CONSUMER` | a handler runs |
+| `<destination> request` | `CLIENT` | a request waits for a reply |
+
+`request` is `CLIENT` rather than `PRODUCER` because that span *waits*. Its
+duration means something different as a result — a slow publish is a slow broker,
+a slow request is a slow responder — and the kind is what makes a backend show
+them apart rather than averaging one into the other.
+
+```python
+with tracing.request_span("pricing", envelope):
+    answer = await requester.ask(...)
+```
+
+### The attributes
+
+`messaging.system`, `messaging.destination.name`, `messaging.operation`,
+`messaging.message.id`, `messaging.message.conversation_id`,
+`messaging.rabbitmq.destination.routing_key`, and three of AceMQ's own where the
+conventions have no name: `messaging.acemq.message_type`,
+`messaging.acemq.attempt` and `messaging.acemq.outcome`. The same names in all
+four libraries, so one dashboard reads across them.
+
+`unroutable`, `failed` and `dead_lettered` set the span status to `ERROR`. The
+others — including `retried` — do not. A retry is the system working and usually
+succeeds; colouring a trace red for it produces a wall of red traces that turned
+out fine, which is how people learn to ignore the colour.
+
+### Events, not spans
+
+`outbox.publish_failed`, `pipeline.run_finished`, `message.retried` and
+`message.dead_lettered` are recorded as events on whatever span is current:
+
+```python
+tracing.message_retried(queue, envelope, delay_ms=5000)
+tracing.message_dead_lettered(queue, envelope, "out of attempts")
+```
+
+A zero-length span at the end of a trace adds a row to the waterfall and no
+information. An event lands on the span that was doing the work, which is where
+whoever is reading the trace is already looking.
+
+### Propagating by hand
+
+`propagation_headers()` injects the current context into a fresh carrier, for a
+message this library does not publish — one going out through a different client,
+or into a database row an outbox relay will publish later:
+
+```python
+row["headers"] = tracing.propagation_headers()   # {'traceparent': '00-...'}
+```
+
+A fresh carrier every time, so nothing already on the message is overwritten and
+nothing from a previous one is left behind.

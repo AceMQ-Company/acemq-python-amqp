@@ -178,7 +178,7 @@ NAV='<nav class="top">
       <a href="security.html">Security</a>
       <a href="reliability.html">Retries, redelivery, shutdown</a>
       <a href="serialization.html">Codecs</a>
-      <a href="observability.html">Metrics and health</a>
+      <a href="observability.html">Metrics, health and tracing</a>
       <a href="licence.html">Licence</a>
     </div>
   </div>

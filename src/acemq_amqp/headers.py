@@ -59,6 +59,25 @@ CLAIM = "x-acemq-claim"
 #: The prefix every reserved name shares.
 PREFIX = "x-acemq-"
 
+#: W3C trace context. **Deliberately not prefixed**, unlike everything above.
+#:
+#: These two are not AceMQ's names to choose. They are the ones the W3C
+#: specification defines and every piece of tracing tooling already reads, so a
+#: message published here joins up in a consumer written with no knowledge of
+#: this library, and a message published by such a consumer joins up here.
+#: Prefixing them would have been consistent with the rest of this module and
+#: would have made the trace context private to AceMQ, which is the exact
+#: opposite of what a propagation format is for. Java, Go and .NET write these
+#: same two names for the same reason.
+#:
+#: They are application headers, not reserved ones: they belong to whatever
+#: wrote them, they are copied rather than re-derived, and
+#: :mod:`acemq_amqp.tracing` is what puts them on a message.
+TRACEPARENT = "traceparent"
+
+#: The vendor-specific half of the W3C trace context. See :data:`TRACEPARENT`.
+TRACESTATE = "tracestate"
+
 #: Every name this library writes and understands.
 RESERVED = frozenset(
     {ID, TYPE, VERSION, CORRELATION, CAUSATION, ATTEMPT, FIRST_SEEN, ORIGIN, ERROR, CLAIM}

@@ -188,6 +188,35 @@ ignored, and that is deliberate too: a service that was handed a certificate
 authority, connected in plaintext and reported success is the failure this whole
 module exists to prevent. Credentials alone are welcome on either scheme.
 
+### Certificates for a broker on a laptop
+
+```bash
+pip install "acemq-amqp[crypto]"
+python -m acemq_amqp.devcerts --directory certs --broker localhost
+```
+
+An authority, a broker certificate, a client certificate and a `rabbitmq.conf`
+pointing the broker at them — the same file names Go's `acemq-certs` writes, so
+it is a drop-in replacement for it.
+
+Everything it writes carries `ACEMQ DEVELOPMENT ONLY - DO NOT TRUST` in its
+subject organisation, and **this library refuses any certificate carrying it,
+however trust is configured — `without_verifying_the_broker()` included**. That
+is not a warning in a docstring; it is the mechanism. A generated authority's
+private key sits next to its certificate and usually ends up in a repository, so
+a development certificate that could reach production would be an authority
+anybody who can read that repository can issue against, and the connection would
+succeed. Java, Go and .NET stamp the same string and enforce it the same way.
+
+The way through, for the one place it belongs:
+
+```python
+security=Security(certificate_authority="certs/ca.crt", allow_development_certificates=True)
+```
+
+A named argument a reviewer will see, and one more thing to `grep` for in a
+deployed configuration. See [Security](docs/security.md#development-certificates).
+
 ## What is identical, and what is not
 
 **Identical**, because a message crosses languages: the reserved header names
@@ -421,6 +450,36 @@ message that was perfectly readable. That is the gap these close: not
 capability, interoperability. See [Codecs](docs/serialization.md), and note what
 the XML codec does about document type declarations.
 
+### Encrypted bodies
+
+`EncryptedCodec` wraps any of the above and encrypts what it produced, so the
+broker, its disk, its backups and its management interface hold ciphertext:
+
+```python
+# pip install "acemq-amqp[crypto]"
+from acemq_amqp.codecs.encrypted import EncryptedCodec, Keyring, generate_key
+
+keyring = Keyring.of("2026-01", generate_key())
+mq = await connect(url, codec=EncryptedCodec(JsonCodec(), keyring))
+```
+
+AES-GCM, a fresh nonce per message, and the key identifier in the clear in front
+of the ciphertext — which is what makes rotation possible, because a consumer
+reads which key a message needs instead of assuming the current one. The header
+is bound in as associated data, so an identifier altered in flight makes the
+message fail to open rather than open as something else. `key_id_of(body)`
+answers "which key does this need?" from the bytes alone, without holding any.
+
+No failure message, log line or exception ever contains the plaintext or the key,
+and a wrong key and a tampered body fail identically — GCM authenticates before
+it returns anything, and nothing here adds a check that would tell them apart.
+
+**It interoperates with the Java library and with nothing else.** Java, Go and
+.NET currently write three different framings under one content type; a body from
+Go or .NET is refused here, visibly, rather than misread. The table and the test
+vector to converge on are in
+[Codecs → Encryption](docs/serialization.md#encryption).
+
 ## Interceptors
 
 Every organisation has something every message needs and no library can guess: a
@@ -561,6 +620,44 @@ of rotation.
 `aggregate_health` runs checks at once rather than in turn, under a deadline, so
 one that hangs cannot hang the probe with it — and a probe that hangs is a pod
 that never comes back.
+
+### Tracing
+
+```python
+# pip install "acemq-amqp[opentelemetry]"
+from acemq_amqp.tracing import OpenTelemetryTracing
+
+OpenTelemetryTracing().install(mq)
+```
+
+Metrics answer *how much*. A trace answers *what happened to this message* — this
+one was published by checkout, retried twice over four minutes and given up on —
+and a counter cannot.
+
+**A consumer's span is a child of the publish that caused it**, taken from the
+message's own headers rather than from whatever context happened to be current
+when the delivery arrived. Those are different processes and often minutes apart,
+and joining them is the one thing a messaging system needs from tracing that an
+HTTP client does not.
+
+The context travels in `traceparent` and `tracestate` — deliberately **not**
+`x-acemq-` prefixed, unlike every other header here, because they are the W3C
+names every other piece of tracing tooling already reads. Java, Go and .NET write
+the same two.
+
+| Span | Kind |
+|---|---|
+| `<destination> publish` | `PRODUCER` |
+| `<queue> process` | `CONSUMER` |
+| `<destination> request` | `CLIENT` — because that one *waits*, so its duration measures a responder rather than a broker |
+
+`unroutable`, `failed` and `dead_lettered` set the span status to `ERROR`; the
+others, `retried` included, do not — a retry is the system working, and a wall of
+red traces that turned out fine is how people learn to ignore the colour.
+
+The dependency is `opentelemetry-api`, not the SDK, so without an application
+configuring one this exports nothing at all. See
+[Tracing](docs/observability.md#tracing).
 
 ## Patterns
 

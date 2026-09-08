@@ -89,12 +89,14 @@ from .retry import (
     no_retry,
 )
 from .security import (
+    DEVELOPMENT_MARKER,
     Credentials,
     CredentialsSource,
     Security,
     Verification,
     credentials_from_environment,
     credentials_from_file,
+    is_development_certificate,
     without_verifying_the_broker,
 )
 from .telemetry import (
@@ -154,6 +156,7 @@ __all__ = [
     "BYTES_CONTENT_TYPE",
     "DEAD_LETTER_EXCHANGE",
     "DEFAULT_BROKER_WAIT_THRESHOLD",
+    "DEVELOPMENT_MARKER",
     "JSON_CONTENT_TYPE",
     "METRIC_ACCEPTED",
     "METRIC_CONSUMED",
@@ -231,6 +234,7 @@ __all__ = [
     "exponential_retry",
     "fixed_retry",
     "headers",
+    "is_development_certificate",
     "no_retry",
     "parked_queue",
     "prometheus_text",

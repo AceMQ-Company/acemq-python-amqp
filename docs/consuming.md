@@ -251,4 +251,4 @@ consumer.closed       # whether it has been stopped
 `running` is the interesting one and is what `Connection.health()` reads. A
 consumer whose workers have all finished without it being closed is one the
 broker is still sending messages to and nothing is reading — indistinguishable
-from a quiet queue from outside. See [metrics and health](observability.md).
+from a quiet queue from outside. See [metrics, health and tracing](observability.md).

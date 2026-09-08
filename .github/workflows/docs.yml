@@ -62,7 +62,7 @@ jobs:
         #
         # pdoc is pinned so a new release cannot change the rendered reference
         # without somebody choosing it.
-        run: pip install -e ".[rabbitmq,prometheus,yaml,toml,protobuf,avro]" pdoc==15.0.1
+        run: pip install -e ".[rabbitmq,prometheus,yaml,toml,protobuf,avro,crypto,opentelemetry]" pdoc==15.0.1
 
       - name: Render the pages
         run: bash .github/scripts/build-docs-site.sh

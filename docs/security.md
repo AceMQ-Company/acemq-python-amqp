@@ -210,6 +210,77 @@ leave in a file nobody rereads.
 `Security(certificate_authority="ca.crt")` — and gives back everything this
 gives up.
 
+## Development certificates
+
+A broker on a laptop needs a certificate, and the alternative to generating one
+is six `openssl` invocations with a hand-written extensions file — which is how
+people end up developing against a plaintext broker instead, and finding out on
+the day TLS is switched on that nothing was ever tested through it.
+
+```bash
+pip install "acemq-amqp[crypto]"
+python -m acemq_amqp.devcerts --directory certs --broker localhost
+```
+
+That writes `ca.crt`, `ca.key`, `server.crt`, `server.key`, `client.crt`,
+`client.key` and a `rabbitmq.conf` pointing the broker at them. The same file
+names Go's `acemq-certs` writes, so it is a drop-in replacement for it.
+
+```python
+from acemq_amqp.devcerts import generate
+
+written = generate("certs", broker_host="localhost", validity_days=30)
+```
+
+### The marker, which is the whole point
+
+Every certificate written carries `ACEMQ DEVELOPMENT ONLY - DO NOT TRUST` in its
+subject organisation, and **this library refuses any certificate carrying it,
+however trust is configured — including `without_verifying_the_broker()`**:
+
+```python
+mq = await connect("amqps://broker:5671/", security=Security(certificate_authority="certs/ca.crt"))
+# SecurityError: the certificate authority 'certs/ca.crt' is marked 'ACEMQ DEVELOPMENT
+# ONLY - DO NOT TRUST'. It was generated for development and its signing key is not a
+# secret, so it is not trusted here. Use a real certificate, or say so deliberately with
+# Security(allow_development_certificates=True)
+```
+
+That is not a warning somebody has to read. It is the mechanism. A generated
+authority's private key sits in the same directory as its certificate and
+usually ends up in a repository, so a certificate that *could* reach production
+would be an authority anybody who can read that repository can issue against —
+and the failure would be silent, because the connection succeeds.
+
+Java, Go and .NET stamp the same string and enforce it the same way, so a broker
+set up by any of the four is reachable from all of them and none of them will
+speak to it without being told.
+
+Two checks, because a development certificate arrives from two directions. The
+files this configuration *names* are read when the TLS context is built, where
+the error can point at the setting that is wrong. What the broker actually
+*presents* is checked at the handshake, where no trust setting can avoid it —
+that is the path that matters under `without_verifying_the_broker()`, because
+there is no verified chain there for a check to hang on and it is the
+configuration in which a development certificate is most likely to be reached
+for.
+
+### Saying so deliberately
+
+```python
+mq = await connect(
+    "amqps://localhost:5671/",
+    security=Security(
+        certificate_authority="certs/ca.crt",
+        allow_development_certificates=True,
+    ),
+)
+```
+
+A named argument, spelled out, that a reviewer will see. It belongs in a test
+fixture and a developer's compose file and nowhere else — put it in the
+production checklist below as something to `grep` for.
+
 ## A production checklist
 
 - `amqps://` in the URL. Nothing else makes the connection encrypted
@@ -218,6 +289,9 @@ gives up.
   per connection
 - No `without_verifying_the_broker` anywhere — `grep` for it in the deployed
   configuration, not only in the code
+- No `allow_development_certificates=True` anywhere either, and for the same
+  reason. Without it a development certificate cannot reach production; with it,
+  one can
 - `client_certificate` too, if the broker authenticates clients that way
 - The account the service logs in as has permissions on the queues it uses and
   nothing else. That is a broker configuration and this library cannot help with
@@ -225,16 +299,15 @@ gives up.
 
 ## What this library does not do
 
-It does not encrypt message **bodies**. TLS protects the connection, and a
+TLS does not encrypt message **bodies**. It protects the connection, and a
 message sitting in a queue is plaintext to anyone with access to the broker. A
-payload that must not be readable there has to be encrypted before it is
-published — an [interceptor](interceptors.md) is the natural place, because it
-sees the payload before the codec runs and applies to every publisher without
-being remembered at each call site.
+payload that must not be readable there is
+[`EncryptedCodec`'s](serialization.md#encryption) problem, not this module's.
 
-It does not manage certificates, rotate them, or generate development ones.
-`ssl` is the standard library, and the context this module builds is handed to
-aio-pika rather than reimplemented around it.
+It does not manage certificates or rotate them. `ssl` is the standard library,
+and the context this module builds is handed to aio-pika rather than
+reimplemented around it. It generates development ones and refuses them
+everywhere else, which is a different job from being a certificate authority.
 
 It does not authorise. Which queues an account may read and write is a broker
 setting, and a library that appeared to enforce it would be enforcing it in the

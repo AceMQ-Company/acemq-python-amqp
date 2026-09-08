@@ -73,8 +73,10 @@ from acemq_amqp import (
     PublishResult,
     RetryPolicy,
     Security,
+    SecurityError,
     TextCodec,
     Topology,
+    Verification,
     accept,
     connect,
     dead_letter_queue,
@@ -1410,12 +1412,47 @@ def handshakes(monkeypatch: pytest.MonkeyPatch) -> list[ssl.SSLObject]:
 
 
 def trusting_the_test_authority(**extra: object) -> Security:
-    """The settings a service deployed against this broker would really use."""
+    """The settings a service deployed against this broker would really use.
+
+    With one addition a real service must not copy:
+    ``allow_development_certificates``. The fixture broker's certificates come
+    from ``acemq-certs`` and carry ``ACEMQ DEVELOPMENT ONLY - DO NOT TRUST``, so
+    without it every test in this section is refused at the handshake — which is
+    the point of the marker and is asserted directly a few tests below. Saying so
+    here, once, is exactly the deliberate act the flag exists to require.
+    """
     return Security(
         certificate_authority=CERTIFICATES / "ca.crt",
         credentials=TLS_LOGIN,
+        allow_development_certificates=True,
         **extra,  # type: ignore[arg-type]
     )
+
+
+@needs_a_tls_broker
+async def test_a_development_certificate_is_refused_however_trust_is_configured() -> None:
+    """The safety net under the certificate generator, against a real handshake.
+
+    The broker on the other end is presenting a certificate stamped
+    ``ACEMQ DEVELOPMENT ONLY - DO NOT TRUST``, which is what makes this
+    assertable at all: every other test in this section has to opt out of the
+    refusal to get anywhere. Both routes in are tried — the authority named, and
+    no verification whatsoever — because a check that only ran on the verifying
+    path would be absent from the one configuration where a development
+    certificate is most likely to be reached for.
+    """
+    named = Security(
+        certificate_authority=CERTIFICATES / "ca.crt", credentials=TLS_LOGIN
+    )
+    with pytest.raises(SecurityError, match="DEVELOPMENT ONLY"):
+        await connect(TLS_BROKER, security=named)
+
+    # Nothing verified at all, so there is no chain and no trust decision to
+    # hang a check on. It still refuses.
+    with pytest.raises(AMQPConnectionError, match="DEVELOPMENT ONLY"):
+        await connect(
+            TLS_BROKER, security=without_verifying_the_broker(credentials=TLS_LOGIN)
+        )
 
 
 @needs_a_tls_broker
@@ -1491,7 +1528,14 @@ async def test_the_opt_out_gets_in_where_verification_would_not(
     # check. Encrypted, and to whoever answered: which is exactly what
     # without_verifying_the_broker's docstring says it is for and against.
     mq = await connect(
-        TLS_BROKER, security=without_verifying_the_broker(credentials=TLS_LOGIN)
+        TLS_BROKER,
+        security=Security(
+            credentials=TLS_LOGIN,
+            verification=Verification.NOTHING_AT_ALL,
+            # The fixture broker's certificate is a development one. See
+            # trusting_the_test_authority.
+            allow_development_certificates=True,
+        ),
     )
     try:
         assert await mq.queue_exists(f"{PREFIX}nothing-of-the-kind") is False
@@ -1970,3 +2014,64 @@ async def test_a_message_no_codec_claims_is_parked_rather_than_guessed_at(
         await consumer.close()
 
     assert parked.payload == body
+
+
+# --------------------------------------------------------------------------
+# Tracing, across a real broker
+#
+# The unit tests in tests/test_tracing.py drive the interceptors directly and
+# assert on the spans that came out. What they cannot prove is that the trace
+# context survives the trip: headers are rendered by the envelope, written by
+# the transport, stored by the broker, read back and parsed again, and a context
+# that is lost anywhere along that path produces two traces that look perfectly
+# healthy and are not connected to each other.
+# --------------------------------------------------------------------------
+
+
+async def test_a_trace_joins_a_publisher_and_a_consumer_through_the_broker(
+    mq: Connection, workspace: Workspace
+) -> None:
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from acemq_amqp.headers import TRACEPARENT
+    from acemq_amqp.tracing import OpenTelemetryTracing
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    OpenTelemetryTracing(system="rabbitmq", tracer_provider=provider).install(mq)
+
+    queue = await workspace.queue("traced")
+    seen: list[Message] = []
+
+    def remember(message: Message) -> Ack:
+        seen.append(message)
+        return accept()
+
+    consumer = await mq.consume(queue, remember)
+    try:
+        await mq.publisher(routing_key=queue, mandatory=True).send({"id": "7"})
+        for _ in range(200):
+            if seen:
+                break
+            await asyncio.sleep(0.05)
+    finally:
+        await consumer.close()
+        provider.shutdown()
+
+    assert seen, "the message never arrived"
+    # The W3C header really crossed the broker, unprefixed and in the form
+    # anything else reading this queue would recognise.
+    assert str(seen[0].envelope.headers[TRACEPARENT]).startswith("00-")
+
+    spans: dict[str, Any] = {span.name: span for span in exporter.get_finished_spans()}
+    publish = spans[f"{queue} publish"]
+    process = spans[f"{queue} process"]
+
+    # One trace, and the delivery hangs under the publish that caused it.
+    assert process.context.trace_id == publish.context.trace_id
+    assert process.parent.span_id == publish.context.span_id
+    assert publish.attributes["messaging.acemq.outcome"] == "confirmed"
+    assert process.attributes["messaging.acemq.outcome"] == "acked"
