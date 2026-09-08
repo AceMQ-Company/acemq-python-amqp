@@ -66,7 +66,12 @@ installing a broker client:
 pip install acemq-amqp                # the contract, no dependencies at all
 pip install "acemq-amqp[rabbitmq]"    # and a way to talk to a broker
 pip install "acemq-amqp[prometheus]"  # and a registry to report into
+pip install "acemq-amqp[yaml]"        # and one of the five optional formats
 ```
+
+The formats go the same way, one extra each — `[yaml]`, `[toml]`, `[protobuf]`,
+`[avro]` — because a service that speaks YAML has no reason to install a
+protobuf runtime. XML has no extra: it is written against the standard library.
 
 ### Not running an event loop?
 
@@ -395,6 +400,26 @@ candidate and the first that can actually read the body wins. `BytesCodec`
 answers for everything and hands back the bytes unchanged, which is what to read
 a dead-letter queue with: the message that went there may be exactly the one
 nothing could decode.
+
+Five more formats ship behind an extra each — the same five Java and Go ship, so
+a message from either is readable here:
+
+```python
+from acemq_amqp.codecs.avro import AvroCodec          # avro/binary
+from acemq_amqp.codecs.protobuf import ProtobufCodec  # application/x-protobuf
+from acemq_amqp.codecs.toml import TomlCodec          # application/toml
+from acemq_amqp.codecs.xml import XmlCodec            # application/xml
+from acemq_amqp.codecs.yaml import YamlCodec          # application/yaml
+
+mq = await connect(url, codec=CompositeCodec(JsonCodec(), YamlCodec()))
+```
+
+Each reads a wider set than it writes, because a producer in another stack uses
+whichever spelling its own library picked — `text/yaml` and `application/x-yaml`
+both predate the registered `application/yaml`, and refusing them would park a
+message that was perfectly readable. That is the gap these close: not
+capability, interoperability. See [Codecs](docs/serialization.md), and note what
+the XML codec does about document type declarations.
 
 ## Interceptors
 

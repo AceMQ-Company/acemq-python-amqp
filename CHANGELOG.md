@@ -10,6 +10,99 @@ While the version is `0.x` the public API may change in any release.
 
 ### Added
 
+- **The five codecs Java and Go ship: YAML, TOML, XML, Protobuf and Avro.** One
+  module each under `acemq_amqp.codecs`, one extra each, and nothing added to the
+  core's dependencies. The gap they close is not capability — Python could always
+  parse YAML — but interoperability: a Java or Go service publishing any of these
+  formats produced a message this library refused, because nothing here claimed
+  the content type. The write types are the contract and are the ones the other
+  libraries write: `application/yaml`, `application/toml`, `application/xml`,
+  `application/x-protobuf`, and `avro/binary` or `application/vnd.acemq.avro`.
+
+- Each codec **reads a wider set than it writes**, because a producer in another
+  stack uses whichever spelling its own library picked. YAML also accepts
+  `application/x-yaml`, `text/yaml` and `text/x-yaml` — all three predate the
+  RFC 9512 registration and are what most tooling still emits — TOML also accepts
+  `text/toml`, XML also accepts `text/xml`, Protobuf also accepts
+  `application/protobuf`, and every one of them accepts its `+suffix` form. None
+  of the five answers for a message with **no** content type; `JsonCodec` remains
+  the only codec that does, which is right, because a YAML codec that volunteered
+  would return the correct value while recording that a YAML message had arrived.
+
+- The suite proves this against **another language's bytes rather than its own**.
+  `tests/fixtures/codec-interop-fixtures.json` holds eleven message bodies
+  produced by a Go program calling the same functions `acemq-go-amqp/codec/*`
+  calls at the versions its `go.mod` files pin, and by a Java program whose
+  Jackson mappers are the bodies of the Java codecs' `defaultMapper()` methods at
+  the versions `acemq-java-amqp/pom.xml` declares. A round trip would have proved
+  nothing about either. Java and Go turned out to write byte-identical XML and
+  byte-identical Avro in both framings; their YAML differs only in list
+  indentation and their TOML only in quote style, and both of each pair decode to
+  the same value here.
+
+- **`ProtobufCodec` accepts `application/vnd.google.protobuf`, which Java does
+  not.** Go's codec accepts it and Java's does not, so a message written with the
+  type Google's own tooling emits is read by a Go consumer and refused by a Java
+  one standing beside it. The union is taken here: accepting it costs nothing and
+  closes the hole in this direction. Java's `ProtobufCodec.canDecode` is the side
+  that should change.
+
+- **Avro's two modes are not interchangeable, and each claims only its own
+  content type — Java's rule, not Go's.** A registered message carries five bytes
+  of Confluent framing that a fixed-schema codec reads as the first field; that
+  does not throw, so a codec accepting the other framing hands back a record full
+  of silent nonsense. Java's `canDecode` is mode-aware and Go's is not, so a Go
+  fixed-schema codec claims `application/vnd.acemq.avro` and mis-decodes it. This
+  follows Java. Java and Go do agree on the constants themselves and on the
+  framing — one zero byte, four bytes of identifier big-endian, then the body —
+  and the fixture proves the bytes match.
+
+- **Where the Avro codec improves on Java rather than copying it**: Java's
+  fixed-schema `decode` refuses any body of five bytes or more beginning with a
+  zero byte, on the grounds that it might be framed — but a legitimate Avro body
+  begins with a zero byte whenever its first field encodes to one, which an empty
+  string, a `0`, a `false` and the first branch of a union all do. That rule
+  refuses real messages. Here the content type is used first, because it is the
+  actual contract and it is on the message; the byte heuristic is kept only for
+  the case where the sender said nothing at all, where it is the only signal
+  there is.
+
+- **`XmlCodec` needs no extra and refuses every DTD, not configurably.** It is
+  written against `xml.etree.ElementTree` and `xml.parsers.expat`, so there would
+  be nothing in an `[xml]` extra. External entities are already inert in Python —
+  `xml.etree` does not resolve them — but **internal** entity expansion is not:
+  the billion-laughs attack needs no network and no readable file, and
+  `ElementTree.fromstring` expands it, which was checked against the interpreter
+  this library is tested on rather than taken from a table. So rather than
+  disabling the individual hazards, expat's `StartDoctypeDeclHandler`,
+  `EntityDeclHandler`, `UnparsedEntityDeclHandler` and `ExternalEntityRefHandler`
+  each raise, and a body carrying `<!DOCTYPE` is a `FatalError` whatever the DTD
+  would have said. `defusedxml` was considered and not used: what it does is turn
+  these handlers off, and this turns the same handlers off directly.
+
+- `YamlCodec` loads with `safe_load` and there is no way to ask for anything
+  else. PyYAML's default loader builds arbitrary Python objects out of tags like
+  `!!python/object/apply`, and a message body is untrusted input.
+
+- `TomlCodec` refuses a payload that is not a mapping, in `encode`, the way Java
+  and Go both do — TOML is a table format, and a bare list published as TOML is a
+  message nothing can read, discovered by the consumer rather than the publisher.
+  Reading uses `tomllib` on 3.11 and later and `tomli` on 3.10; writing uses
+  `tomli-w`, because the standard library has no writer.
+
+- Importing `acemq_amqp.codecs.yaml`, `.toml` or `.xml` registers it under that
+  name, the way Go's `init()` does, so `codec_by_name("yaml")` works from
+  configuration. `protobuf` and `avro` are deliberately not registrable: neither
+  format's bytes describe themselves, so a codec needs a message type or a schema
+  and a no-argument factory has nothing to hand back.
+
+- `AvroCodec.from_registry` and `learn_from` lift schema resolution out of the
+  message path. Java's schema registry is a synchronous interface and Go's takes
+  a context, so both can look a schema up from inside `encode`; `SchemaRegistry`
+  here is a set of coroutines and `encode` cannot await one. A message carrying
+  an identifier the codec has not been taught raises `FatalError` naming the
+  identifier rather than guessing at it.
+
 - **Sagas.** `Saga` runs named steps in order and, when one fails, compensates
   the completed ones in reverse — the order the world was changed in, because a
   compensation often depends on state a later step has not yet altered. A step

@@ -13,13 +13,212 @@ await mq.consume("orders.dlq", inspect, codec=BytesCodec())  # one consumer
 
 JSON is the default. Nothing has to be configured to get it.
 
-## The three that ship
+## The three that need nothing installed
 
 | | Writes | Reads |
 |---|---|---|
 | `JsonCodec` | `application/json` | JSON, `text/json`, any `+json` type, and a message with **no** content type |
 | `TextCodec` | `text/plain; charset=utf-8` | `text/*` and nothing else |
 | `BytesCodec` | `application/octet-stream` | everything |
+
+## The five behind an extra
+
+| | Writes | Reads | Install |
+|---|---|---|---|
+| `YamlCodec` | `application/yaml` | that, `application/x-yaml`, `text/yaml`, `text/x-yaml`, any `+yaml` type | `[yaml]` |
+| `TomlCodec` | `application/toml` | that, `text/toml`, any `+toml` type | `[toml]` |
+| `XmlCodec` | `application/xml` | that, `text/xml`, any `+xml` type | nothing |
+| `ProtobufCodec` | `application/x-protobuf` | that, `application/protobuf`, `application/vnd.google.protobuf`, any `+protobuf` type | `[protobuf]` |
+| `AvroCodec` | `avro/binary`, or `application/vnd.acemq.avro` with a registry | see [Avro](#avro) | `[avro]` |
+
+**None of the five answers for a message with no content type.** Only
+`JsonCodec` does that, and it is the only one that should: JSON is the default
+format, so an untyped message is far more likely to be JSON than anything else.
+A YAML codec that volunteered would be worse than useless — YAML parses JSON, so
+it would return the right value while recording that a YAML message had arrived.
+
+They live one module each, and none of them is imported by `acemq_amqp`, so the
+core keeps its promise of depending on nothing:
+
+```bash
+pip install "acemq-amqp[yaml]"
+```
+
+```python
+from acemq_amqp import CompositeCodec, JsonCodec
+from acemq_amqp.codecs.yaml import YamlCodec
+
+mq = await connect(url, codec=CompositeCodec(JsonCodec(), YamlCodec()))
+```
+
+### Why they exist
+
+Not because Python could not parse YAML. It always could. The gap was that a
+**Java or Go service publishing YAML produced a message this library refused** —
+the bytes were readable and nothing here claimed the content type, so a
+perfectly good message was parked. Java and Go ship these five as separate
+optional modules; these are the same five, writing the same content types and
+accepting the same wider sets, so a message crosses either way.
+
+What each codec *reads* is deliberately wider than what it writes, because a
+producer in another stack uses whichever spelling its own library picked.
+`application/yaml` was only registered by RFC 9512; `application/x-yaml`,
+`text/yaml` and `text/x-yaml` all predate it and are what a lot of tooling still
+emits. Getting that set wrong is the failure these codecs exist to prevent.
+
+The tests are not round trips. `tests/fixtures/codec-interop-fixtures.json`
+holds message bodies produced by Java and by Go — by programs calling the same
+functions those codecs call, at the versions their build files pin — and the
+suite decodes those. Java and Go turned out to write byte-identical XML and
+byte-identical Avro; their YAML differs only in list indentation and their TOML
+only in quote style, which is exactly the difference a decoder has to absorb and
+a round trip would never have produced.
+
+### YAML
+
+Block style, not flow style, which is the whole reason to pick YAML — flow style
+produces something very close to JSON and leaves nothing to justify the cost. No
+leading `---`: a message body is a single document, so the marker separates
+nothing from nothing. Keys keep the order the payload was built in.
+
+```python
+YamlCodec().encode({"orderId": "o-1", "items": ["widget", "gasket"]})
+# b'orderId: o-1\nitems:\n- widget\n- gasket\n'
+```
+
+**Loading is always safe loading, and that is not configurable.** PyYAML's
+default loader constructs arbitrary Python objects out of tags like
+`!!python/object/apply`, and a message body is untrusted input.
+
+YAML costs more to parse than JSON and is a poor choice for high volume. It
+earns its place where somebody will actually read the message — a configuration
+change broadcast to a fleet, a command replayed by hand from a dead-letter
+queue.
+
+### TOML
+
+**The top level has to be a mapping.** TOML is a table format; a bare list or a
+bare number is not a TOML document, and `encode` says so rather than emitting
+something nothing can read:
+
+```python
+TomlCodec().encode(["a", "b"])
+# TypeError: ... the top level has to be a mapping ...
+```
+
+Refused at the publisher rather than discovered by the consumer, which is what
+Java and Go both do. Reading uses `tomllib` from the standard library on 3.11
+and later and `tomli` — the same parser under its original name — on 3.10;
+writing has no standard-library answer at all, so the extra brings `tomli-w`.
+
+### XML
+
+**No extra**, because there would be nothing in it: the codec is written against
+`xml.etree.ElementTree` and `xml.parsers.expat`.
+
+**Every document with a DTD is refused, and that is not configurable.** A
+message body arrives from a queue, which is exactly the sort of place a message
+from somewhere unexpected turns up. Python's position here is better than it is
+often given credit for and worse than it needs to be:
+
+- External entities are already inert. `<!ENTITY x SYSTEM "file:///etc/passwd">`
+  is not resolved by `xml.etree`; the reference fails as an undefined entity. So
+  plain XXE and DTD retrieval are not live hazards.
+- **Internal** entity expansion is not inert. The billion-laughs attack needs no
+  network and no readable file — a few nested internal entities expand to
+  gigabytes inside the parser — and `ElementTree.fromstring` expands them
+  happily. That was checked against the interpreter this library is tested on
+  rather than taken from a table.
+
+So rather than disabling the individual hazards, the codec refuses the construct
+they all need: expat's `StartDoctypeDeclHandler`, `EntityDeclHandler`,
+`UnparsedEntityDeclHandler` and `ExternalEntityRefHandler` each raise, and a
+body carrying `<!DOCTYPE` is a `FatalError` whatever the DTD would have said.
+There is no constructor argument to relax it. `defusedxml` was considered and
+not used: what it does is turn these handlers off, and this turns the same
+handlers off directly, in a way nobody can turn back on.
+
+**XML has no types, so everything decodes to a string**, a nested dict, or a
+list where a tag repeats — the same thing Jackson gives when an XML message is
+read into a `Map`. A consumer that wants an `int` converts it, where it can
+decide what an unparseable field means.
+
+A dataclass is written under its class name, the way Jackson and Go's
+`encoding/xml` write theirs; a plain mapping has no name to take, so
+`XmlCodec(root="OrderPlaced")` supplies one. The default is `message`.
+
+### Protobuf
+
+**A codec is built for one message type**, the way it is in Java:
+
+```python
+from acemq_amqp.codecs.protobuf import ProtobufCodec
+from myapp.orders_pb2 import OrderPlaced
+
+codec = ProtobufCodec(OrderPlaced)
+```
+
+Protobuf bytes carry no name — they are field numbers and wire types — so a
+reader must already know which message it is holding, or the bytes are not
+interpretable at all. A destination carrying several message types has to say
+which is which, and the protobuf answer to that is a wrapper message with a
+`oneof`: a decision about the schema, not about the transport.
+
+`decode` hands back the generated message itself, with its fields typed, rather
+than a dict.
+
+### Avro
+
+**There is no schema-free Avro and there cannot be one.** Avro's bytes describe
+nothing about themselves: a reader must already hold the schema the writer used.
+Two ways to say where it comes from, and the choice matters more than it looks.
+
+```python
+from acemq_amqp.codecs.avro import AvroCodec
+
+codec = AvroCodec(schema)                                        # avro/binary
+codec = await AvroCodec.from_registry(registry, "order.placed", schema)
+```
+
+`AvroCodec(schema)` fixes one schema for the codec's whole life. Small, fast,
+nothing extra to run — and the writer's schema is whatever the reader happens to
+have. The moment a producer adds a field, every consumer still holding the old
+schema reads the new bytes wrongly and Avro will not always notice. Sound only
+where producer and consumer are released together.
+
+`AvroCodec.from_registry(...)` writes the schema's identifier into the front of
+every message, so a reader can look up exactly what the writer used and let Avro
+resolve it against its own. That is what makes a field addition safe, and it is
+the mode to use unless there is a reason not to. The framing is **one zero byte,
+four bytes of identifier big-endian, then the Avro body** — Confluent's layout,
+and byte-for-byte the one Java and Go write.
+
+| Mode | Writes | Reads |
+|---|---|---|
+| fixed schema | `avro/binary` | `avro/binary`, any `avro/*`, `application/avro`, any type containing `avro` that is not the registered one |
+| registered | `application/vnd.acemq.avro` | that, `application/avro`, any type containing `avro` that is not `avro/…` |
+
+**Each mode claims only its own framing type.** The two are not interchangeable
+and the difference is invisible in the bytes: a framed message begins with five
+bytes a fixed-schema codec would read as the first field. That does not throw —
+Avro decodes the shifted bytes into whatever they happen to mean — so a codec
+that accepted the other framing would hand back a record full of silent
+nonsense.
+
+**The registry here is async and a codec is not.** Java's registry is a
+synchronous interface and Go's takes a context, so both can look a schema up
+from inside `encode`. `SchemaRegistry` in this library is a set of coroutines,
+and `encode` cannot await one — it runs on the publisher's hot path and, in the
+`sync` facade, on a worker thread with no loop. So resolution is lifted out of
+the message path and done once, explicitly:
+
+```python
+codec = await AvroCodec.from_registry(registry, "order.placed", schema)
+await codec.learn_from(registry, 7)   # a writer version this consumer will meet
+```
+
+A message carrying an identifier the codec has not been taught raises
+`FatalError` naming the identifier rather than guessing.
 
 ### JSON
 
@@ -169,7 +368,13 @@ codec = codec_by_name(config.codec)
 
 So that configuration can name a format without the code that reads the
 configuration importing every format it might name. `json`, `bytes` and `text`
-are registered by the library.
+are registered by the library; importing `acemq_amqp.codecs.yaml`,
+`.toml` or `.xml` adds `yaml`, `toml` and `xml`, which is how Go's `init()`
+does it.
+
+`protobuf` and `avro` are deliberately **not** registrable. Neither format's
+bytes describe themselves, so a codec needs a message type or a schema before it
+can read anything, and a no-argument factory has nothing to hand back.
 
 `register_codec` takes a **factory**, not an instance, so `codec_by_name`
 returns a new one each time. Registering the same name twice replaces the first,
@@ -178,13 +383,8 @@ listing the names it does know.
 
 ## What is not here
 
-No XML, YAML, TOML, Protobuf or Avro. The Go library has a module each for those
-and Python could have the same, but a codec is thirty lines and a dependency —
-and the dependency is the part that matters, because taking one here would put
-every user of this package on it.
-
-Encryption is the same shape. A codec that encrypts is a codec, and so is a
-codec that compresses; both wrap another one and neither needs anything from
+Encryption. A codec that encrypts is a codec, and so is a codec that compresses;
+both wrap another one and neither needs anything from
 this library that is not on this page. An [interceptor](interceptors.md) is the
 alternative for encryption specifically, because it sees the payload before the
 codec runs and applies to every publisher without being remembered at each call

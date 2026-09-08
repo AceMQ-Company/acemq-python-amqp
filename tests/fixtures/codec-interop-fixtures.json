@@ -1,0 +1,168 @@
+{
+  "about": "Message bodies as the Java and Go AceMQ libraries write them, so this library can be tested against another language's bytes rather than against its own. A codec that encodes and decodes its own output proves nothing about reading a Java or Go message; these are the Java and Go messages.",
+  "how_these_were_made": {
+    "go": "A program built from acemq-go-amqp/codec/{yaml,toml,xml,protobuf,avro}, calling the same functions those codecs call, with the same settings and the same library versions their go.mod files pin: gopkg.in/yaml.v3 v3.0.1 (yaml.Marshal), github.com/BurntSushi/toml v1.5.0 (toml.NewEncoder), encoding/xml from the standard library (xml.Marshal), google.golang.org/protobuf v1.36.10 (proto.Marshal) and github.com/hamba/avro/v2 v2.30.0 (avro.Marshal).",
+    "java": "A program whose mappers are the bodies of YamlCodec.defaultMapper(), TomlCodec.defaultMapper() and XmlCodec.defaultMapper() copied out of acemq-amqp-codec-{yaml,toml,xml}, and whose Avro path is AvroCodec.encode copied out of acemq-amqp-codec-avro, at the versions acemq-java-amqp/pom.xml declares: Jackson 2.18.9 and Avro 1.12.0.",
+    "protobuf": "Go only. protoc on this machine emits Java that needs a newer protobuf-java than the codec module declares; the protobuf wire format does not vary by runtime version, and the Python runtime was checked to produce these exact bytes for this message, so the Go sample covers both.",
+    "proto_schema": "message OrderPlaced { string order_id = 1; int64 total_cents = 2; string tenant = 3; } in package acemq.test — the same message the .NET library's protobuf tests use."
+  },
+  "notes": [
+    "Java and Go produce byte-identical XML and byte-identical Avro, fixed and framed alike.",
+    "Their YAML differs only in list indentation and their TOML only in quote style; both pairs are the same document and both decode to the same value.",
+    "The Avro framing is Confluent's: one zero byte, four bytes of schema identifier big-endian, then the body. Identifier 7 here."
+  ],
+  "avro_schema": "{\"type\":\"record\",\"name\":\"OrderPlaced\",\"namespace\":\"org.acemq.test\",\"fields\":[{\"name\":\"orderId\",\"type\":\"string\"},{\"name\":\"totalCents\",\"type\":\"long\"},{\"name\":\"tenant\",\"type\":\"string\"}]}",
+  "samples": [
+    {
+      "format": "yaml",
+      "producer": "java",
+      "content_type": "application/yaml",
+      "body_base64": "b3JkZXJJZDogby0xCmN1c3RvbWVyOiBBbmEgU8O2ZGVyc3Ryw7ZtCnRvdGFsQ2VudHM6IDQyNTAKY3VycmVuY3k6IEVVUgppdGVtczoKLSB3aWRnZXQKLSBnYXNrZXQK",
+      "expected": {
+        "orderId": "o-1",
+        "customer": "Ana Söderström",
+        "totalCents": 4250,
+        "currency": "EUR",
+        "items": [
+          "widget",
+          "gasket"
+        ]
+      }
+    },
+    {
+      "format": "toml",
+      "producer": "java",
+      "content_type": "application/toml",
+      "body_base64": "b3JkZXJJZCA9ICdvLTEnCmN1c3RvbWVyID0gJ0FuYSBTw7ZkZXJzdHLDtm0nCnRvdGFsQ2VudHMgPSA0MjUwCmN1cnJlbmN5ID0gJ0VVUicKaXRlbXMgPSBbJ3dpZGdldCcsICdnYXNrZXQnXQo=",
+      "expected": {
+        "orderId": "o-1",
+        "customer": "Ana Söderström",
+        "totalCents": 4250,
+        "currency": "EUR",
+        "items": [
+          "widget",
+          "gasket"
+        ]
+      }
+    },
+    {
+      "format": "xml",
+      "producer": "java",
+      "content_type": "application/xml",
+      "body_base64": "PE9yZGVyUGxhY2VkPjxvcmRlcklkPm8tMTwvb3JkZXJJZD48Y3VzdG9tZXI+QW5hIFPDtmRlcnN0csO2bTwvY3VzdG9tZXI+PHRvdGFsQ2VudHM+NDI1MDwvdG90YWxDZW50cz48Y3VycmVuY3k+RVVSPC9jdXJyZW5jeT48aXRlbXM+d2lkZ2V0PC9pdGVtcz48aXRlbXM+Z2Fza2V0PC9pdGVtcz48L09yZGVyUGxhY2VkPg==",
+      "expected": {
+        "orderId": "o-1",
+        "customer": "Ana Söderström",
+        "totalCents": "4250",
+        "currency": "EUR",
+        "items": [
+          "widget",
+          "gasket"
+        ]
+      }
+    },
+    {
+      "format": "avro",
+      "producer": "java",
+      "content_type": "avro/binary",
+      "body_base64": "Bm8tMbRCCGFjbWU=",
+      "expected": {
+        "orderId": "o-1",
+        "totalCents": 4250,
+        "tenant": "acme"
+      }
+    },
+    {
+      "format": "avro-registered",
+      "producer": "java",
+      "content_type": "application/vnd.acemq.avro",
+      "body_base64": "AAAAAAcGby0xtEIIYWNtZQ==",
+      "expected": {
+        "orderId": "o-1",
+        "totalCents": 4250,
+        "tenant": "acme"
+      }
+    },
+    {
+      "format": "yaml",
+      "producer": "go",
+      "content_type": "application/yaml",
+      "body_base64": "b3JkZXJJZDogby0xCmN1c3RvbWVyOiBBbmEgU8O2ZGVyc3Ryw7ZtCnRvdGFsQ2VudHM6IDQyNTAKY3VycmVuY3k6IEVVUgppdGVtczoKICAgIC0gd2lkZ2V0CiAgICAtIGdhc2tldAo=",
+      "expected": {
+        "orderId": "o-1",
+        "customer": "Ana Söderström",
+        "totalCents": 4250,
+        "currency": "EUR",
+        "items": [
+          "widget",
+          "gasket"
+        ]
+      }
+    },
+    {
+      "format": "toml",
+      "producer": "go",
+      "content_type": "application/toml",
+      "body_base64": "b3JkZXJJZCA9ICJvLTEiCmN1c3RvbWVyID0gIkFuYSBTw7ZkZXJzdHLDtm0iCnRvdGFsQ2VudHMgPSA0MjUwCmN1cnJlbmN5ID0gIkVVUiIKaXRlbXMgPSBbIndpZGdldCIsICJnYXNrZXQiXQo=",
+      "expected": {
+        "orderId": "o-1",
+        "customer": "Ana Söderström",
+        "totalCents": 4250,
+        "currency": "EUR",
+        "items": [
+          "widget",
+          "gasket"
+        ]
+      }
+    },
+    {
+      "format": "xml",
+      "producer": "go",
+      "content_type": "application/xml",
+      "body_base64": "PE9yZGVyUGxhY2VkPjxvcmRlcklkPm8tMTwvb3JkZXJJZD48Y3VzdG9tZXI+QW5hIFPDtmRlcnN0csO2bTwvY3VzdG9tZXI+PHRvdGFsQ2VudHM+NDI1MDwvdG90YWxDZW50cz48Y3VycmVuY3k+RVVSPC9jdXJyZW5jeT48aXRlbXM+d2lkZ2V0PC9pdGVtcz48aXRlbXM+Z2Fza2V0PC9pdGVtcz48L09yZGVyUGxhY2VkPg==",
+      "expected": {
+        "orderId": "o-1",
+        "customer": "Ana Söderström",
+        "totalCents": "4250",
+        "currency": "EUR",
+        "items": [
+          "widget",
+          "gasket"
+        ]
+      }
+    },
+    {
+      "format": "protobuf",
+      "producer": "go",
+      "content_type": "application/x-protobuf",
+      "body_base64": "CgNvLTEQmiEaBGFjbWU=",
+      "expected": {
+        "order_id": "o-1",
+        "total_cents": 4250,
+        "tenant": "acme"
+      }
+    },
+    {
+      "format": "avro",
+      "producer": "go",
+      "content_type": "avro/binary",
+      "body_base64": "Bm8tMbRCCGFjbWU=",
+      "expected": {
+        "orderId": "o-1",
+        "totalCents": 4250,
+        "tenant": "acme"
+      }
+    },
+    {
+      "format": "avro-registered",
+      "producer": "go",
+      "content_type": "application/vnd.acemq.avro",
+      "body_base64": "AAAAAAcGby0xtEIIYWNtZQ==",
+      "expected": {
+        "orderId": "o-1",
+        "totalCents": 4250,
+        "tenant": "acme"
+      }
+    }
+  ]
+}

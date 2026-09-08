@@ -40,16 +40,36 @@ prometheus = ["prometheus-client>=0.20"]
 # and psycopg works if you have it. This extra is a convenience for a project
 # that has not chosen a PostgreSQL driver yet, not something the code needs.
 postgres = ["psycopg[binary]>=3.1"]
+# The five formats Java and Go ship as separate optional modules, so a message
+# from either can be read here. One extra each rather than one for all five: a
+# service that speaks YAML has no reason to install a protobuf runtime, and the
+# whole argument for keeping the core dependency-free is lost if the codecs
+# arrive in a bundle. There is deliberately no [xml] extra — that codec is
+# written against xml.etree and xml.parsers.expat and there would be nothing in
+# it. See docs/serialization.md.
+yaml = ["PyYAML>=6.0"]
+# tomllib reads TOML from 3.11 on; tomli is the same parser under its original
+# name, for 3.10. Neither writes, and the standard library has no writer at all.
+toml = ["tomli-w>=1.0", "tomli>=2.0; python_version < '3.11'"]
+protobuf = ["protobuf>=4.25"]
+avro = ["fastavro>=1.9"]
 dev = [
   "aio-pika>=9.4",
+  "fastavro>=1.9",
   "mypy>=1.11",
   # Pinned, so a new pdoc cannot change the published API reference without
   # somebody choosing it. The docs workflow installs the same version.
   "pdoc==15.0.1",
   "prometheus-client>=0.20",
+  "protobuf>=4.25",
   "pytest>=8.0",
   "pytest-asyncio>=0.24",
+  "PyYAML>=6.0",
   "ruff>=0.6",
+  "tomli-w>=1.0",
+  "tomli>=2.0; python_version < '3.11'",
+  "types-protobuf",
+  "types-PyYAML",
 ]
 
 [project.urls]

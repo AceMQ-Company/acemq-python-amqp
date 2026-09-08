@@ -55,9 +55,14 @@ jobs:
         # it documents: without aio-pika, acemq_amqp.rabbitmq becomes a page
         # saying only that the module could not be loaded.
         #
+        # The codec extras for the same reason. Those modules do import without
+        # their dependency — the import is deferred into the constructor, so a
+        # reader can still ask what the codec claims — but a reference built
+        # without them would document a library nobody runs.
+        #
         # pdoc is pinned so a new release cannot change the rendered reference
         # without somebody choosing it.
-        run: pip install -e ".[rabbitmq,prometheus]" pdoc==15.0.1
+        run: pip install -e ".[rabbitmq,prometheus,yaml,toml,protobuf,avro]" pdoc==15.0.1
 
       - name: Render the pages
         run: bash .github/scripts/build-docs-site.sh
@@ -98,7 +103,10 @@ jobs:
               "acemq_amqp/envelope.html", "acemq_amqp/interceptors.html",
               "acemq_amqp/rabbitmq.html", "acemq_amqp/retry.html",
               "acemq_amqp/telemetry.html", "acemq_amqp/topology.html",
-              "acemq_amqp/patterns.html",
+              "acemq_amqp/patterns.html", "acemq_amqp/codecs.html",
+              "acemq_amqp/codecs/yaml.html", "acemq_amqp/codecs/toml.html",
+              "acemq_amqp/codecs/xml.html", "acemq_amqp/codecs/protobuf.html",
+              "acemq_amqp/codecs/avro.html",
           }
           missing = [p for p in sorted(expected)
                      if not os.path.exists(os.path.join("site/apidocs", p))]

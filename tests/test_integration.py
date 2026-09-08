@@ -28,6 +28,7 @@ that is not.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import os
@@ -55,6 +56,7 @@ from acemq_amqp import (
     Ack,
     BytesCodec,
     Codec,
+    CompositeCodec,
     Connection,
     ConsumeContext,
     ConsumeNext,
@@ -62,6 +64,7 @@ from acemq_amqp import (
     Envelope,
     FatalError,
     HealthStatus,
+    JsonCodec,
     Message,
     Metrics,
     Outbound,
@@ -85,6 +88,10 @@ from acemq_amqp import (
     sync,
     without_verifying_the_broker,
 )
+from acemq_amqp.codecs.avro import AvroCodec
+from acemq_amqp.codecs.toml import TomlCodec
+from acemq_amqp.codecs.xml import XmlCodec
+from acemq_amqp.codecs.yaml import YamlCodec
 from acemq_amqp.patterns import (
     HEADER_REPLAY_COUNT,
     HEADER_REPLAYED_FROM,
@@ -1819,3 +1826,147 @@ async def test_a_scheduler_leaves_no_dead_letter_queues_of_its_own_behind(
             assert await mq.queue_exists(name) is False
     finally:
         await without_the_scheduler_queues(mq)
+
+
+# ---------------------------------------------------------------------------
+# The five optional codecs, over a real broker.
+#
+# The unit suite proves each one reads bytes Java and Go wrote. This proves the
+# rest of the path: that the content type survives the broker, that a consumer
+# holding a CompositeCodec picks the right codec out of it on the far side, and
+# that a message another language wrote arrives readable rather than parked.
+# ---------------------------------------------------------------------------
+
+
+class VerbatimCodec:
+    """Publishes bytes untouched under a content type of the caller's choosing.
+
+    So that a body Java or Go produced can be put on a real queue exactly as it
+    was, and read back by the codec that has to claim it. BytesCodec would have
+    done the passing-through, but it writes ``application/octet-stream``, and
+    the content type is the entire thing under test.
+    """
+
+    def __init__(self, content_type: str) -> None:
+        self._content_type = content_type
+
+    @property
+    def content_type(self) -> str:
+        return self._content_type
+
+    def encode(self, payload: Any) -> bytes:
+        assert isinstance(payload, bytes)
+        return payload
+
+    def decode(self, body: bytes, content_type: str | None = None) -> Any:
+        return bytes(body)
+
+    def can_decode(self, content_type: str | None) -> bool:
+        return True
+
+
+def foreign_samples() -> list[dict[str, Any]]:
+    fixtures: dict[str, Any] = json.loads(
+        (Path(__file__).parent / "fixtures" / "codec-interop-fixtures.json").read_text("utf-8")
+    )
+    samples: list[dict[str, Any]] = fixtures["samples"]
+    return samples
+
+
+@pytest.mark.parametrize(
+    "sample", foreign_samples(), ids=lambda s: f"{s['producer']}-{s['format']}"
+)
+async def test_a_java_or_go_message_survives_the_broker_and_is_decoded(
+    mq: Connection, workspace: Workspace, sample: dict[str, Any]
+) -> None:
+    """A body another language wrote, published byte for byte, read back here."""
+    from test_codecs_interop import as_dict, codec_for
+
+    queue = await workspace.queue(f"codec-{sample['format']}")
+    body = base64.b64decode(sample["body_base64"])
+
+    await mq.publisher(
+        routing_key=queue, mandatory=True, codec=VerbatimCodec(sample["content_type"])
+    ).send(body)
+
+    # The consumer holds JSON first, the way a service that has always spoken
+    # JSON and has just met a second producer would.
+    reader = CompositeCodec(JsonCodec(), codec_for(sample))
+    got = (await collect(mq, queue, codec=reader))[0]
+
+    assert got.content_type == sample["content_type"]
+    assert as_dict(got.payload) == sample["expected"]
+
+
+async def test_each_codec_writes_the_content_type_the_other_libraries_read(
+    mq: Connection, workspace: Workspace
+) -> None:
+    """What this library puts on the wire, inspected on the wire.
+
+    A round trip through one codec would pass with any content type at all. This
+    reads the message back with BytesCodec so what is asserted is the property
+    the broker carried, which is what a Java or Go consumer will match on.
+    """
+    order = {"orderId": "o-1", "totalCents": 4250, "tenant": "acme"}
+    schema = json.dumps(
+        {
+            "type": "record",
+            "name": "OrderPlaced",
+            "namespace": "org.acemq.test",
+            "fields": [
+                {"name": "orderId", "type": "string"},
+                {"name": "totalCents", "type": "long"},
+                {"name": "tenant", "type": "string"},
+            ],
+        }
+    )
+    expected: dict[str, tuple[Codec, dict[str, Any], str]] = {
+        "yaml": (YamlCodec(), order, "application/yaml"),
+        "toml": (TomlCodec(), order, "application/toml"),
+        "xml": (XmlCodec("OrderPlaced"), order, "application/xml"),
+        "avro": (AvroCodec(schema), order, "avro/binary"),
+        "avro-registered": (
+            AvroCodec(schema, schema_id=7),
+            order,
+            "application/vnd.acemq.avro",
+        ),
+    }
+
+    for what, (codec, payload, content_type) in expected.items():
+        queue = await workspace.queue(f"writes-{what}")
+        await mq.publisher(routing_key=queue, mandatory=True, codec=codec).send(payload)
+        arrived = (await collect(mq, queue, codec=BytesCodec()))[0]
+        assert arrived.content_type == content_type, what
+        # And the bytes are the codec's own, unchanged by the broker.
+        assert arrived.payload == codec.encode(payload), what
+
+
+async def test_a_message_no_codec_claims_is_parked_rather_than_guessed_at(
+    mq: Connection, workspace: Workspace
+) -> None:
+    """The other half of the accept-set: a type nothing here reads.
+
+    A consumer holding YAML and TOML meets a protobuf message. Neither claims
+    it, so it is parked with its bytes intact rather than handed to whichever
+    codec happened to be first.
+    """
+    queue = await workspace.queue("codec-unclaimed")
+    body = base64.b64decode(
+        next(s for s in foreign_samples() if s["format"] == "protobuf")["body_base64"]
+    )
+
+    await mq.publisher(
+        routing_key=queue, mandatory=True, codec=VerbatimCodec("application/x-protobuf")
+    ).send(body)
+
+    consumer = await mq.consume(
+        queue,
+        lambda message: accept(),
+        codec=CompositeCodec(YamlCodec(), TomlCodec()),
+    )
+    try:
+        parked = (await collect(mq, parked_queue(queue), codec=BytesCodec()))[0]
+    finally:
+        await consumer.close()
+
+    assert parked.payload == body

@@ -153,13 +153,19 @@ def test_a_composite_claims_what_any_of_its_codecs_claims() -> None:
 
 
 def test_the_registry_builds_a_codec_by_name() -> None:
-    assert codec_names() == ["bytes", "json", "text"]
+    # A subset rather than an equality, because the registry is process-wide and
+    # importing an optional codec adds to it — which is the whole point of the
+    # registry, and is how acemq_amqp.codecs.yaml and the rest become nameable.
+    # These three are the ones this module registers, and they need nothing
+    # installed.
+    assert {"bytes", "json", "text"} <= set(codec_names())
+    assert codec_names() == sorted(codec_names())
     assert isinstance(codec_by_name("json"), JsonCodec)
 
 
 def test_an_unknown_codec_name_says_which_ones_there_are() -> None:
     with pytest.raises(KeyError, match="json"):
-        codec_by_name("yaml")
+        codec_by_name("nothing-is-registered-under-this")
 
 
 def test_registering_a_name_twice_replaces_the_first() -> None:

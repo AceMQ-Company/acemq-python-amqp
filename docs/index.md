@@ -118,6 +118,7 @@ One package, a module per concern:
 | `acemq_amqp.interceptors` | the seam around publishing and handling |
 | `acemq_amqp.telemetry` | the `Observer` interface, in-memory `Metrics`, health reports |
 | `acemq_amqp.prometheus` | one `Observer` implementation, behind the `[prometheus]` extra |
+| `acemq_amqp.codecs` | YAML, TOML, XML, Protobuf and Avro — the five formats Java and Go ship, one module and one extra each. XML needs no extra |
 | `acemq_amqp.patterns` | request-reply, idempotency, outbox, ordering, pipelines, replay, routing slips, sagas, scheduled delivery, consumer groups, schema registry, streams, the claim check |
 | `acemq_amqp.patterns.sql` | the idempotency, outbox and schema-registry seams over any DB-API 2.0 database, with no driver dependency |
 
@@ -159,7 +160,7 @@ out in the reverse of the way in. See [interceptors](interceptors.md).
 - [Interceptors](interceptors.md) — the seam for what every message needs
 - [Security](security.md) — TLS, trust and credentials
 - [Retries, redelivery and shutdown](reliability.md)
-- [Codecs](serialization.md) — JSON, bytes, text, and writing your own
+- [Codecs](serialization.md) — JSON, bytes, text, the five optional formats, and writing your own
 - [Patterns](patterns.md) — the thirteen things every service ends up writing
 - [Metrics and health](observability.md)
 - [Testing without a broker](testing.md)
