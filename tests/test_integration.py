@@ -1215,8 +1215,17 @@ async def test_an_amqps_connection_really_negotiates_tls_and_carries_a_message(
         assert session.cipher() is not None
         presented = session.getpeercert()
         assert presented is not None
+        # Issued by the authority we chose to trust, read out of that authority's
+        # own certificate rather than written here as a literal. The name a CA
+        # happens to carry is a property of whoever generated it — this suite
+        # used to hardcode one, which meant the test failed against any other
+        # correctly-built authority for a reason that had nothing to do with
+        # TLS. What matters is that the broker's issuer is the authority named
+        # by ACEMQ_TEST_TLS_CERTIFICATES, whatever it is called.
+        trusted = ssl._ssl._test_decode_cert(str(CERTIFICATES / "ca.crt"))  # noqa: SLF001
+        expected = [field for name in trusted["subject"] for field in name]
         issuer = [field for name in presented["issuer"] for field in name]
-        assert ("commonName", "AceMQ Python Test CA") in issuer
+        assert issuer == expected, f"issued by {issuer}, expected {expected}"
     finally:
         await space.cleanup()
         await mq.close()
