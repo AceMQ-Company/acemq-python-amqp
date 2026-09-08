@@ -216,7 +216,12 @@ jobs:
         # check this artifact and did not.
         run: |
           log="$RUNNER_TEMP/broker-tests.log"
-          passed=$(sed -n 's/.*[^0-9]\([0-9]\+\) passed.*/\1/p' "$log" | head -1)
+          # Not `sed 's/.*[^0-9]\([0-9]\+\) passed.*/\1/p'`, which is what this
+          # was and which never matched anything: it requires a non-digit before
+          # the count, and pytest -q opens its summary with the number, at
+          # column one. The guard reported 0 for a run that passed 26 and failed
+          # the release on it.
+          passed=$(grep -oE '[0-9]+ passed' "$log" | head -1 | grep -oE '[0-9]+')
           passed=${passed:-0}
           if [ "$passed" -lt 20 ]; then
             echo "::error::only $passed broker tests passed; expected at least 20"
