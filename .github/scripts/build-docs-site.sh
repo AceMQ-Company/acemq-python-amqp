@@ -127,6 +127,24 @@ th { color:var(--muted); font-weight:600; }
 blockquote { border-left:3px solid var(--line); margin:1.25rem 0; padding:.2rem 0 .2rem 1.15rem; color:var(--muted); }
 footer { max-width:47rem; margin:0 auto; padding:1.5rem 1.25rem 4rem;
          border-top:1px solid var(--line); color:var(--muted); font-size:.85rem; }
+
+/* Pandoc writes its own syntax colours into a <style> block in the head, and
+   they are tuned for a white page: numbers, floats and base-n literals are all
+   #0000cf, which on this page's dark background is about 1.4:1 against it —
+   `timedelta(seconds=1)` reads as `timedelta(seconds= )`. This stylesheet is
+   linked after that block, so redefining the handful of colours that go dark
+   is enough; the light palette is left exactly as pandoc chose it. */
+@media (prefers-color-scheme: dark) {
+  code span.dv, code span.bn, code span.fl { color:#b5cea8; }   /* literals */
+  code span.st, code span.ch, code span.vs { color:#a3d18a; }   /* strings */
+  code span.co, code span.cn                { color:#9c9c9c; }   /* comments */
+  code span.kw, code span.cf                { color:#7fb3ff; }   /* keywords */
+  code span.dt, code span.bu                { color:#7fd4c1; }   /* types */
+  code span.fu                              { color:#dcb6ff; }   /* functions */
+  code span.at, code span.va                { color:#e8e8e8; }
+  code span.op, code span.sc                { color:#c9c9c9; }
+  code span.er, code span.al                { color:#ff8a5c; }
+}
 CSS
 
 # Six top-level entries with the rest grouped underneath, rather than fourteen in
