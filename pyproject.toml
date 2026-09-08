@@ -35,6 +35,11 @@ rabbitmq = ["aio-pika>=9.4"]
 # client. This extra is one adapter for it; telemetry.prometheus_text renders
 # the same format with nothing installed at all.
 prometheus = ["prometheus-client>=0.20"]
+# patterns.sql imports no driver at all: it is written against the DB-API 2.0
+# protocols, so sqlite3 from the standard library works with nothing installed
+# and psycopg works if you have it. This extra is a convenience for a project
+# that has not chosen a PostgreSQL driver yet, not something the code needs.
+postgres = ["psycopg[binary]>=3.1"]
 dev = [
   "aio-pika>=9.4",
   "mypy>=1.11",

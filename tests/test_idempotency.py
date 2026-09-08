@@ -167,3 +167,66 @@ async def test_a_key_is_forgotten_once_its_window_has_passed() -> None:
 
     assert ran == ["order-1", "order-2"]
     assert len(store) == 1
+
+
+class LeasingStore:
+    """A store that hands out a claim and wants to be told it became a fact."""
+
+    def __init__(self) -> None:
+        self.claimed: list[str] = []
+        self.confirmed: list[str] = []
+        self.forgotten: list[str] = []
+        self.confirm_fails = False
+
+    async def first_time(self, key: str) -> bool:
+        if key in self.claimed:
+            return False
+        self.claimed.append(key)
+        return True
+
+    async def confirm(self, key: str) -> None:
+        if self.confirm_fails:
+            raise RuntimeError("the store is not answering")
+        self.confirmed.append(key)
+
+    async def forget(self, key: str) -> None:
+        self.forgotten.append(key)
+        self.claimed.remove(key)
+
+
+async def test_a_store_that_leases_is_told_when_the_lease_became_a_fact() -> None:
+    store = LeasingStore()
+
+    async def handler(incoming: Message) -> Ack:
+        return accept()
+
+    assert await idempotent(store, handler)(message("order-1")) == accept()
+
+    assert store.claimed == ["order-1"]
+    assert store.confirmed == ["order-1"]
+    assert store.forgotten == []
+
+
+async def test_a_lease_is_released_rather_than_confirmed_when_a_handler_fails() -> None:
+    store = LeasingStore()
+
+    async def handler(incoming: Message) -> Ack:
+        return reject(ValueError("no"))
+
+    await idempotent(store, handler)(message("order-1"))
+
+    assert store.confirmed == []
+    assert store.forgotten == ["order-1"]
+
+
+async def test_a_confirmation_that_fails_does_not_undo_the_handler() -> None:
+    """The work happened. Turning a bookkeeping failure into a rejection would
+    undo it; the lease expiring is the safe outcome."""
+    store = LeasingStore()
+    store.confirm_fails = True
+
+    async def handler(incoming: Message) -> Ack:
+        return accept()
+
+    assert await idempotent(store, handler)(message("order-1")) == accept()
+    assert store.confirmed == []

@@ -20,6 +20,28 @@ While the version is `0.x` the public API may change in any release.
   `FilesystemClaimCheckStore` implement the seam; `claim_key_of` and
   `is_claim_check` read a body without fetching anything, which is what an
   operator looking at a dead-letter queue wants.
+- **Database-backed stores**, in `acemq_amqp.patterns.sql`.
+  `SqlIdempotencyStore`, `SqlOutboxStore` and `SqlSchemaRegistry` are the three
+  storage seams over a real database instead of a dictionary, written against
+  the DB-API 2.0 protocols so the module imports no driver: `sqlite3` works with
+  nothing installed and psycopg works with `paramstyle="format"`. The suite
+  exercises `sqlite3`; the same checks have been run by hand against PostgreSQL
+  17 through psycopg 3 and pass, but are not in the suite because a test needing
+  a database server is a test that gets skipped. `create_schema` and
+  `schema_ddl` make the tables, or print them for a migration tool to own.
+- `SqlOutboxStore.add` writes on a connection the **caller** supplies, and
+  neither commits nor closes it, so the outbox insert and the business write
+  commit together or not at all — the property `InMemoryOutboxStore` says in its
+  own docstring that it does not have. With no transaction to join it raises
+  rather than opening a connection of its own.
+
+### Changed
+
+- `idempotent(...)` calls `store.confirm(key)` when a handler accepts, if the
+  store has one. A store that hands out a *lease* rather than a fact — so a
+  consumer that dies holding a message does not block its redelivery — needs to
+  be told when the lease becomes a fact. Duck-typed, so a store without one,
+  including `InMemoryIdempotencyStore`, behaves exactly as before.
 
 ## [0.2.0] — 2026-09-07
 

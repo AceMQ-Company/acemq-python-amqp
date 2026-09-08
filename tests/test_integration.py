@@ -31,6 +31,7 @@ import asyncio
 import contextlib
 import json
 import os
+import sqlite3
 import ssl
 import threading
 import uuid
@@ -97,8 +98,10 @@ from acemq_amqp.patterns import (
     Requester,
     ResponderError,
     RoutingSlip,
+    SqlOutboxStore,
     StreamRetention,
     claim_key_of,
+    create_schema,
     declare_stream,
     follow_slip,
     from_first,
@@ -890,6 +893,57 @@ async def test_an_outbox_relay_publishes_what_was_committed(
     assert got.payload == {"id": "7"}
     assert got.envelope.origin == "acemq-python-tests@ci"
     assert len(store) == 0
+
+
+async def test_a_relay_publishes_what_a_transaction_committed_and_nothing_else(
+    mq: Connection, workspace: Workspace, tmp_path: Path
+) -> None:
+    """The outbox pattern end to end, against a real database and a real broker.
+
+    Two transactions against the same database: one commits and one is rolled
+    back. The broker sees exactly the message that was committed, and never
+    hears about the other — which is the property the in-memory store cannot
+    have and the reason for the SQL one.
+    """
+    queue = await workspace.queue("sql-outbox")
+    database = tmp_path / "outbox.db"
+
+    setting_up = sqlite3.connect(database)
+    try:
+        create_schema(setting_up, idempotency=None, registry=None)
+        setting_up.execute("CREATE TABLE orders (id TEXT PRIMARY KEY)")
+        setting_up.commit()
+    finally:
+        setting_up.close()
+
+    store = SqlOutboxStore(lambda: sqlite3.connect(database))
+
+    abandoned = sqlite3.connect(database)
+    try:
+        abandoned.execute("INSERT INTO orders (id) VALUES ('rolled-back')")
+        await store.add(record(mq, "", queue, {"id": "rolled-back"}), connection=abandoned)
+        abandoned.rollback()
+    finally:
+        abandoned.close()
+
+    committed = sqlite3.connect(database)
+    try:
+        committed.execute("INSERT INTO orders (id) VALUES ('committed')")
+        await store.add(record(mq, "", queue, {"id": "committed"}), connection=committed)
+        committed.commit()
+    finally:
+        committed.close()
+
+    assert await store.count() == 1
+
+    async with OutboxRelay(mq, store, interval=timedelta(milliseconds=20)):
+        got = (await collect(mq, queue))[0]
+
+    assert got.payload == {"id": "committed"}
+    assert got.envelope.origin == "acemq-python-tests@ci"
+    assert await store.count() == 0
+    # And the queue is empty rather than holding the message that was abandoned.
+    await until(lambda: _count(mq, queue, 0), "nothing else was published")
 
 
 async def test_a_large_payload_travels_as_a_claim_check(

@@ -137,7 +137,13 @@ def idempotent(
     something that went right.
 
     When the handler does not accept, the key is forgotten so the retry can
-    actually run. That ordering is what makes this a guard against duplicates
+    actually run. When it does accept and the store has a ``confirm`` method,
+    that is called: a store which hands out a *lease* rather than a fact — so a
+    consumer that dies holding a message does not block its redelivery — needs
+    to be told when the lease becomes a fact. A store without one, such as
+    :class:`InMemoryIdempotencyStore`, is unaffected.
+
+    That ordering is what makes this a guard against duplicates
     rather than a promise of exactly-once: between the handler finishing and the
     acknowledgement reaching the broker there is still a gap where a crash leaves
     a message that will be delivered again. Only a store written in the same
@@ -180,9 +186,43 @@ def idempotent(
             # It did not work, so it has not been handled. Forgetting is what
             # lets the retry do anything at all.
             await _forget_quietly(store, identity)
+        else:
+            await _confirm_quietly(store, identity)
         return decision
 
     return guarded
+
+
+async def _confirm_quietly(store: IdempotencyStore, key: str) -> None:
+    """Tells a store that keeps a claim separate from a fact that the work is done.
+
+    :class:`IdempotencyStore` has two methods and this is not one of them,
+    because most stores do not need it: recording a key *is* remembering the
+    message, as it is in :class:`InMemoryIdempotencyStore`. A store that hands
+    out a **lease** rather than a fact — which is what
+    :class:`~acemq_amqp.patterns.sql.SqlIdempotencyStore` does, so a consumer
+    that dies holding a message does not block its redelivery — needs to be told
+    when the lease becomes a fact, and this is where it is told.
+
+    Duck-typed rather than a second Protocol, so a store that does not have it
+    is unaffected and nobody has to implement a method meaning "nothing".
+
+    A failure here is logged rather than raised: the handler accepted, the work
+    happened, and turning a bookkeeping failure into a rejection would undo it.
+    The lease expiring is the safe outcome — the message may be handled twice,
+    which is what an idempotent handler is for.
+    """
+    confirm = getattr(store, "confirm", None)
+    if confirm is None:
+        return
+    try:
+        await confirm(key)
+    except Exception:
+        log.exception(
+            "acemq: could not confirm the idempotency key %s; its claim will expire "
+            "and a redelivery may be handled again",
+            key,
+        )
 
 
 async def _forget_quietly(store: IdempotencyStore, key: str) -> None:

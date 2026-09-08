@@ -563,11 +563,47 @@ from acemq_amqp.patterns import InMemoryIdempotencyStore, chain, idempotent, wit
 | `read_stream(...)` | Read a queue that keeps what it has already handed out |
 
 Every one is built out of the public library — handlers, envelopes, publishers —
-so nothing is possible with a pattern that would not be possible without it. The
-storage seams (`IdempotencyStore`, `OutboxStore`, `SchemaRegistry`) are
-interfaces with in-memory implementations that say in their own docstrings why
-they are not the ones to use in production: an outbox store that does not share a
-transaction with your database has the gap the pattern exists to close.
+so nothing is possible with a pattern that would not be possible without it.
+
+### Stores that survive a restart
+
+Three of these have a storage seam — `IdempotencyStore`, `OutboxStore`,
+`SchemaRegistry` — and each in-memory implementation says in its own docstring
+why it is not the one to use in production. `acemq_amqp.patterns.sql` is the one
+to use:
+
+```python
+import sqlite3
+
+from acemq_amqp.patterns import SqlOutboxStore, create_schema
+
+connections = lambda: sqlite3.connect("acemq.db")   # or a pool's checkout
+create_schema(connections)                          # development only
+outbox = SqlOutboxStore(connections)
+
+async with database.transaction() as tx:
+    await place_order(tx, order)
+    await outbox.add(record(mq, "orders-events", "order.placed", event),
+                     connection=tx.connection)
+# one commit; the order and the message are the same decision
+```
+
+`add` writes on the connection **you** hand it and does not commit it, does not
+roll it back and does not close it. That is the guarantee rather than an
+oversight: roll your transaction back and the message is not in the outbox,
+because it never was. With no transaction to join it raises rather than opening
+one — a fresh connection with autocommit on would leave a message queued for
+work that never happened, which is the exact fault the pattern was adopted to
+prevent.
+
+Nothing in the module imports a database driver. It is written against the
+DB-API 2.0 protocols, so `sqlite3` from the standard library works with nothing
+installed and psycopg works if you have it — `paramstyle="format"` for the
+latter. **The automated suite exercises `sqlite3`**; the same checks have been
+run by hand against PostgreSQL 17 through psycopg 3 and pass, but they are not
+in the suite, because a suite that needs a database server is a suite that gets
+skipped. Anything else — MySQL, SQL Server, Oracle — needs at least a different
+upsert and is not claimed.
 
 ## Requirements
 

@@ -600,3 +600,136 @@ version that matters. Each seam is a `Protocol` with two to four methods, so the
 real one is a small class over whatever database the service already has — and
 for the outbox and the idempotency store, it must be *that* database, in *that*
 transaction, or the gap the pattern exists to close is still open.
+
+That class ships, in `acemq_amqp.patterns.sql`:
+
+```python
+import sqlite3
+
+from acemq_amqp.patterns import (
+    SqlIdempotencyStore, SqlOutboxStore, SqlSchemaRegistry, create_schema,
+)
+
+connections = lambda: sqlite3.connect("acemq.db")   # or a pool's checkout
+
+create_schema(connections)                          # development; see below
+outbox = SqlOutboxStore(connections)
+seen = SqlIdempotencyStore(connections)
+registry = SqlSchemaRegistry(connections)
+```
+
+**No driver dependency.** Nothing in the module imports a database driver. It is
+written against the DB-API 2.0 connection and cursor protocols, which every
+Python driver already implements, so one class serves `sqlite3`, psycopg and
+anything else following PEP 249. The one thing that differs is the placeholder,
+and that is a constructor argument: `paramstyle="qmark"` for `sqlite3` — the
+default — and `paramstyle="format"` for psycopg.
+
+**What has been run.** The automated suite exercises `sqlite3`, which is in the
+standard library, so the tests need nothing installed. The same checks —
+`create_schema`, the rollback, the round trip through `bytea`, the claim race,
+the lease take-over, four registries registering one schema at once — have been
+run **by hand against PostgreSQL 17 through psycopg 3**, and they pass. They are
+not in the suite, because a suite that needs a database server is a suite that
+gets skipped, and a skipped test proves nothing. So: sqlite3 on every commit,
+PostgreSQL when somebody runs it. `pip install "acemq-amqp[postgres]"` installs
+psycopg for a project that has not chosen a driver, and nothing more. Anything
+else — MySQL, SQL Server, Oracle — needs at least a different upsert, and is not
+claimed.
+
+### The outbox, and the transaction it joins
+
+This is the one that matters, because the in-memory store admits it does not
+have the property the pattern exists for.
+
+```python
+async with database.transaction() as tx:
+    await place_order(tx, order)
+    await outbox.add(
+        record(mq, "orders-events", "order.placed", event),
+        connection=tx.connection,
+    )
+# one commit; the order and the message are the same decision
+```
+
+`add` writes on the connection **you** hand it, and does not commit it, does not
+roll it back and does not close it. That is not an oversight — it is the
+guarantee. The insert becomes durable exactly when your transaction does, and if
+you roll that transaction back the message is not in the outbox, because it never
+was: it was one insert among yours. There is a test that does exactly that and
+then looks.
+
+The connection can come from either end. Pass `connection=` at the call site,
+which is clearest where the transaction is a local variable; or give the
+constructor a `transaction=` callable and let it fetch the connection bound to
+the current transaction, which is what a framework with a thread-local or
+context-local session wants. What it must **never** be is "open a new
+connection". A fresh connection with autocommit on inserts the row immediately
+and independently, so a later rollback of the business work leaves a message
+queued for something that never happened — the exact fault the pattern was
+adopted to prevent, now harder to notice because the code looks right. With no
+transaction to join, `add` raises rather than opening one.
+
+The relay's own work — `pending` and `mark_published` — is not your transaction
+and has no business joining it, so it uses the `connections` factory and commits
+for itself.
+
+**One relay per outbox.** `pending` takes no lease, because the `OutboxStore`
+protocol has nowhere to put one, so two processes sweeping the same table publish
+everything twice. Java's JDBC store leases rows for this reason; this one does
+not, and the shape of the mistake is a service that starts a relay per worker.
+
+### A claim is a lease, not a fact
+
+`SqlIdempotencyStore` writes a row that starts `CLAIMED`, with a deadline
+`claim_timeout` away; `confirm` turns it into `CONFIRMED` with a deadline
+`retention` away, and `idempotent(...)` calls that for you when a handler
+accepts. The insert *is* the claim, and the primary key is what makes it atomic
+across every process using the table — two consumers racing on one message
+cannot both be told they are first, without a lock anybody has to remember to
+take.
+
+The lease is what a fact cannot do. A consumer that dies holding a message would
+otherwise have recorded it as handled without handling it, and the redelivery —
+the thing at-least-once delivery is *for* — would be skipped. So a hold that has
+run out can be taken over, and the message gets handled by somebody.
+
+Nothing on the message path deletes anything: schedule `purge_expired`, hourly
+is ample. A store that tidies up on the hot path makes every message pay for it.
+
+`confirm` is duck-typed rather than a third method on `IdempotencyStore`, so a
+store that does not hand out leases — `InMemoryIdempotencyStore`, or your own —
+is unaffected and nobody has to implement a method meaning "nothing".
+
+### Tables, and who owns them
+
+`create_schema(connections)` creates whichever of the three tables you ask for.
+It is for development and for tests. In production they belong in whatever
+migration tool already owns the schema — the outbox table especially, because it
+has to live in the same database as the business tables it commits with, and
+that database's shape is not a messaging library's to change at start-up. So the
+DDL is printable:
+
+```python
+from acemq_amqp.patterns import schema_ddl
+
+for statement in schema_ddl(dialect="postgres"):
+    print(statement + ";")
+```
+
+Table names are constructor arguments, and are checked rather than trusted: a
+table name reaches SQL by concatenation because no database binds one as a
+parameter, so anything that is not a plain identifier is refused.
+
+Times are stored as **epoch milliseconds** in a `BIGINT` — the same units as
+`x-acemq-first-seen` on the envelope, and the one representation of an instant
+that every database and every driver agrees about without a per-driver
+conversion. It reads worse in `psql` than a timestamp column would, and it is
+the same number everywhere, which is worth more.
+
+The tables are not a cross-language contract. Java's `JdbcOutboxStore` stores a
+message type and a string payload where this stores a body, a content type and
+rendered headers, because the two libraries' `OutboxRecord` are not the same
+record. What crosses languages is the message on the broker, which is identical;
+a Java relay draining a Python outbox table is not something either side
+supports.

@@ -115,7 +115,8 @@ One package, a module per concern:
 | `acemq_amqp.interceptors` | the seam around publishing and handling |
 | `acemq_amqp.telemetry` | the `Observer` interface, in-memory `Metrics`, health reports |
 | `acemq_amqp.prometheus` | one `Observer` implementation, behind the `[prometheus]` extra |
-| `acemq_amqp.patterns` | request-reply, idempotency, outbox, ordering, pipelines, replay, routing slips, consumer groups, schema registry, streams |
+| `acemq_amqp.patterns` | request-reply, idempotency, outbox, ordering, pipelines, replay, routing slips, consumer groups, schema registry, streams, the claim check |
+| `acemq_amqp.patterns.sql` | the idempotency, outbox and schema-registry seams over any DB-API 2.0 database, with no driver dependency |
 
 Everything worth naming is re-exported from the top, so a program imports from
 one place:
