@@ -188,7 +188,8 @@ module exists to prevent. Credentials alone are welcome on either scheme.
 **Identical**, because a message crosses languages: the reserved header names
 and their types, the defaults applied when they are absent, the retry schedule
 arithmetic, the `{queue}.dlq` / `{queue}.parked` / `{queue}.retry.{delay}`
-naming, and the rules for giving up.
+naming, the queue type and arguments each of those is declared with, and the
+rules for giving up.
 
 **Not identical**, deliberately: the API shape. Go gets `ctx`, .NET gets
 `IAsyncEnumerable`, and Python gets dataclasses, `async with` and type hints.
@@ -316,6 +317,66 @@ a broker already carrying a Java service has the arrangement above on it.
 connection with no policy dead-letters the message and says so in the reason,
 which is louder than the alternative default — an immediate requeue, which is a
 hot loop nobody asked for.
+
+### Quorum by default, and what stays classic
+
+A durable queue asked for through `Topology().queue(...)` is a **quorum** queue,
+declared with `x-queue-type: quorum`:
+
+```python
+print(Topology().queue("shipping.orders", dead_letter=True))
+# Topology: 1 exchanges, 3 queues, 2 bindings
+#   declare exchange acemq.dlx (direct, durable)
+#   declare queue shipping.orders (durable, x-dead-letter-exchange='acemq.dlx',
+#                                  x-dead-letter-routing-key='shipping.orders.dlq',
+#                                  x-queue-type='quorum')
+#   declare queue shipping.orders.dlq (durable)
+#   declare queue shipping.orders.parked (durable)
+#   declare binding shipping.orders.dlq (from acemq.dlx on shipping.orders.dlq)
+#   declare binding shipping.orders.parked (from acemq.dlx on shipping.orders.parked)
+```
+
+It is the same contract as the rung arguments and it exists for the same reason.
+A queue type is one more thing the broker compares, so a Java service and a
+Python service consuming `shipping.orders` that disagree about it cannot both
+consume it — the second one to declare is answered `PRECONDITION_FAILED`. Java
+has declared quorum since it had deployments, so quorum is the answer here.
+
+**Three kinds of queue stay classic**, deliberately, and Java declares them
+classic too:
+
+| | |
+| --- | --- |
+| `{queue}.retry.{delay}` | Nothing consumes a rung; replicating it buys nothing and would cost a Java service its declaration of the same name |
+| `{queue}.dlq`, `{queue}.parked` | The same, for the same reason |
+| Anything exclusive, auto-deleting or transient | RabbitMQ **refuses** a quorum queue that is any of those |
+
+That last row is not a preference. A generated reply queue is exclusive and
+auto-deleting so that it goes when its requester does, and asking for it as
+quorum is a declaration the broker rejects — so a queue that is any of those
+three is declared classic without being asked. Asking for both at once is
+refused here, where the contradiction is written down, rather than at the broker,
+which answers it with a message that never mentions the word quorum:
+
+```python
+Topology().queue("replies", exclusive=True, quorum=True)
+# ValueError: acemq: queue 'replies' asks for quorum=True and also exclusive; ...
+```
+
+A caller who wants a classic queue says so, and gets one with no `x-queue-type`
+at all — the spelling every AceMQ library uses, and therefore the only one a
+broker finds equivalent to theirs:
+
+```python
+Topology().queue("shipping.orders", quorum=False)
+```
+
+Streams are unaffected: `stream(...)` writes its own `x-queue-type`, and a queue
+whose arguments already name a kind keeps it.
+
+**A queue that already exists cannot change kind.** AMQP has no way to alter a
+queue's type in place, so a queue declared classic by 0.1.0 has to be drained
+and deleted before this version can declare it.
 
 ### Codecs
 

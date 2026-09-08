@@ -34,13 +34,15 @@ import os
 import ssl
 import threading
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from datetime import timedelta
 from pathlib import Path
+from typing import Any
 from urllib.parse import unquote, urlsplit, urlunsplit
 
+import aio_pika
 import pytest
-from aiormq.exceptions import AMQPConnectionError
+from aiormq.exceptions import AMQPConnectionError, ChannelPreconditionFailed
 
 from acemq_amqp import (
     DEAD_LETTER_EXCHANGE,
@@ -71,6 +73,7 @@ from acemq_amqp import (
     accept,
     connect,
     dead_letter_queue,
+    exponential_retry,
     fixed_retry,
     parked_queue,
     reject,
@@ -490,6 +493,193 @@ async def test_a_rung_returns_a_message_through_the_named_retry_exchange(
     assert envelope.attempt == 2
     assert json.loads(returned.body) == {"id": "7"}
     print(f"  returned {queue} holds 1, on attempt {envelope.attempt}, {rung} holds 0")
+
+
+def java_source_arguments(queue: str) -> dict[str, str]:
+    """Exactly what a Java service writes when it declares a source queue.
+
+    Spelled out as literals rather than built from this library's constants on
+    purpose. A test that asks this library what this library writes, and then
+    checks the answer against itself, proves nothing about the other service;
+    these three strings are read off ``Topology.java`` and ``RabbitMqConnection``
+    and are the thing being claimed.
+    """
+    return {
+        "x-queue-type": "quorum",
+        "x-dead-letter-exchange": "acemq.dlx",
+        "x-dead-letter-routing-key": f"{queue}.dlq",
+    }
+
+
+async def declared_by_another_service(queue: str, arguments: Mapping[str, Any]) -> None:
+    """Declares a queue from a second connection, without this library.
+
+    Straight onto ``aio_pika``, on a connection of its own, because the point is
+    a service that shares the broker and not the code. Its own channel too: a
+    declare the broker refuses takes the channel down with it, and a shared one
+    would take every later declare with it.
+
+    :raises ChannelPreconditionFailed: when the broker says this is not the
+        queue that is already there
+    """
+    connection = await aio_pika.connect_robust(BROKER)
+    try:
+        channel = await connection.channel()
+        await channel.declare_queue(queue, durable=True, arguments=dict(arguments))
+    finally:
+        await connection.close()
+
+
+async def test_a_queue_python_declares_is_one_a_java_service_can_declare_too(
+    mq: Connection, workspace: Workspace
+) -> None:
+    """The interop claim, proved rather than asserted.
+
+    Two services in different languages consuming one queue both declare it, and
+    the broker compares what the second one sends against what the first one
+    created. So the claim is not "Python sends ``x-queue-type=quorum``" — it is
+    "the declaration Java sends is accepted against the queue Python made", and
+    the only thing that can answer that is a broker.
+
+    The refusal underneath is half of the same claim. Without it the test would
+    pass just as well against a broker that had stopped comparing arguments at
+    all, which is the failure that would let this whole change be wrong and look
+    right.
+    """
+    queue = await workspace.queue("orders")
+
+    print(f"\ninterop for {queue}")
+    print(f"  python declared it, then java declares {java_source_arguments(queue)}")
+
+    # Accepted: the second service gets the queue it asked for.
+    await declared_by_another_service(queue, java_source_arguments(queue))
+    print("  accepted")
+
+    # And a classic declaration of the same queue is refused, which is what a
+    # Python service would have got before this change — the same three
+    # arguments with x-queue-type left off, which is how classic is spelled.
+    classic = {
+        key: value
+        for key, value in java_source_arguments(queue).items()
+        if key != "x-queue-type"
+    }
+    with pytest.raises(ChannelPreconditionFailed) as refusal:
+        await declared_by_another_service(queue, classic)
+
+    said = str(refusal.value)
+    print(f"  refused  {classic} -> {said}")
+    assert "x-queue-type" in said
+    assert "quorum" in said
+
+    # The queue is still there and still usable afterwards: a refused declare is
+    # the broker protecting the queue, not damaging it.
+    assert await mq.queue_exists(queue) is True
+    await mq.publisher(routing_key=queue, mandatory=True).send({"id": "7"})
+    assert (await collect(mq, queue))[0].payload == {"id": "7"}
+
+
+async def test_a_retry_goes_round_a_quorum_source_queue_and_a_classic_rung(
+    mq: Connection, workspace: Workspace
+) -> None:
+    """A whole broker wait, on the queue types this library now declares.
+
+    Not a formality. A quorum queue dead-letters through different machinery
+    from a classic one, and the rung it goes to is classic while the queue it
+    comes home to is not, so every hop in this cycle crosses between the two.
+    """
+    delay = timedelta(seconds=5)
+    policy = fixed_retry(2, delay).wait_in_broker_from(timedelta(seconds=1))
+    queue = await workspace.queue("mixed", policy)
+    rung = retry_queue(queue, delay)
+
+    # The types, confirmed by the broker rather than by this process: an
+    # equivalence declare is accepted only when the queue really is what the
+    # arguments say. The rung is offered rung_args and nothing else, which is a
+    # classic queue — the argument that would make it quorum is not in there.
+    await declared_by_another_service(queue, java_source_arguments(queue))
+    await declared_by_another_service(rung, rung_args(queue, delay))
+    print(f"\nretry cycle for {queue}")
+    print(f"  source   {queue} is quorum")
+    print(f"  rung     {rung} is classic, {rung_args(queue, delay)}")
+
+    attempts: list[int] = []
+
+    async def handler(message: Message) -> Ack:
+        attempts.append(message.envelope.attempt)
+        return retry(RuntimeError("the warehouse is not answering"))
+
+    consumer = await mq.consume(queue, handler, retry=policy)
+    await mq.publisher(routing_key=queue, mandatory=True).send({"id": "7"})
+    await until(lambda: _count(mq, rung, 1), "the message reached the rung queue")
+
+    # Closed before anything is counted, because a zero on the source queue with
+    # a consumer still attached could be a consumer holding the message.
+    await consumer.close()
+    await until(lambda: _detached(mq, queue), "the consumer detached")
+
+    assert attempts == [1]
+    assert await mq.message_count(rung) == 1
+    assert await mq.message_count(queue) == 0
+    assert await _consumers(mq, queue) == 0
+    print(f"  waiting  {rung} holds 1, {queue} holds 0 with 0 consumers")
+
+    # And it comes home, one attempt further on, to the quorum queue it left.
+    await until(lambda: _count(mq, queue, 1), "the rung returned the message", timeout=30.0)
+    assert await mq.message_count(rung) == 0
+
+    returned = await mq.pull(queue)
+    assert returned is not None
+    await returned.ack()
+    envelope = Envelope.from_headers(returned.headers, returned.routing_key)
+    assert envelope.attempt == 2
+    assert json.loads(returned.body) == {"id": "7"}
+    print(f"  returned {queue} holds 1, on attempt {envelope.attempt}, {rung} holds 0")
+
+
+async def test_the_whole_topology_is_printed_with_every_type_and_argument(
+    mq: Connection, workspace: Workspace
+) -> None:
+    """Everything one topology puts on a broker, in one place, to be read.
+
+    Five libraries have to declare the same thing, and no assertion inside any
+    one of them catches the case where four agree with each other and not with
+    the fifth. A person comparing five printouts does. So this prints what was
+    asked for, and then has the broker confirm each line of it: an equivalence
+    declare from a connection that is not this library's is accepted only if the
+    queue really carries those arguments and no others.
+    """
+    policy = exponential_retry(6, timedelta(seconds=10))
+    queue = workspace.name("orders")
+    exchange = workspace.name("events")
+    topology = (
+        Topology()
+        .exchange(exchange, "topic", auto_delete=True)
+        .queue(queue, dead_letter=True, retry=policy)
+        .binding(queue, exchange, "order.#")
+    )
+
+    await mq.declare(topology)
+    workspace.register(queue, policy)
+
+    print(f"\n{topology}")
+
+    confirmed: dict[str, dict[str, Any]] = {
+        queue: {
+            "x-queue-type": "quorum",
+            "x-dead-letter-exchange": DEAD_LETTER_EXCHANGE,
+            "x-dead-letter-routing-key": dead_letter_queue(queue),
+        },
+        dead_letter_queue(queue): {},
+        parked_queue(queue): {},
+    }
+    for rung in policy.broker_rungs():
+        confirmed[retry_queue(queue, rung)] = dict(rung_args(queue, rung))
+
+    print("confirmed against the broker:")
+    for name, arguments in confirmed.items():
+        await declared_by_another_service(name, arguments)
+        kind = arguments.get("x-queue-type", "classic")
+        print(f"  {name}: {kind}, {arguments or 'no arguments'}")
 
 
 async def test_interceptors_wrap_a_real_publish_and_a_real_handler(

@@ -27,6 +27,8 @@ from acemq_amqp.topology import (
     DEAD_LETTER_EXCHANGE_ARG,
     DEAD_LETTER_ROUTING_KEY_ARG,
     MESSAGE_TTL_ARG,
+    QUEUE_TYPE_ARG,
+    QUORUM_QUEUE_TYPE,
     RETRY_EXCHANGE,
     Binding,
     Topology,
@@ -97,6 +99,90 @@ def test_the_dead_letter_queue_does_not_dead_letter() -> None:
 
     target = next(action for action in plan if action.name == "orders.new.dlq")
     assert DEAD_LETTER_EXCHANGE_ARG not in target.detail
+
+
+async def test_a_durable_queue_is_a_quorum_queue() -> None:
+    # The interop claim, pinned. Java declares a source queue quorum, a queue
+    # type is compared as strictly as any other argument, and a Java service and
+    # a Python service both consume `orders`. Spelled out rather than written
+    # through the constant, so a change of mind cannot silently pass.
+    transport = FakeTransport()
+
+    await Topology().queue("orders.new").apply(transport)
+
+    assert transport.queues["orders.new"].args == {"x-queue-type": "quorum"}
+    assert QUEUE_TYPE_ARG == "x-queue-type"
+    assert QUORUM_QUEUE_TYPE == "quorum"
+
+
+async def test_a_source_queue_carries_the_arguments_java_writes_and_no_others() -> None:
+    # All three together are what the broker compares, so all three are checked
+    # together: a queue that is quorum but dead-letters somewhere else is as
+    # unusable to the other service as one that is classic.
+    transport = FakeTransport()
+
+    await Topology().queue("orders.new", dead_letter=True).apply(transport)
+
+    assert transport.queues["orders.new"].args == {
+        QUEUE_TYPE_ARG: QUORUM_QUEUE_TYPE,
+        DEAD_LETTER_EXCHANGE_ARG: DEAD_LETTER_EXCHANGE,
+        DEAD_LETTER_ROUTING_KEY_ARG: "orders.new.dlq",
+    }
+
+
+async def test_the_rungs_and_the_dead_letter_queues_stay_classic() -> None:
+    # Java declares every one of these QueueType.CLASSIC, and classic is spelled
+    # by leaving the argument off rather than by writing 'classic' — which is a
+    # fourth spelling the broker would not find equivalent to Java's.
+    transport = FakeTransport()
+
+    await (
+        Topology()
+        .queue("orders.new", dead_letter=True, retry=fixed_retry(3, MINUTE))
+        .apply(transport)
+    )
+
+    for name in ("orders.new.dlq", "orders.new.parked", "orders.new.retry.1m"):
+        assert QUEUE_TYPE_ARG not in transport.queues[name].args, name
+
+
+def test_a_queue_can_still_be_asked_for_classic() -> None:
+    # A service with a quorum queue it cannot afford, or one talking to a broker
+    # that has none, still has a way to say so.
+    plan = Topology().queue("orders.new", quorum=False).plan()
+
+    assert QUEUE_TYPE_ARG not in plan[0].detail
+
+
+def test_an_exclusive_or_auto_deleting_queue_is_classic_without_being_asked() -> None:
+    # RabbitMQ refuses a quorum queue that is either, and the refusal it sends
+    # back never mentions the word quorum.
+    for spec in ({"exclusive": True}, {"auto_delete": True}, {"durable": False}):
+        plan = Topology().queue("replies", **spec).plan()  # type: ignore[arg-type]
+        assert QUEUE_TYPE_ARG not in plan[0].detail, spec
+
+
+def test_a_quorum_queue_that_belongs_to_one_connection_is_refused_here() -> None:
+    # Refused where the contradiction is written down rather than at the broker,
+    # which answers it with a message about neither quorum nor exclusivity.
+    with pytest.raises(ValueError, match="quorum=True and also exclusive"):
+        Topology().queue("replies", exclusive=True, quorum=True)
+    with pytest.raises(ValueError, match="quorum=True and also auto_delete"):
+        Topology().queue("replies", auto_delete=True, quorum=True)
+    with pytest.raises(ValueError, match=r"quorum=True and also durable=False"):
+        Topology().queue("replies", durable=False, quorum=True)
+
+
+def test_a_queue_that_names_its_own_kind_keeps_it() -> None:
+    # Which is how a stream is declared, and it is not overruled here.
+    plan = Topology().queue("events", args={QUEUE_TYPE_ARG: "stream"}).plan()
+
+    assert f"{QUEUE_TYPE_ARG}='stream'" in plan[0].detail
+
+
+def test_naming_a_kind_and_also_asking_for_one_is_refused_rather_than_resolved() -> None:
+    with pytest.raises(ValueError, match="pick one"):
+        Topology().queue("events", args={QUEUE_TYPE_ARG: "stream"}, quorum=True)
 
 
 def test_a_policy_declares_a_rung_for_each_of_its_long_waits() -> None:

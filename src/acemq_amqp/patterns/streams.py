@@ -41,10 +41,14 @@ from typing import Any
 
 from ..codec import Codec
 from ..connection import Connection, Consumer, Handler
+from ..topology import QUEUE_TYPE_ARG as _QUEUE_TYPE_ARG
 from ..topology import Topology
 
 #: Marks a queue as a stream at declaration. It cannot be changed afterwards.
-QUEUE_TYPE_ARG = "x-queue-type"
+#: It is the same argument that makes an ordinary queue quorum rather than
+#: classic, so it is defined once, in :mod:`acemq_amqp.topology`, and named
+#: again here because a stream is what a reader of this module came for.
+QUEUE_TYPE_ARG = _QUEUE_TYPE_ARG
 
 #: Where a stream consumer starts, given when it subscribes.
 STREAM_OFFSET_ARG = "x-stream-offset"

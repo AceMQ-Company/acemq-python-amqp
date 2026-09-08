@@ -120,7 +120,14 @@ from .telemetry import (
     aggregate_health,
     prometheus_text,
 )
-from .topology import DEAD_LETTER_EXCHANGE, RETRY_EXCHANGE, Topology, rung_args
+from .topology import (
+    DEAD_LETTER_EXCHANGE,
+    QUEUE_TYPE_ARG,
+    QUORUM_QUEUE_TYPE,
+    RETRY_EXCHANGE,
+    Topology,
+    rung_args,
+)
 from .transport import (
     ConsumeSpec,
     Delivery,
@@ -159,6 +166,8 @@ __all__ = [
     "METRIC_RETRIED",
     "METRIC_RUNG_MISSING",
     "METRIC_SET_ASIDE_FAILED",
+    "QUEUE_TYPE_ARG",
+    "QUORUM_QUEUE_TYPE",
     "RETRY_EXCHANGE",
     "TEXT_CONTENT_TYPE",
     "AceMQError",

@@ -904,6 +904,11 @@ class Connection:
         cheapest thing: a temporary queue, removed again straight away. Both
         prove the same thing, which is that the connection answers rather than
         merely being open.
+
+        The temporary queue is classic, and has to be. It is exclusive and
+        auto-deleting so that it goes when the channel does, and RabbitMQ
+        refuses a quorum queue that is either — a health check that could not be
+        declared would report a healthy broker as down.
         """
         if isinstance(self._transport, QueueAdmin):
             await self._transport.queue_exists(name)

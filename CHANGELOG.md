@@ -25,6 +25,34 @@ While the version is `0.x` the public API may change in any release.
 > two services on one queue that disagree about a rung's arguments cannot both
 > consume it.
 
+> ### ⚠ Migrating: a durable queue is now a quorum queue
+>
+> `Topology().queue(...)` declares a durable queue with
+> `x-queue-type: quorum`, where 0.1.0 sent no `x-queue-type` at all and
+> therefore got a classic queue. **A queue that already exists as classic
+> cannot be redeclared as quorum.** AMQP offers no way to change a queue's type
+> in place, so the declare is refused with `PRECONDITION_FAILED` — the broker
+> answers `inequivalent arg 'x-queue-type' ... received 'quorum' but current is
+> 'classic'` — and the service cannot consume the queue at all.
+>
+> Draining and recreating the queue is the only way through it. Stop the
+> consumers, let the queue empty or move what is on it somewhere else, delete
+> it, and let this version declare it again; anything still on the queue when it
+> is deleted is lost. A service that cannot do that yet can keep the queue
+> classic on purpose with `Topology().queue(name, quorum=False)`, which declares
+> exactly what 0.1.0 declared.
+>
+> `{queue}.retry.{delay}`, `{queue}.dlq` and `{queue}.parked` are **not**
+> affected: they stay classic, as they are in Java, so an existing one is
+> redeclared without complaint. Nor is any queue that is exclusive,
+> auto-deleting or transient — a generated reply queue, a temporary queue —
+> because RabbitMQ refuses a quorum queue that is any of those, and one is now
+> declared classic without being asked rather than being refused by the broker.
+>
+> The change exists because Java has declared quorum since it had deployments,
+> a queue type is compared as strictly as any other argument, and a Java service
+> and a Python service consuming one queue cannot disagree about it.
+
 ### Added
 
 - **TLS and credentials.** `amqps://` with the system trust store by default, a
@@ -57,6 +85,13 @@ While the version is `0.x` the public API may change in any release.
 - **A rung returns through the named `acemq.retry` exchange** rather than the
   default exchange, with one binding `{queue} -> acemq.retry -> {queue}`, and
   dead letters route through `acemq.dlx`. See the migration note above.
+- **A durable queue is declared quorum**, as it is in Java, Go, .NET and Ruby.
+  `Topology().queue(..., quorum=False)` still declares a classic one, and a
+  queue that is exclusive, auto-deleting or transient stays classic on its own
+  because a quorum queue cannot be any of those. The rungs, `{queue}.dlq` and
+  `{queue}.parked` stay classic too. `QUEUE_TYPE_ARG` and `QUORUM_QUEUE_TYPE`
+  are exported for a caller who needs to write the argument themselves. See the
+  migration note above.
 - **A replay resets `x-acemq-attempt` to 1** unless told otherwise. A message
   dead-lettered on its last attempt would otherwise be dead-lettered again
   before a handler ever saw it.

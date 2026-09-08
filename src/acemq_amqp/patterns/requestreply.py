@@ -129,10 +129,10 @@ class Requester:
         :param exchange: where requests go, empty for the default exchange
         :param routing_key: what they are published under, or a queue name
         :param reply_queue: where replies come back. One is generated when this
-            is not given: transient, exclusive and auto-deleting, belonging to
-            this process. Name one only when replies must survive a restart —
-            a named reply queue that outlives its requester collects answers
-            nobody is waiting for
+            is not given: transient, exclusive, auto-deleting and classic,
+            belonging to this process. Name one only when replies must survive a
+            restart — a named reply queue that outlives its requester collects
+            answers nobody is waiting for
         :param timeout: how long :meth:`ask` waits
         :param codec: a codec other than the connection's, for both directions
         :returns: the requester, already consuming
@@ -142,12 +142,20 @@ class Requester:
 
         generated = not reply_queue
         queue = reply_queue or f"acemq-reply-{uuid.uuid4().hex}"
+        # A generated reply queue is classic, and has to be: it is exclusive and
+        # auto-deleting so that it goes when this process does, and RabbitMQ
+        # refuses a quorum queue that is either. Said here rather than left to
+        # the default, because it is the one queue in the library where turning
+        # it quorum would stop request/reply working at all rather than merely
+        # declare something different. A named one is an ordinary durable queue
+        # a responder may also declare, so it is quorum like any other.
         await connection.declare(
             Topology().queue(
                 queue,
                 durable=not generated,
                 auto_delete=generated,
                 exclusive=generated,
+                quorum=not generated,
             )
         )
 

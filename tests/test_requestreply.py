@@ -33,7 +33,7 @@ from acemq_amqp.patterns import (
     ResponderError,
     serve,
 )
-from acemq_amqp.topology import Topology
+from acemq_amqp.topology import QUEUE_TYPE_ARG, QUORUM_QUEUE_TYPE, Topology
 
 REQUESTS = "price-requests"
 REPLIES = "price-replies"
@@ -258,6 +258,10 @@ async def test_a_generated_reply_queue_belongs_to_this_process_alone() -> None:
     assert spec.durable is False
     assert spec.exclusive is True
     assert spec.auto_delete is True
+    # And therefore classic. RabbitMQ refuses a quorum queue that is exclusive
+    # or auto-deleting, so a reply queue that picked up the quorum default would
+    # not be declared at all and request/reply would stop working outright.
+    assert QUEUE_TYPE_ARG not in spec.args
     await mq.close()
 
 
@@ -271,4 +275,7 @@ async def test_a_named_reply_queue_is_declared_to_survive_a_restart() -> None:
 
     assert spec.durable is True
     assert spec.exclusive is False
+    # A named reply queue is an ordinary durable queue that a responder in
+    # another language may declare too, so it is quorum like any other.
+    assert spec.args[QUEUE_TYPE_ARG] == QUORUM_QUEUE_TYPE
     await mq.close()

@@ -39,6 +39,14 @@ from, and :data:`DEAD_LETTER_EXCHANGE` reaches the dead-letter and parking
 queues. Both are declared, and bound, by :meth:`Topology.queue` when it is asked
 for retries or for dead-lettering, so that the whole arrangement appears in
 :meth:`Topology.plan` and nothing depends on a caller remembering a binding.
+
+A durable queue asked for here is a **quorum** queue. That is the default in
+every AceMQ library, and it is a contract rather than a preference for the same
+reason the rung arguments are: a Java service and a Python service consuming
+``orders`` both declare ``orders``, and a queue type is compared as strictly as
+any other argument, so the second one to arrive is answered
+``PRECONDITION_FAILED`` and cannot consume at all. See :meth:`Topology.queue`
+for what stays classic and why.
 """
 
 from __future__ import annotations
@@ -81,6 +89,19 @@ RETRY_EXCHANGE = "acemq.retry"
 #: The exchange the dead-letter and parking queues are reached through, each
 #: bound on its own name.
 DEAD_LETTER_EXCHANGE = "acemq.dlx"
+
+#: What kind of queue to declare. Fixed at declaration: a queue that exists
+#: cannot be turned into another kind, only deleted and declared again.
+QUEUE_TYPE_ARG = "x-queue-type"
+
+#: The kind a durable queue asked for through :meth:`Topology.queue` is declared
+#: as, which is what Java, Go, .NET and Ruby declare too.
+#:
+#: There is no matching constant for a classic queue, and that is deliberate: a
+#: classic queue is declared by leaving :data:`QUEUE_TYPE_ARG` off altogether,
+#: which is what the other libraries send and therefore the only spelling a
+#: broker will find equivalent to theirs.
+QUORUM_QUEUE_TYPE = "quorum"
 
 #: How both managed exchanges are declared: direct, because every binding on
 #: them matches a queue name exactly, and durable, because a topology that
@@ -212,11 +233,34 @@ class Topology:
         durable: bool = True,
         auto_delete: bool = False,
         exclusive: bool = False,
+        quorum: bool | None = None,
         dead_letter: bool = False,
         retry: RetryPolicy | None = None,
         args: Mapping[str, Any] | None = None,
     ) -> Topology:
         """Adds a queue, and the queues that catch what it cannot handle.
+
+        A durable queue is a **quorum** queue unless it is asked to be something
+        else. That is what Java has always declared and what the other libraries
+        declare now, and it has to be the same everywhere: the queue type is one
+        more argument the broker compares, so a Java service and a Python
+        service that disagree about ``orders`` cannot both consume it. Pass
+        ``quorum=False`` for a classic queue, which is declared by leaving
+        ``x-queue-type`` off entirely — the spelling every AceMQ library uses,
+        and therefore the only one a broker finds equivalent to theirs.
+
+        ``exclusive``, ``auto_delete`` and ``durable=False`` all mean a queue
+        that belongs to one connection, and RabbitMQ refuses a quorum queue that
+        is any of those. Such a queue is declared classic without being asked,
+        because the alternative is a declaration the broker rejects with a
+        message that never mentions the word quorum. Asking for both — a queue
+        that is ``quorum=True`` and exclusive — is refused here instead, where
+        the contradiction is written down.
+
+        A queue whose ``args`` already name a kind keeps it: that is how
+        :func:`acemq_amqp.patterns.stream` declares a stream, and a caller who
+        wrote ``x-queue-type`` down meant it. Writing it down *and* passing
+        ``quorum`` is two answers to one question and is refused.
 
         ``dead_letter`` declares ``{name}.dlq`` alongside it and points the
         broker at it, so a message this queue rejects or lets expire lands
@@ -255,16 +299,30 @@ class Topology:
         :param durable: survives a broker restart
         :param auto_delete: goes away when its last consumer does
         :param exclusive: usable only by the connection that declared it
+        :param quorum: replicated rather than classic. ``None``, the default,
+            means quorum for a durable queue and classic for one belonging to a
+            single connection
         :param dead_letter: also declare and wire ``{name}.dlq``, and declare
             ``{name}.parked``
         :param retry: also declare the rung queues this policy's long waits use
         :param args: broker-specific arguments
         :returns: this topology
+        :raises ValueError: when the queue cannot be what it was asked to be
         """
         if not name:
             raise ValueError("acemq: a queue needs a name")
 
         arguments: dict[str, Any] = dict(args or {})
+        kind = _queue_type(
+            name,
+            arguments,
+            durable=durable,
+            auto_delete=auto_delete,
+            exclusive=exclusive,
+            quorum=quorum,
+        )
+        if kind is not None:
+            arguments[QUEUE_TYPE_ARG] = kind
         if dead_letter:
             # Refused rather than resolved, because either answer would be a
             # guess about which of two conflicting instructions was meant.
@@ -295,6 +353,11 @@ class Topology:
         )
         if dead_letter:
             self._managed_exchange(DEAD_LETTER_EXCHANGE)
+            # Classic, deliberately, whatever the queue in front of them is.
+            # Java declares both QueueType.CLASSIC and these are shared names:
+            # a dead-letter queue nobody consumes gains nothing from being
+            # replicated, and gaining it here would cost a Java service its
+            # declaration of the same queue.
             for target in (naming.dead_letter_queue(name), naming.parked_queue(name)):
                 self._queues.append(_NamedQueue(target, QueueSpec(durable=durable)))
                 self._bindings.append(
@@ -304,6 +367,10 @@ class Topology:
             rungs = retry.broker_rungs()
             if rungs:
                 self._managed_exchange(RETRY_EXCHANGE)
+                # Classic too, and for the same reason as ``.dlq``: a rung is
+                # declared by every service consuming the source queue, Java
+                # declares it QueueType.CLASSIC, and :func:`rung_args` is the
+                # whole argument table — three keys, no ``x-queue-type``.
                 for rung in rungs:
                     self._queues.append(
                         _NamedQueue(
@@ -457,6 +524,67 @@ class Topology:
             f"{len(self._queues)} queues, {len(self._bindings)} bindings"
         )
         return "\n".join([header, *(f"  {action}" for action in actions)])
+
+
+def _queue_type(
+    name: str,
+    args: Mapping[str, Any],
+    *,
+    durable: bool,
+    auto_delete: bool,
+    exclusive: bool,
+    quorum: bool | None,
+) -> str | None:
+    """What to declare a queue as, or ``None`` to leave the argument off.
+
+    ``None`` is classic and is a real answer rather than a missing one: every
+    AceMQ library declares a classic queue by sending no ``x-queue-type`` at
+    all, and a broker compares the argument tables it was given, so sending
+    ``classic`` where Java sends nothing would be a third spelling of the same
+    queue and would be refused as a fourth disagreement.
+
+    :param name: the queue, for the message when the answer is a refusal
+    :param args: what the caller wrote down, which may already name a kind
+    :param durable: survives a broker restart
+    :param auto_delete: goes away when its last consumer does
+    :param exclusive: usable only by the connection that declared it
+    :param quorum: what the caller asked for, or ``None`` for the default
+    :returns: the value for :data:`QUEUE_TYPE_ARG`, or ``None`` for classic
+    :raises ValueError: when what was asked for cannot exist
+    """
+    written = args.get(QUEUE_TYPE_ARG)
+    if written is not None:
+        if quorum is not None:
+            raise ValueError(
+                f"acemq: queue {name!r} sets {QUEUE_TYPE_ARG}={written!r} and also passes "
+                f"quorum={quorum!r}; pick one"
+            )
+        return str(written)
+
+    # A queue tied to one connection cannot be a quorum queue. RabbitMQ refuses
+    # exclusive, auto-delete and transient outright, and the refusal it sends
+    # back does not say which of the three it objected to.
+    per_connection = exclusive or auto_delete or not durable
+    if quorum is None:
+        return None if per_connection else QUORUM_QUEUE_TYPE
+    if not quorum:
+        return None
+    if per_connection:
+        refused = ", ".join(
+            label
+            for label, set_ in (
+                ("exclusive", exclusive),
+                ("auto_delete", auto_delete),
+                ("durable=False", not durable),
+            )
+            if set_
+        )
+        raise ValueError(
+            f"acemq: queue {name!r} asks for quorum=True and also {refused}; "
+            "a quorum queue belongs to the broker rather than to a connection, "
+            "so it can be none of those"
+        )
+    return QUORUM_QUEUE_TYPE
 
 
 def _describe(spec: QueueSpec | ExchangeSpec) -> str:
