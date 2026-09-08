@@ -6,6 +6,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 While the version is `0.x` the public API may change in any release.
 
+## [Unreleased]
+
+### Added
+
+- **The claim check.** `ClaimCheckCodec` wraps any codec, sends a payload of at
+  least `DEFAULT_THRESHOLD` (64 KiB) to a `ClaimCheckStore` and puts the key on
+  the wire in its place; anything smaller travels inline, unchanged. The framing
+  is byte for byte what the Java library writes — `0xAC 0x01 0x00` before an
+  inline payload and `0xAC 0x01 0x01` before a bare UTF-8 key — so a document a
+  Java service put aside is one a Python service can redeem, and a body neither
+  wrote goes to the wrapped codec untouched. `InMemoryClaimCheckStore` and
+  `FilesystemClaimCheckStore` implement the seam; `claim_key_of` and
+  `is_claim_check` read a body without fetching anything, which is what an
+  operator looking at a dead-letter queue wants.
+
 ## [0.2.0] — 2026-09-07
 
 > ### ⚠ Migrating: a retry rung now returns through `acemq.retry`

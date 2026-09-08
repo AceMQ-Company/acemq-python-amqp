@@ -9,8 +9,8 @@ bugs live.
 
 ```python
 from acemq_amqp.patterns import (
-    ConsumerGroup, InMemoryIdempotencyStore, Requester, RoutingSlip,
-    chain, idempotent, ordered, replay, serve, with_timeout,
+    ClaimCheckCodec, ConsumerGroup, InMemoryIdempotencyStore, Requester,
+    RoutingSlip, chain, idempotent, ordered, replay, serve, with_timeout,
 )
 ```
 
@@ -480,6 +480,107 @@ it is a stream.
 `Connection.message_count` on a stream says how many messages are **retained**,
 not how many are outstanding, for the same reason: there is no such thing as
 outstanding on a stream.
+
+## The claim check
+
+A forty-megabyte message is possible and is a mistake: it fills the broker's
+memory, it is copied to every bound queue, it makes a dead-letter queue
+impossible to inspect, and it turns a broker into a filesystem with worse tools.
+What travels instead is a **claim check** — the payload goes to a store and the
+message carries the key.
+
+```python
+from acemq_amqp.codec import JsonCodec
+from acemq_amqp.patterns import ClaimCheckCodec, FilesystemClaimCheckStore
+
+store = FilesystemClaimCheckStore("/mnt/payloads")
+mq = await connect(url, codec=ClaimCheckCodec(JsonCodec(), store))
+```
+
+That is the whole of it. `ClaimCheckCodec` is a `Codec`, so it goes wherever a
+codec goes: on the connection, on one publisher, on one consumer.
+
+**Only when it is worth it.** Below the threshold the payload travels inline,
+exactly as it would without this codec. That matters more than it sounds:
+offloading a two-hundred-byte message turns one broker round trip into a store
+round trip *and* a broker round trip, so an unconditional claim check makes the
+common case slower to fix the rare one. The default threshold is
+`DEFAULT_THRESHOLD`, 64 KiB — comfortably above an ordinary event and comfortably
+below the size at which a broker starts to care. Pass `threshold=` to change it;
+`threshold=0` offloads everything, which is occasionally what a store-backed
+audit trail wants.
+
+### What is on the wire
+
+Three bytes, then either the payload or the key:
+
+```
+0xAC  0x01  0x00  payload      inline, and identical to what the delegate wrote
+0xAC  0x01  0x01  key          a claim check
+```
+
+Byte for byte what the Java library writes, so a document a Java service put
+aside is one a Python service can read. Two things about that are worth being
+explicit about, because getting either wrong means the two languages cannot
+exchange a large message even though both "have claim check":
+
+- **The key is bare.** No scheme, no `acemq://`, no wrapper — whatever the
+  store's `put` returned, in UTF-8. A key is meaningful only to the store that
+  issued it, so dressing it up as a URI would be inventing an authority nobody
+  reads.
+- **A consumer decides from the body, never from a header.** The reserved
+  `x-acemq-claim` header is for an application that wants to say where a payload
+  went in a form an operator can read; it is not what this codec dispatches on.
+  Headers get dropped by shovels, federation links and plugins, and a message
+  whose body is a key but whose header went missing would be handed to a JSON
+  parser as if it were a document.
+
+A body this codec did not write — no magic, wrong version, an unknown third byte
+— goes to the delegate untouched. That is what makes it safe to introduce on a
+queue that already has messages in it, and safe to change the threshold
+afterwards.
+
+```python
+from acemq_amqp.patterns import claim_key_of, is_claim_check
+
+is_claim_check(message_body)   # is the payload somewhere else?
+claim_key_of(message_body)     # which object does it need? None when inline
+```
+
+For the operator looking at a dead-letter queue, that one line is the difference
+between a five-minute check and restoring a backup.
+
+### Retention is the part that goes wrong
+
+The store and the queue have different lifetimes and nothing enforces a
+relationship between them. A message replayed a month later carries a key, and
+if the store expired that key the replay produces a message nobody can read —
+**worse than a lost message, because it looks like a message** and fails deep
+inside a consumer rather than visibly. A redeemed claim that is not there raises
+`FatalError`, which dead-letters the message rather than retrying it forever.
+
+So the store's retention must exceed every retention that could bring a message
+back: queue TTLs, dead-letter queues, and however long somebody might sit on a
+message before replaying it by hand. When in doubt, longer. The codec never
+calls `delete` for the same reason: deleting on read breaks the second consumer,
+deleting on acknowledgement breaks a replay, and when a payload may be removed
+is a decision that belongs to whoever owns the data.
+
+### The stores
+
+`ClaimCheckStore` is three synchronous methods — `put`, `get`, `delete` — so a
+store over S3 or Azure Blob Storage is a small class. It is synchronous because
+`Codec` is: a codec is called from inside both the async and the blocking API,
+and a store that had to be awaited could not serve the second.
+
+| | |
+|---|---|
+| `InMemoryClaimCheckStore` | the payloads are held in the publisher's own memory, which is where they were going to be anyway — so this takes them off the broker and does nothing else. A consumer in another process gets "the claim check is not in the store". For tests |
+| `FilesystemClaimCheckStore` | a shared, durable mount: NFS, a persistent volume. Writes go to a temporary file and are moved into place, so a consumer fast enough to read the key before the writer finished sees the whole payload or none of it. On a container's *local* disk it is the in-memory store with extra steps |
+
+`FilesystemClaimCheckStore` checks a key rather than trusting it — a key becomes
+a path segment, and `../../etc/passwd` is a key too. It accepts exactly what
+Java's accepts, so the two can share one mount.
 
 ## Stores that survive a restart
 

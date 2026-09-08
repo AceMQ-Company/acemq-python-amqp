@@ -88,7 +88,9 @@ from acemq_amqp.patterns import (
     HEADER_REPLAYED_FROM,
     HEADER_ROUTING_SLIP,
     NOTHING,
+    ClaimCheckCodec,
     ConsumerGroup,
+    FilesystemClaimCheckStore,
     InMemoryIdempotencyStore,
     InMemoryOutboxStore,
     OutboxRelay,
@@ -96,6 +98,7 @@ from acemq_amqp.patterns import (
     ResponderError,
     RoutingSlip,
     StreamRetention,
+    claim_key_of,
     declare_stream,
     follow_slip,
     from_first,
@@ -887,6 +890,57 @@ async def test_an_outbox_relay_publishes_what_was_committed(
     assert got.payload == {"id": "7"}
     assert got.envelope.origin == "acemq-python-tests@ci"
     assert len(store) == 0
+
+
+async def test_a_large_payload_travels_as_a_claim_check(
+    mq: Connection, workspace: Workspace, tmp_path: Path
+) -> None:
+    """The broker carries a key; the payload never reaches it."""
+    queue = await workspace.queue("claimcheck")
+    store = FilesystemClaimCheckStore(tmp_path / "payloads")
+    checked = ClaimCheckCodec(mq.codec, store)
+
+    # Comfortably over the 64 KiB threshold both this library and Java use.
+    order = {"id": "big-1", "lines": ["x" * 64] * 2000}
+
+    await mq.publisher(routing_key=queue, mandatory=True, codec=checked).send(order)
+
+    # What the broker actually holds: three bytes of framing and a key, not the
+    # document. Read with BytesCodec so it is the wire that is being inspected.
+    on_the_wire = (await collect(mq, queue, codec=BytesCodec()))[0].payload
+    assert isinstance(on_the_wire, bytes)
+    assert on_the_wire[:3] == b"\xac\x01\x01"
+    assert len(on_the_wire) < 100
+    key = claim_key_of(on_the_wire)
+    assert key is not None
+    assert store.get(key) is not None
+
+    # And a consumer with the same store gets the document back whole.
+    await mq.publisher(routing_key=queue, mandatory=True, codec=checked).send(order)
+    got = (await collect(mq, queue, codec=checked))[0]
+    assert got.payload == order
+
+    # The content type is unchanged: a claim-checked document is still a document.
+    assert got.content_type == mq.codec.content_type
+
+
+async def test_a_small_payload_still_travels_inline(
+    mq: Connection, workspace: Workspace, tmp_path: Path
+) -> None:
+    """Below the threshold nothing goes to the store, so the common case pays
+    for nothing."""
+    queue = await workspace.queue("claimcheck-small")
+    store = FilesystemClaimCheckStore(tmp_path / "payloads")
+    checked = ClaimCheckCodec(mq.codec, store)
+
+    await mq.publisher(routing_key=queue, mandatory=True, codec=checked).send({"id": "1"})
+
+    on_the_wire = (await collect(mq, queue, codec=BytesCodec()))[0].payload
+    assert isinstance(on_the_wire, bytes)
+    assert on_the_wire[:3] == b"\xac\x01\x00"
+    assert on_the_wire[3:] == b'{"id": "1"}'
+    assert claim_key_of(on_the_wire) is None
+    assert list((tmp_path / "payloads").iterdir()) == []
 
 
 async def test_a_duplicate_is_accepted_without_running_the_handler_again(

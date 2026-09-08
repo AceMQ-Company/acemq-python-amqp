@@ -40,6 +40,12 @@ was written.
 | `x-acemq-error` | string | Why it was dead-lettered or parked |
 | `x-acemq-claim` | string | Where the payload is, when it is stored outside the message |
 
+`x-acemq-claim` is for saying, in a form an operator reading a dead-letter queue
+can use, where a payload went. It is **not** how a consumer decides that a
+message is a claim check: [`ClaimCheckCodec`](patterns.md#the-claim-check) puts
+three bytes at the front of the body and dispatches on those, because a header
+can be dropped by a shovel, a federation link or a plugin and a body cannot.
+
 These names are the contract between languages, not an implementation detail of
 this one. Nothing here is renamed for Python's benefit —
 `x-acemq-first-seen` stays hyphenated and stays epoch milliseconds, however

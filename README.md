@@ -559,6 +559,7 @@ from acemq_amqp.patterns import InMemoryIdempotencyStore, chain, idempotent, wit
 | `RoutingSlip` / `follow_slip(...)` | An itinerary the message carries, instead of an orchestrator that knows it |
 | `chain(...)` / `then(...)` | Wrap a handler in a deadline, logging and the guards; publish what a step produced onwards |
 | `SchemaRegistry` | Remember what a message used to look like, so a producer can add a field without a synchronised deployment |
+| `ClaimCheckCodec` | Put a payload too large for a broker into a store and send the key, above a threshold and inline below it |
 | `read_stream(...)` | Read a queue that keeps what it has already handed out |
 
 Every one is built out of the public library — handlers, envelopes, publishers —

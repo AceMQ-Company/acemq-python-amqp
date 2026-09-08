@@ -190,5 +190,10 @@ alternative for encryption specifically, because it sees the payload before the
 codec runs and applies to every publisher without being remembered at each call
 site.
 
+A payload too large for a broker is also a codec's problem, and it does ship:
+`ClaimCheckCodec` wraps another codec, sends anything over a threshold to a
+store, and puts the key on the wire instead. See
+[the claim check](patterns.md#the-claim-check).
+
 Schema *evolution* is a different problem from serialization and has its own
 answer: see [the schema registry](patterns.md#schema-registry).

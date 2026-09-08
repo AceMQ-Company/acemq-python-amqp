@@ -33,6 +33,15 @@ without it. That is deliberate: a pattern you cannot walk away from is a trap.
 
 from __future__ import annotations
 
+from .claimcheck import (
+    DEFAULT_THRESHOLD,
+    ClaimCheckCodec,
+    ClaimCheckStore,
+    FilesystemClaimCheckStore,
+    InMemoryClaimCheckStore,
+    claim_key_of,
+    is_claim_check,
+)
 from .consumergroup import ConsumerGroup
 from .idempotency import (
     DEFAULT_MEMORY,
@@ -121,6 +130,7 @@ __all__ = [
     "DEFAULT_INTERVAL",
     "DEFAULT_MEMORY",
     "DEFAULT_STREAM_PREFETCH",
+    "DEFAULT_THRESHOLD",
     "DEFAULT_TIMEOUT",
     "HEADER_ERROR",
     "HEADER_REPLAYED_AT",
@@ -129,8 +139,12 @@ __all__ = [
     "HEADER_REPLY_TO",
     "HEADER_ROUTING_SLIP",
     "NOTHING",
+    "ClaimCheckCodec",
+    "ClaimCheckStore",
     "ConsumerGroup",
+    "FilesystemClaimCheckStore",
     "IdempotencyStore",
+    "InMemoryClaimCheckStore",
     "InMemoryIdempotencyStore",
     "InMemoryOutboxStore",
     "InMemorySchemaRegistry",
@@ -157,6 +171,7 @@ __all__ = [
     "by_correlation",
     "by_header",
     "chain",
+    "claim_key_of",
     "declare_stream",
     "fingerprint",
     "follow_slip",
@@ -166,6 +181,7 @@ __all__ = [
     "from_offset",
     "from_timestamp",
     "idempotent",
+    "is_claim_check",
     "ordered",
     "partition",
     "partitioned_routing_key",
