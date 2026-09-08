@@ -31,9 +31,13 @@ Two queues, and they are different on purpose:
 | `{queue}.dlq` | ran out of attempts, was rejected, or was marked fatal. Usually the world |
 | `{queue}.parked` | never reached the handler at all — the body would not decode. Usually a producer |
 
-`Topology().queue(name, dead_letter=True)` declares both. A library that parks
-messages into a queue nobody declared has only moved the disappearance somewhere
-else.
+`Topology().queue(name, dead_letter=True)` declares both, and **so does the
+consumer, when it starts**. A library that parks messages into a queue nobody
+declared has only moved the disappearance somewhere else: the republish reaches
+no queue, the broker drops it, and nothing anywhere says so. Declaring both ends
+of that at start-up costs a few round trips once per consumer and closes the
+path. See [who declares what](topology.md#who-declares-what) for the whole split
+and for the `declare=False` a consumer with no `configure` permission needs.
 
 The message arrives with `x-acemq-error` saying which limit it hit and what the
 last failure was:
@@ -182,8 +186,11 @@ policy.wait_in_broker_from(timedelta(minutes=1))   # move the line
 policy.wait_in_broker_from(timedelta(0))           # never; every wait is held here
 ```
 
-Zero is the way out, for a service that may not declare queues on its broker.
-It is the wrong setting for a policy with delays measured in minutes.
+Zero is the way out for a service that may not declare queues on its broker: no
+rungs exist, so nothing tries to declare any and nothing publishes to one. Pair
+it with `declare=False` on `consume()`, which stops the consumer declaring its
+dead-letter queues too. It is the wrong setting for a policy with delays measured
+in minutes.
 
 Splitting at a threshold rather than picking one of the two takes the durability
 where it is worth its complexity and leaves the simplicity where it is not:
@@ -239,7 +246,9 @@ under the load that puts two different waits on one queue at once.
 Both are **direct** and **durable**, and both are declared by
 `Topology().queue(...)` when it is asked for retries or for dead-lettering — as
 is the one binding that brings an expired message home, `{queue}` to
-`acemq.retry` on `{queue}`.
+`acemq.retry` on `{queue}`. A consumer declares the same exchanges, the same
+rungs and the same binding again when it starts, with the same arguments, so the
+second declaration is a no-op whichever of the two arrives first.
 
 That binding is not optional and is not lazy. A direct exchange drops what it
 cannot route and says nothing, so a topology missing it loses every expired
@@ -253,12 +262,16 @@ a broker already carrying a Java service has this arrangement on it.
 
 ### When a rung is missing
 
+A consumer declares its own rungs at start-up, so this is rarer than it was —
+but it has not gone away. A consumer started with `declare=False` declares
+nothing, and a rung deleted under a running consumer is gone whoever made it.
+
 If the rung queue is not on the broker, the message is **still retried** — the
 consumer holds it and waits here instead — and:
 
 - `acemq.retry.rung.missing` is counted, labelled with the rung's name
-- an error is logged naming the queue and the `Topology().queue(..., retry=...)`
-  call that would declare it
+- an error is logged naming the queue, the `Topology().queue(..., retry=...)`
+  call that would declare it, and the `declare=True` that would have
 
 That metric is the one to alert on, because nothing else shows it. The message
 is still retried and the wait still happens, so a dashboard reads as normal

@@ -10,6 +10,12 @@ While the version is `0.x` the public API may change in any release.
 
 ### Added
 
+- `declare_where_failures_go(transport, queue, retry)` declares the dead-letter
+  and retry half of a queue's topology without declaring the queue itself, which
+  is the one arrangement `Topology` cannot describe: it refuses a binding on a
+  queue it does not declare, and a consumer must not guess at the source queue.
+  It is what `consume()` calls at start-up.
+
 - **The claim check.** `ClaimCheckCodec` wraps any codec, sends a payload of at
   least `DEFAULT_THRESHOLD` (64 KiB) to a `ClaimCheckStore` and puts the key on
   the wire in its place; anything smaller travels inline, unchanged. The framing
@@ -37,6 +43,30 @@ While the version is `0.x` the public API may change in any release.
 
 ### Changed
 
+- **A consumer declares the queues it will need when a message fails, before it
+  subscribes**: `acemq.dlx`, `{queue}.dlq`, `{queue}.parked` and their two
+  bindings, plus `acemq.retry`, the rung queues and the binding home when its
+  retry policy has waits the broker holds. `mq.consume(...)` used to declare
+  nothing at all and leave every one of those to `Topology`. The union is the
+  same once a topology has been applied, so a correctly deployed service sees no
+  change beyond a few extra declares at start-up; what it fixes is the service
+  deployed *without* one, where a consumer that gave up republished to
+  `{queue}.dlq`, the broker could not route it, and the message was discarded
+  without a trace. Every declaration carries the arguments `Topology` writes, so
+  either order is accepted and neither is a `PRECONDITION_FAILED`. The source
+  queue is **not** declared — it belongs to whoever set the service up, and
+  `x-dead-letter-exchange` on it can still only be asked for through
+  `Topology().queue(name, dead_letter=True)`.
+- `mq.consume(..., declare=False)` turns that off, for a login with no
+  `configure` permission on the vhost and for a tool draining a queue it does not
+  own. `sync.SyncConnection.consume` takes it too. A `Requester` passes it
+  itself: a reply queue is a mailbox for one process that never dead-letters
+  anything, and declaring for it would leave two durable queues behind per
+  restart.
+- `acemq.retry.rung.missing` and the fallback to waiting in the consumer stay,
+  because a rung can still be absent — a consumer started with `declare=False`
+  declares none, and a rung deleted under a running consumer is gone whoever
+  made it.
 - `idempotent(...)` calls `store.confirm(key)` when a handler accepts, if the
   store has one. A store that hands out a *lease* rather than a fact — so a
   consumer that dies holding a message does not block its redelivery — needs to

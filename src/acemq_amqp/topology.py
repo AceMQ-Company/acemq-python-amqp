@@ -40,6 +40,13 @@ queues. Both are declared, and bound, by :meth:`Topology.queue` when it is asked
 for retries or for dead-lettering, so that the whole arrangement appears in
 :meth:`Topology.plan` and nothing depends on a caller remembering a binding.
 
+A consumer declares that same half again when it starts, through
+:func:`declare_where_failures_go`, without waiting to be asked. Declaring it
+twice costs two round trips and nothing else, because both declarations carry
+the same arguments; not declaring it at all costs a message, because a service
+deployed without its topology republishes a dead letter to a queue the broker
+cannot route to, and the broker discards what it cannot route in silence.
+
 A durable queue asked for here is a **quorum** queue. That is the default in
 every AceMQ library, and it is a contract rather than a preference for the same
 reason the rung arguments are: a Java service and a Python service consuming
@@ -591,6 +598,71 @@ def _queue_type(
             "so it can be none of those"
         )
     return QUORUM_QUEUE_TYPE
+
+
+async def declare_where_failures_go(
+    transport: Transport, queue: str, retry: RetryPolicy | None = None
+) -> None:
+    """Declares the queues a consumer of ``queue`` will need when it fails.
+
+    ``acemq.dlx``, ``{queue}.dlq``, ``{queue}.parked`` and the two bindings that
+    reach them; and, when ``retry`` has waits long enough to be held by the
+    broker, ``acemq.retry``, one rung queue per distinct wait, and the binding
+    that brings an expired message back to ``queue``. Exactly what
+    :meth:`Topology.queue` writes for the same arguments, and exactly what Java's
+    consumer declares when it starts.
+
+    Called by :meth:`acemq_amqp.Connection.consume` before it subscribes, which
+    is the point of it: everything here is somewhere a message goes when the
+    handler has given up, and a message republished to a queue that is not there
+    is discarded by the broker without a word. Applying a topology first is still
+    the right way to run a service — it is reviewable, and it declares the source
+    queue with the ``x-dead-letter-exchange`` this cannot — but a service that was
+    deployed without one should lose a message to a bug rather than to a missing
+    queue.
+
+    The source queue is deliberately not declared. It belongs to whoever set the
+    service up, who chose its type and its arguments, and guessing wrong is a
+    ``PRECONDITION_FAILED`` that stops the consumer starting at all.
+
+    Safe to call repeatedly, and safe to call after :meth:`Topology.apply` or
+    before it: every declaration here carries the same arguments the topology
+    would send, so the second one to arrive is a no-op rather than a refusal.
+
+    :param transport: where to declare it
+    :param queue: the queue being consumed
+    :param retry: the policy the consumer is running, whose long waits decide
+        which rungs exist. ``None``, or a policy that holds every wait in the
+        consumer, declares only the dead-letter half
+    """
+    await transport.declare_exchange(DEAD_LETTER_EXCHANGE, _MANAGED_EXCHANGE)
+    for target in (naming.dead_letter_queue(queue), naming.parked_queue(queue)):
+        # Classic, whatever the queue in front of them is, for the reason
+        # :meth:`Topology.queue` gives: these are shared names, and a Java
+        # service declaring the same queue declares it classic.
+        await transport.declare_queue(target, QueueSpec(durable=True))
+        await transport.bind(target, DEAD_LETTER_EXCHANGE, target)
+
+    # Keyed by name rather than by delay. Two delays can render to the same name,
+    # and a second queue by that name with a different time-to-live is not a
+    # second rung — it is the PRECONDITION_FAILED that stops this consumer
+    # starting. The first delay to reach a name owns it, which is what Java does.
+    rungs: dict[str, timedelta] = {}
+    for delay in retry.broker_rungs() if retry is not None else []:
+        rungs.setdefault(naming.retry_queue(queue, delay), delay)
+    if not rungs:
+        return
+
+    await transport.declare_exchange(RETRY_EXCHANGE, _MANAGED_EXCHANGE)
+    for name, delay in rungs.items():
+        await transport.declare_queue(
+            name, QueueSpec(durable=True, args=rung_args(queue, delay))
+        )
+    # One binding brings every expired message home. Without it a rung expires
+    # into an exchange that routes nowhere, and the broker drops what it cannot
+    # route in silence: the retry looks like one still waiting rather than one
+    # that is gone.
+    await transport.bind(queue, RETRY_EXCHANGE, queue)
 
 
 def _describe(spec: QueueSpec | ExchangeSpec) -> str:

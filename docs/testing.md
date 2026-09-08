@@ -257,7 +257,11 @@ gained, none lost, none renamed. See
   count matters as much as the values: a fourth is a `PRECONDITION_FAILED` for
   the second service to declare that queue.
 - **`topology`** — the whole declared plan, exchange by exchange and binding by
-  binding, with each entry labelled by which half of the library declares it.
+  binding, with each entry labelled `declaredBy` — the topology, the consumer, or
+  both. Three tests read that label: one that a topology produces all three
+  groups, one that a topology without a policy produces everything but the rungs,
+  and one that a **consumer** starting against a bare broker produces exactly the
+  `consumer` and `both` groups and nothing from `topology`.
 - **`queueTypeDefaults`** — quorum source queue, classic rungs and dead letters,
   everything durable.
 
@@ -276,6 +280,29 @@ was testing its own arithmetic against its own expectations. Three more — the
 rung's dead-letter exchange, the source queue's dead-letter arguments, and the
 queue type — turned up the same way on the same afternoon, all four found by a
 person reading five codebases side by side.
+
+### A disagreement the suite settled
+
+**Who declares the dead-letter queues.** The first `declaredBy` reading found
+that Java's consumer declared `acemq.dlx`, `{queue}.dlq`, `{queue}.parked`, their
+bindings and the whole retry half when it started, and that this library's
+consumer declared **nothing at all** — it published to a rung, counted
+`acemq.retry.rung.missing` when the broker could not route it, and left every
+queue to `Topology`. Go, .NET and Ruby sat between the two.
+
+The union is identical once a topology has been applied, so nothing was ever
+missing in a correctly deployed system. The problem was the system where it had
+not been: a consumer that gave up republished to `{queue}.dlq`, the broker could
+not route it, and an unroutable message is discarded without a trace. Declaring
+at start-up costs a few idempotent declares once per consumer and removes a
+silent-loss path, so all five libraries moved to Java's side — the reverse of the
+last disagreement, which Java lost. The rule is that the safer behaviour wins,
+not that the majority does.
+
+A test asserts the new split rather than the old one, and would fail if this
+library's consumer ever stopped declaring its half again. An integration test
+proves the point end to end: a queue on a broker nothing was applied to, a
+handler that gives up, and the message on `{queue}.dlq` where it used to vanish.
 
 ### Where the libraries do not agree yet
 

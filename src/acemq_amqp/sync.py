@@ -198,6 +198,7 @@ class SyncConnection:
         concurrency: int = 1,
         tag: str = "",
         args: Mapping[str, Any] | None = None,
+        declare: bool = True,
     ) -> SyncConsumer:
         """Reads messages from a queue until the returned consumer is closed.
 
@@ -214,6 +215,9 @@ class SyncConnection:
         :param concurrency: how many messages to work on at once
         :param tag: what to call this consumer to the broker
         :param args: broker-specific consumer arguments
+        :param declare: declare ``{queue}.dlq``, ``{queue}.parked`` and the
+            rungs before subscribing. On by default; see
+            :meth:`acemq_amqp.Connection.consume`
         :returns: the running consumer
         """
         workers = ThreadPoolExecutor(
@@ -234,6 +238,7 @@ class SyncConnection:
                 concurrency=concurrency,
                 tag=tag,
                 args=args,
+                declare=declare,
             )
         )
         return SyncConsumer(self, consumer, workers)

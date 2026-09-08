@@ -69,7 +69,7 @@ from .telemetry import (
     NullObserver,
     Observer,
 )
-from .topology import Topology
+from .topology import Topology, declare_where_failures_go
 from .transport import (
     ConsumeSpec,
     Delivery,
@@ -246,6 +246,10 @@ class Consumer:
     One is built by :meth:`Connection.consume` rather than directly, because it
     has to be started before it is any use and a half-built consumer that looks
     finished is a thing somebody will hold on to.
+
+    Starting one declares the queues it will need when a message fails — its
+    dead-letter queue, its parking lot and its rungs — unless it was told not
+    to. See :func:`acemq_amqp.topology.declare_where_failures_go`.
     """
 
     def __init__(
@@ -257,6 +261,7 @@ class Consumer:
         codec: Codec,
         retry: RetryPolicy,
         concurrency: int,
+        declare: bool = True,
     ) -> None:
         if concurrency < 1:
             raise ValueError(f"acemq: concurrency must be at least 1, got {concurrency}")
@@ -266,6 +271,7 @@ class Consumer:
         self._codec = codec
         self._retry = retry
         self._concurrency = concurrency
+        self._declare = declare
         self._work: asyncio.Queue[Delivery | None] = asyncio.Queue()
         self._workers: list[asyncio.Task[None]] = []
         self._subscription: Subscription | None = None
@@ -312,6 +318,16 @@ class Consumer:
         return self._connection.observer
 
     async def _start(self, prefetch: int, tag: str, args: Mapping[str, Any]) -> None:
+        if self._declare:
+            # Before the subscription rather than after it, so that the first
+            # message this consumer gives up on already has somewhere to go. A
+            # broker that refuses one of these declarations is a consumer that
+            # does not start, which is the honest failure: it would otherwise
+            # start and lose its first dead letter.
+            await declare_where_failures_go(
+                self._connection.transport, self._queue, self._retry
+            )
+
         self._workers = [
             asyncio.create_task(self._work_loop(), name=f"acemq-consumer-{self._queue}-{n}")
             for n in range(self._concurrency)
@@ -543,19 +559,24 @@ class Consumer:
         rung = naming.retry_queue(self._queue, delay)
         next_attempt = envelope.with_(attempt=envelope.attempt + 1)
         if not await self._republish(delivery, rung, next_attempt):
+            # Kept even though a consumer declares its own rungs when it starts,
+            # because the rung can still be missing: a consumer started with
+            # ``declare=False`` declares nothing, and a rung deleted under a
+            # running consumer is gone whoever declared it. What has changed is
+            # what it means — it used to be an ordinary topology mistake and is
+            # now either a deliberate opt-out or somebody removing queues.
+            #
             # Degraded rather than fatal: the message is still deliverable, and
             # waiting for it here is what this library did before there were
-            # rungs. Loud, because a topology that declares the queue without its
-            # rungs will otherwise look like it works right up until a long
-            # backoff quietly becomes a held prefetch slot.
-            # Counted as well as logged, because this is the one failure here
-            # that nothing else shows: the message is still retried and the wait
-            # still happens, so a dashboard reads as normal while the reason the
-            # rung exists is quietly gone.
+            # rungs. Counted as well as logged, because this is the one failure
+            # here that nothing else shows: the message is still retried and the
+            # wait still happens, so a dashboard reads as normal while the reason
+            # the rung exists is quietly gone.
             self._observer.count(METRIC_RUNG_MISSING, 1, {**self._labels, "rung": rung})
             log.error(
                 "acemq: %s is not on the broker, so %s will wait %s in this consumer "
-                "instead; declare it with Topology().queue(%r, retry=policy)",
+                "instead; declare it with Topology().queue(%r, retry=policy), or let "
+                "the consumer declare it by leaving declare=True",
                 rung,
                 envelope.id,
                 delay,
@@ -1009,8 +1030,18 @@ class Connection:
         concurrency: int = 1,
         tag: str = "",
         args: Mapping[str, Any] | None = None,
+        declare: bool = True,
     ) -> Consumer:
         """Reads messages from a queue until the returned consumer is closed.
+
+        Before it subscribes it declares the queues it will need when a message
+        fails: ``{queue}.dlq``, ``{queue}.parked``, ``acemq.dlx`` and, when the
+        retry policy has waits the broker holds, ``acemq.retry`` and the rungs.
+        See :func:`acemq_amqp.topology.declare_where_failures_go` for exactly
+        what and why. The source queue is not among them, and neither is
+        anything a producer needs, so this is not a replacement for declaring a
+        topology — it is the floor underneath a service that was deployed
+        without one.
 
         :param queue: what to read
         :param handler: what to do with a message; returning an
@@ -1024,6 +1055,14 @@ class Connection:
             that spend their time waiting on something else
         :param tag: what to call this consumer to the broker
         :param args: broker-specific consumer arguments
+        :param declare: declare the queues above before subscribing. On by
+            default, because the alternative default loses messages silently.
+            Turn it off for a login with no ``configure`` permission on the
+            vhost, which is refused by the broker rather than ignored, and for a
+            tool draining a queue it does not own — a one-off reader of
+            ``orders.dlq`` has no business creating ``orders.dlq.dlq``. A
+            consumer started this way still publishes to those queues, so
+            somebody else has to have declared them
         :returns: the running consumer
         """
         if self._closed:
@@ -1036,6 +1075,7 @@ class Connection:
             codec=codec or self._codec,
             retry=retry or self._retry,
             concurrency=concurrency,
+            declare=declare,
         )
         self._consumers.append(consumer)
         try:

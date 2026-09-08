@@ -155,18 +155,43 @@ four identical generated tags cannot tell which pod is the slow one.
 `args` passes broker-specific consumer arguments straight through — a stream
 offset, a single-active-consumer flag, a priority.
 
+## What starting a consumer declares
+
+Before it subscribes, a consumer declares the queues it will need when a message
+fails: `{queue}.dlq`, `{queue}.parked`, `acemq.dlx` and — when its retry policy
+has waits long enough for the broker to hold — `acemq.retry` and the rungs. Not
+the source queue, which belongs to whoever set the service up.
+
+That is a floor, not a replacement for a topology: `Topology` is reviewable ahead
+of time and is the only place `x-dead-letter-exchange` can be put on the source
+queue. What it buys is the service deployed without one, where a dead letter used
+to be republished to a queue that was not there and dropped by the broker in
+silence.
+
+```python
+consumer = await mq.consume("shipping.orders", ship, declare=False)
+```
+
+Turn it off for a login with no `configure` permission on the vhost — the broker
+refuses rather than ignores the attempt, so the consumer would not start — and
+for a tool draining a queue it does not own. See [who declares
+what](topology.md#who-declares-what).
+
 ## A different codec
 
 ```python
 from acemq_amqp import BytesCodec
 
-await mq.consume("shipping.orders.dlq", inspect, codec=BytesCodec())
+await mq.consume("shipping.orders.dlq", inspect, codec=BytesCodec(), declare=False)
 ```
 
 The connection's codec applies unless a consumer overrides it. `BytesCodec` is
 what to read a dead-letter queue with: the message that went there may be
 exactly the one nothing could decode, and a codec that fails on it would park it
 a second time. See [codecs](serialization.md).
+
+`declare=False` for the same reason: a one-off reader of `shipping.orders.dlq`
+has no business creating `shipping.orders.dlq.dlq`.
 
 ## When a message cannot be decoded
 

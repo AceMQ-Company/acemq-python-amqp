@@ -221,6 +221,12 @@ async def collect(
     A dead-letter queue is read with BytesCodec, because the message that went
     there may be exactly the one nothing could decode — and a reader that
     dead-letters what it cannot read would send it round again.
+
+    ``declare=False`` because this is a drain rather than a service, which is
+    what the flag is for: half of these calls read a ``.dlq``, and a consumer
+    declaring its own dead-letter half there would leave ``.dlq.dlq`` and
+    ``.dlq.parked`` behind on the broker for a reader that never dead-letters
+    anything. What it reads has always been declared by the test itself.
     """
     got: list[Message] = []
     enough = asyncio.Event()
@@ -231,7 +237,7 @@ async def collect(
             enough.set()
         return accept()
 
-    consumer = await mq.consume(queue, handler, codec=codec)
+    consumer = await mq.consume(queue, handler, codec=codec, declare=False)
     try:
         await asyncio.wait_for(enough.wait(), timeout)
     finally:
@@ -499,6 +505,106 @@ async def test_a_rung_returns_a_message_through_the_named_retry_exchange(
     assert envelope.attempt == 2
     assert json.loads(returned.body) == {"id": "7"}
     print(f"  returned {queue} holds 1, on attempt {envelope.attempt}, {rung} holds 0")
+
+
+async def _gives_up(message: Message) -> Ack:
+    """A handler that always asks for another attempt, and on the default policy
+    is therefore always out of them."""
+    return retry(RuntimeError("the warehouse is not answering"))
+
+
+async def test_a_dead_letter_arrives_on_a_broker_no_topology_was_applied_to(
+    mq: Connection, workspace: Workspace
+) -> None:
+    """ADR-032 against a real broker: the message that used to vanish.
+
+    The queue is here and nothing else is — a service deployed without ever
+    applying its topology, which is the case the ADR is about. The consumer used
+    to declare nothing, so when the handler gave up the republish to
+    ``{queue}.dlq`` reached no queue at all; the broker discarded it and said
+    nothing, and the message was gone. Now the consumer declares that queue when
+    it starts, and the message lands in it.
+    """
+    queue = workspace.name("stranded")
+    await mq.declare(Topology().queue(queue))
+    workspace.register(queue)
+
+    print("\nbefore the consumer starts, on a broker nothing was applied to")
+    print(f"  queue    {queue} exists: {await mq.queue_exists(queue)}")
+    print(
+        f"  queue    {dead_letter_queue(queue)} exists: "
+        f"{await mq.queue_exists(dead_letter_queue(queue))}"
+    )
+    assert await mq.queue_exists(dead_letter_queue(queue)) is False
+    assert await mq.queue_exists(parked_queue(queue)) is False
+
+    consumer = await mq.consume(queue, _gives_up)
+    try:
+        print("  the consumer started, and declared what it will need:")
+        print(
+            f"  queue    {dead_letter_queue(queue)} exists: "
+            f"{await mq.queue_exists(dead_letter_queue(queue))}"
+        )
+        print(
+            f"  queue    {parked_queue(queue)} exists: "
+            f"{await mq.queue_exists(parked_queue(queue))}"
+        )
+        assert await mq.queue_exists(dead_letter_queue(queue)) is True
+        assert await mq.queue_exists(parked_queue(queue)) is True
+
+        await mq.publisher(routing_key=queue, mandatory=True).send({"id": "7"})
+        await until(
+            lambda: _count(mq, dead_letter_queue(queue), 1),
+            "the message reached the dead-letter queue",
+        )
+    finally:
+        await consumer.close()
+
+    dead = (await collect(mq, dead_letter_queue(queue)))[0]
+    print(f"  message  {dead.payload} is on {dead_letter_queue(queue)}")
+    print(f"  reason   {dead.envelope.error}")
+    assert dead.payload == {"id": "7"}
+    assert "exhausted 1 attempt" in dead.envelope.error
+    assert "RuntimeError: the warehouse is not answering" in dead.envelope.error
+
+
+async def test_a_consumer_and_a_topology_declare_the_same_thing_either_way_round(
+    mq: Connection, workspace: Workspace
+) -> None:
+    """Neither order is refused, which is what makes declaring at start-up safe.
+
+    A queue redeclared with so much as one argument different is answered
+    ``PRECONDITION_FAILED``, and the service that asked cannot consume at all. So
+    a consumer that declares its own dead-letter half is only safe if what it
+    sends matches what ``Topology`` sends to the key — proved here by doing it
+    both ways round against a broker that will refuse a mismatch.
+    """
+    policy = fixed_retry(3, timedelta(seconds=40)).wait_in_broker_from(timedelta(seconds=30))
+
+    # Topology first, then a consumer: the ordinary deployment.
+    first = await workspace.queue("ordered.topology-first", policy)
+    consumer = await mq.consume(first, _gives_up, retry=policy)
+    await consumer.close()
+    print(f"\ntopology then consumer on {first}: accepted")
+
+    # Consumer first, then the topology: the deployment that applies its topology
+    # after the service is already running. The source queue is declared the way
+    # a Java service declares it, so what is being compared is this library's
+    # dead-letter half against the topology's, not two copies of one call.
+    second = workspace.name("ordered.consumer-first")
+    await declared_by_another_service(second, java_source_arguments(second))
+    workspace.register(second, policy)
+    consumer = await mq.consume(second, _gives_up, retry=policy)
+    try:
+        await mq.declare(Topology().queue(second, dead_letter=True, retry=policy))
+    finally:
+        await consumer.close()
+    print(f"consumer then topology on {second}: accepted")
+
+    for name in (dead_letter_queue(second), parked_queue(second)):
+        assert await mq.queue_exists(name) is True
+    for rung in policy.broker_rungs():
+        assert await mq.queue_exists(retry_queue(second, rung)) is True
 
 
 def java_source_arguments(queue: str) -> dict[str, str]:

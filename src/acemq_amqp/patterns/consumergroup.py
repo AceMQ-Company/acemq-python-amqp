@@ -65,6 +65,7 @@ class ConsumerGroup:
         concurrency: int = 1,
         tag: str = "",
         args: Any = None,
+        declare: bool = True,
     ) -> ConsumerGroup:
         """Starts ``size`` consumers over one queue.
 
@@ -85,6 +86,12 @@ class ConsumerGroup:
             its own name so the management interface shows which consumer is
             holding a message rather than four identical rows
         :param args: broker-specific consumer arguments
+        :param declare: declare the queues a failed message goes to before
+            subscribing. On by default; see
+            :meth:`acemq_amqp.Connection.consume`. Every consumer in the group
+            declares the same things, which is a few extra round trips at
+            start-up and nothing else — the declarations are identical, so all
+            but the first are no-ops
         :returns: the running group
         """
         if size < 1:
@@ -105,6 +112,7 @@ class ConsumerGroup:
                         concurrency=concurrency,
                         tag=f"{base}-{number}",
                         args=args,
+                        declare=declare,
                     )
                 )
         except BaseException:

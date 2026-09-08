@@ -126,6 +126,7 @@ from .topology import (
     QUORUM_QUEUE_TYPE,
     RETRY_EXCHANGE,
     Topology,
+    declare_where_failures_go,
     rung_args,
 )
 from .transport import (
@@ -226,6 +227,7 @@ __all__ = [
     "credentials_from_environment",
     "credentials_from_file",
     "dead_letter_queue",
+    "declare_where_failures_go",
     "exponential_retry",
     "fixed_retry",
     "headers",

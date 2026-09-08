@@ -195,6 +195,7 @@ async def read_stream(
     consumer_name: str = "",
     codec: Codec | None = None,
     concurrency: int = 1,
+    declare: bool = True,
 ) -> Consumer:
     """Reads a stream from a chosen position::
 
@@ -217,6 +218,9 @@ async def read_stream(
     :param codec: a codec other than the connection's
     :param concurrency: how many messages to work on at once. One by default,
         because a stream's order is usually why it is a stream
+    :param declare: declare ``{name}.dlq``, ``{name}.parked`` and the rungs the
+        connection's retry policy asks for, before subscribing. On by default;
+        see :meth:`acemq_amqp.Connection.consume`
     :returns: the running consumer
     """
     if prefetch < 1:
@@ -232,6 +236,7 @@ async def read_stream(
         concurrency=concurrency,
         tag=consumer_name,
         args={STREAM_OFFSET_ARG: (offset or from_next()).to_arg()},
+        declare=declare,
     )
 
 

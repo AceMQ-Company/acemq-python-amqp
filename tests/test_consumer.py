@@ -47,7 +47,13 @@ from acemq_amqp import (
 )
 from acemq_amqp.codec import Codec
 from acemq_amqp.connection import Connection, Handler
-from acemq_amqp.topology import Topology
+from acemq_amqp.topology import (
+    DEAD_LETTER_EXCHANGE,
+    RETRY_EXCHANGE,
+    Topology,
+    rung_args,
+)
+from acemq_amqp.transport import QueueSpec
 
 QUEUE = "orders.new"
 DLQ = "orders.new.dlq"
@@ -63,8 +69,15 @@ async def running(
     codec: Codec | None = None,
     declare_dead_letter: bool = True,
     declare_rungs: bool = True,
+    declare: bool = True,
 ) -> AsyncIterator[FakeTransport]:
-    """A consumer on a fake broker, closed again afterwards."""
+    """A consumer on a fake broker, closed again afterwards.
+
+    ``declare`` is the consumer's own declaration, which is on by default and
+    would otherwise put back whatever ``declare_dead_letter`` and
+    ``declare_rungs`` left out. A test about a queue that is missing has to turn
+    both halves off.
+    """
     transport = FakeTransport()
     policy = policy or no_retry()
     await (
@@ -77,7 +90,7 @@ async def running(
         .apply(transport)
     )
     connection = Connection(transport, retry=policy, codec=codec or JsonCodec())
-    await connection.consume(QUEUE, handler)
+    await connection.consume(QUEUE, handler, declare=declare)
     try:
         yield transport
     finally:
@@ -107,6 +120,61 @@ async def test_accepting_acknowledges_and_publishes_nothing() -> None:
 
     assert settlement.acked is True
     assert transport.sent == []
+
+
+async def test_a_dead_letter_arrives_on_a_broker_no_topology_was_applied_to() -> None:
+    # The hole ADR-032 closes, and the reason a consumer declares at start-up.
+    # Nothing has been applied here: the queue exists and nothing else does, which
+    # is a service deployed without its topology. Before the change the consumer
+    # declared nothing, the republish to orders.new.dlq was unroutable, and the
+    # message was rejected to a broker with nowhere to send it — gone, quietly.
+    transport = FakeTransport()
+    await transport.declare_queue(QUEUE, QueueSpec())
+    connection = Connection(transport)
+    await connection.consume(QUEUE, always(reject(ValueError("no customer"))))
+    try:
+        settlement = await transport.deliver(QUEUE, b"{}", headers=wire(Envelope()))
+    finally:
+        await connection.close()
+
+    assert DLQ in transport.queues
+    assert PARKED in transport.queues
+    dead = transport.sent_to(DLQ)
+    assert len(dead) == 1
+    assert "no customer" in dead[0].headers[headers.ERROR]
+    assert settlement.acked is True
+
+
+async def test_a_consumer_declares_the_rungs_its_own_policy_will_use() -> None:
+    # The rungs come from the policy the consumer is running, so a policy passed
+    # to consume() rather than to the connection declares its rungs and not the
+    # connection's. A rung nobody declared is a long backoff that quietly becomes
+    # a held prefetch slot.
+    policy = fixed_retry(3, timedelta(minutes=2))
+    transport = FakeTransport()
+    await transport.declare_queue(QUEUE, QueueSpec())
+    connection = Connection(transport)
+    await connection.consume(QUEUE, always(accept()), retry=policy)
+    await connection.close()
+
+    assert RUNG in transport.queues
+    assert dict(transport.queues[RUNG].args) == rung_args(QUEUE, timedelta(minutes=2))
+    assert (QUEUE, RETRY_EXCHANGE, QUEUE) in transport.bindings
+
+
+async def test_a_consumer_with_no_long_waits_declares_no_retry_exchange() -> None:
+    # Every wait this policy has is held in the consumer, so there is no rung to
+    # dead-letter home and nothing to bind acemq.retry to. Declaring it anyway
+    # would leave an exchange on the broker that routes nothing.
+    transport = FakeTransport()
+    await transport.declare_queue(QUEUE, QueueSpec())
+    connection = Connection(transport, retry=fixed_retry(3, timedelta(seconds=1)))
+    await connection.consume(QUEUE, always(accept()))
+    await connection.close()
+
+    assert DEAD_LETTER_EXCHANGE in transport.exchanges
+    assert RETRY_EXCHANGE not in transport.exchanges
+    assert [name for name in transport.queues if ".retry." in name] == []
 
 
 async def test_rejecting_dead_letters_with_the_reason() -> None:
@@ -187,15 +255,22 @@ async def test_a_short_wait_still_goes_straight_back_to_the_queue() -> None:
 
 
 async def test_a_missing_rung_is_waited_out_here_rather_than_losing_the_message() -> None:
-    # A topology that declared the queue without its rungs is a mistake, not a
-    # reason to drop a message. The wait degrades to what this library did before
-    # there were rungs — held here, loudly — and the message still arrives. The
-    # delay is a millisecond so the test does not have to wait out a real one.
+    # A rung that is not there is a mistake, not a reason to drop a message. The
+    # wait degrades to what this library did before there were rungs — held here,
+    # loudly — and the message still arrives. The delay is a millisecond so the
+    # test does not have to wait out a real one.
+    #
+    # It takes both halves off to arrange, because a consumer declares its own
+    # rungs now: this is the consumer that was told not to, reading a queue whose
+    # topology has none either.
     policy = fixed_retry(3, timedelta(milliseconds=1)).wait_in_broker_from(
         timedelta(milliseconds=1)
     )
     async with running(
-        always(retry(RuntimeError("not yet"))), policy=policy, declare_rungs=False
+        always(retry(RuntimeError("not yet"))),
+        policy=policy,
+        declare_rungs=False,
+        declare=False,
     ) as transport:
         settlement = await transport.deliver(QUEUE, b"{}", headers=wire(Envelope()))
 
@@ -332,8 +407,13 @@ async def test_a_message_that_cannot_be_dead_lettered_is_left_with_the_broker() 
     # Without a dead-letter queue to put it in, the broker's own dead-lettering
     # is the last thing between this message and nothing. Acknowledging it here
     # would be dropping it.
+    #
+    # Reaching this at all now takes a consumer that was told not to declare, on
+    # a queue whose topology has no dead-letter half either: an ordinary consumer
+    # declares the queue this message could not reach, which is the point of
+    # declaring at start-up.
     async with running(
-        always(reject(RuntimeError("no"))), declare_dead_letter=False
+        always(reject(RuntimeError("no"))), declare_dead_letter=False, declare=False
     ) as transport:
         settlement = await transport.deliver(QUEUE, b"{}", headers=wire(Envelope()))
 

@@ -9,7 +9,8 @@
       "name": "exponential-uncapped",
       "how": "exponential(5, 1s, 24h)",
       "maxAttempts": 5,
-      "maxMessageAgeMillis": 31536000000,
+      "maxMessageAgeMillis": 0,
+      "hasMaxMessageAge": false,
       "jitterFactor": 0.2,
       "brokerWaitThresholdMillis": 30000,
       "scheduleMillis": [1000, 2000, 4000, 8000],
@@ -22,13 +23,8 @@
         },
         {
           "attempt": 1,
-          "messageAgeMillis": 31535999999,
-          "retries": true
-        },
-        {
-          "attempt": 1,
           "messageAgeMillis": 31536000000,
-          "retries": false
+          "retries": true
         },
         {
           "attempt": 4,
@@ -37,22 +33,12 @@
         },
         {
           "attempt": 4,
-          "messageAgeMillis": 31535999999,
-          "retries": true
-        },
-        {
-          "attempt": 4,
           "messageAgeMillis": 31536000000,
-          "retries": false
+          "retries": true
         },
         {
           "attempt": 5,
           "messageAgeMillis": 0,
-          "retries": false
-        },
-        {
-          "attempt": 5,
-          "messageAgeMillis": 31535999999,
           "retries": false
         },
         {
@@ -66,7 +52,8 @@
       "name": "exponential-capped",
       "how": "exponential(6, 10s, 1m)",
       "maxAttempts": 6,
-      "maxMessageAgeMillis": 31536000000,
+      "maxMessageAgeMillis": 0,
+      "hasMaxMessageAge": false,
       "jitterFactor": 0.2,
       "brokerWaitThresholdMillis": 30000,
       "scheduleMillis": [10000, 20000, 40000, 60000, 60000],
@@ -79,13 +66,8 @@
         },
         {
           "attempt": 1,
-          "messageAgeMillis": 31535999999,
-          "retries": true
-        },
-        {
-          "attempt": 1,
           "messageAgeMillis": 31536000000,
-          "retries": false
+          "retries": true
         },
         {
           "attempt": 5,
@@ -94,22 +76,12 @@
         },
         {
           "attempt": 5,
-          "messageAgeMillis": 31535999999,
-          "retries": true
-        },
-        {
-          "attempt": 5,
           "messageAgeMillis": 31536000000,
-          "retries": false
+          "retries": true
         },
         {
           "attempt": 6,
           "messageAgeMillis": 0,
-          "retries": false
-        },
-        {
-          "attempt": 6,
-          "messageAgeMillis": 31535999999,
           "retries": false
         },
         {
@@ -124,6 +96,7 @@
       "how": "exponential(5, 1s, 24h).giveUpAfter(2m)",
       "maxAttempts": 5,
       "maxMessageAgeMillis": 120000,
+      "hasMaxMessageAge": true,
       "jitterFactor": 0.2,
       "brokerWaitThresholdMillis": 30000,
       "scheduleMillis": [1000, 2000, 4000, 8000],
@@ -180,7 +153,8 @@
       "name": "fixed",
       "how": "fixed(4, 30s)",
       "maxAttempts": 4,
-      "maxMessageAgeMillis": 31536000000,
+      "maxMessageAgeMillis": 0,
+      "hasMaxMessageAge": false,
       "jitterFactor": 0,
       "brokerWaitThresholdMillis": 30000,
       "scheduleMillis": [30000, 30000, 30000],
@@ -193,13 +167,8 @@
         },
         {
           "attempt": 1,
-          "messageAgeMillis": 31535999999,
-          "retries": true
-        },
-        {
-          "attempt": 1,
           "messageAgeMillis": 31536000000,
-          "retries": false
+          "retries": true
         },
         {
           "attempt": 3,
@@ -208,22 +177,12 @@
         },
         {
           "attempt": 3,
-          "messageAgeMillis": 31535999999,
-          "retries": true
-        },
-        {
-          "attempt": 3,
           "messageAgeMillis": 31536000000,
-          "retries": false
+          "retries": true
         },
         {
           "attempt": 4,
           "messageAgeMillis": 0,
-          "retries": false
-        },
-        {
-          "attempt": 4,
-          "messageAgeMillis": 31535999999,
           "retries": false
         },
         {
@@ -237,7 +196,8 @@
       "name": "none",
       "how": "none()",
       "maxAttempts": 1,
-      "maxMessageAgeMillis": 31536000000,
+      "maxMessageAgeMillis": 0,
+      "hasMaxMessageAge": false,
       "jitterFactor": 0,
       "brokerWaitThresholdMillis": 30000,
       "scheduleMillis": [],
@@ -250,17 +210,70 @@
         },
         {
           "attempt": 1,
-          "messageAgeMillis": 31535999999,
-          "retries": false
-        },
-        {
-          "attempt": 1,
           "messageAgeMillis": 31536000000,
           "retries": false
         }
       ]
     }
   ],
+  "maxMessageAge": {
+    "defaultMillis": 0,
+    "zeroMeansNoLimit": true,
+    "rule": "maxMessageAgeMillis of 0 means no age limit, and 0 is what every factory produces: only giveUpAfter sets a limit. A message is abandoned when its age reaches a non-zero limit, not when it passes it, so an age exactly equal to the limit does not retry. An age that is not known counts as young enough",
+    "unknownAgeRetries": true,
+    "cases": [
+      {
+        "maxMessageAgeMillis": 0,
+        "messageAgeMillis": 0,
+        "retries": true
+      },
+      {
+        "maxMessageAgeMillis": 0,
+        "messageAgeMillis": 119999,
+        "retries": true
+      },
+      {
+        "maxMessageAgeMillis": 0,
+        "messageAgeMillis": 120000,
+        "retries": true
+      },
+      {
+        "maxMessageAgeMillis": 0,
+        "messageAgeMillis": 120001,
+        "retries": true
+      },
+      {
+        "maxMessageAgeMillis": 0,
+        "messageAgeMillis": 31536000000,
+        "retries": true
+      },
+      {
+        "maxMessageAgeMillis": 120000,
+        "messageAgeMillis": 0,
+        "retries": true
+      },
+      {
+        "maxMessageAgeMillis": 120000,
+        "messageAgeMillis": 119999,
+        "retries": true
+      },
+      {
+        "maxMessageAgeMillis": 120000,
+        "messageAgeMillis": 120000,
+        "retries": false
+      },
+      {
+        "maxMessageAgeMillis": 120000,
+        "messageAgeMillis": 120001,
+        "retries": false
+      },
+      {
+        "maxMessageAgeMillis": 120000,
+        "messageAgeMillis": 31536000000,
+        "retries": false
+      }
+    ]
+  },
   "jitter": {
     "policy": "exponential-uncapped",
     "factor": 0.2,

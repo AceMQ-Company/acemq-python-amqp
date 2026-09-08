@@ -180,6 +180,45 @@ binding that brings an expired retry home are declared here rather than left to
 a caller to remember. See [retries and
 redelivery](reliability.md#the-two-exchanges-this-library-declares).
 
+## Who declares what
+
+A consumer declares this half again for itself when it starts, and does not wait
+to be asked:
+
+| Declared by | What |
+| --- | --- |
+| the topology, only | `shipping.orders`, and the exchange a producer publishes to |
+| the topology **and** every consumer | `acemq.dlx`, `shipping.orders.dlq`, `shipping.orders.parked`, and their two bindings |
+| the topology **and** every consumer with rungs | `acemq.retry`, `shipping.orders.retry.*`, and the binding home |
+
+The overlap is deliberate. A queue redeclared with the same arguments is a no-op,
+so declaring twice costs two round trips at start-up and nothing else; not
+declaring at all costs a message, because a service deployed without its topology
+republishes a dead letter to a queue that is not there and **the broker discards
+what it cannot route in silence**. Either order works — topology then consumer,
+or a consumer already running when the topology is applied — because both send
+the same arguments to the key.
+
+What a consumer will not declare is the source queue. Its type and its arguments
+belong to whoever set the service up, and a guess of classic against a quorum
+queue is a `PRECONDITION_FAILED` that stops the consumer starting at all. That is
+also why `x-dead-letter-exchange` on the source queue — the broker's own route,
+for a message this library never sees — can only be asked for here, with
+`dead_letter=True`.
+
+A consumer on a login with no `configure` permission cannot declare anything, and
+a broker refuses rather than ignores the attempt. Pass `declare=False` to
+`consume()` for that case, and for a tool draining a queue it does not own: a
+one-off reader of `orders.dlq` has no business creating `orders.dlq.dlq`.
+
+```python
+consumer = await mq.consume("orders.new", handle, declare=False)
+```
+
+Everything such a consumer publishes to must then be declared by somebody else.
+`acemq.consumer.rung_missing` and `acemq.messages.set.aside.failed` are what say
+it was not.
+
 ## Reading it before applying it
 
 ```python

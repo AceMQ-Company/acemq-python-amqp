@@ -160,7 +160,16 @@ class Requester:
         )
 
         requester = cls(connection, exchange, routing_key, queue, timeout, codec)
-        requester._consumer = await connection.consume(queue, requester._receive, codec=codec)
+        # The one consumer in this library that declares nothing. A reply queue
+        # is a mailbox for one process, and a generated one is a different name
+        # every restart, so the dead-letter queues a consumer usually declares
+        # would be two durable queues per process that nothing ever reads and
+        # nothing ever deletes. There is nothing for them to catch either:
+        # :meth:`_receive` accepts every reply, including one nobody is waiting
+        # for, so no message on this queue is ever dead-lettered or parked.
+        requester._consumer = await connection.consume(
+            queue, requester._receive, codec=codec, declare=False
+        )
         return requester
 
     @property

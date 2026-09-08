@@ -74,8 +74,13 @@ async def running(
     policy: Any = None,
     declare_dead_letter: bool = True,
     declare_rungs: bool = True,
+    declare: bool = True,
 ) -> AsyncIterator[tuple[FakeTransport, Metrics, Connection]]:
-    """A consumer reporting into a Metrics, closed again afterwards."""
+    """A consumer reporting into a Metrics, closed again afterwards.
+
+    ``declare`` is the consumer's own declaration, on by default, which would
+    otherwise put back whatever the topology flags left out.
+    """
     transport = FakeTransport()
     policy = policy or fixed_retry(1, timedelta(0))
     await (
@@ -89,7 +94,7 @@ async def running(
     )
     metrics = Metrics()
     connection = Connection(transport, retry=policy, observer=metrics)
-    await connection.consume(QUEUE, handler)
+    await connection.consume(QUEUE, handler, declare=declare)
     try:
         yield transport, metrics, connection
     finally:
@@ -263,7 +268,11 @@ async def test_a_missing_rung_is_counted_because_nothing_else_shows_it() -> None
     async def handler(message: Message) -> Ack:
         return retry(RuntimeError("the warehouse is not answering"))
 
-    async with running(handler, policy=policy, declare_rungs=False) as (transport, metrics, _):
+    async with running(handler, policy=policy, declare_rungs=False, declare=False) as (
+        transport,
+        metrics,
+        _,
+    ):
         await transport.deliver(QUEUE, b'{"id": "1"}', headers=wire())
 
     rung = f"{QUEUE}.retry.0s"
@@ -275,10 +284,16 @@ async def test_a_missing_rung_is_counted_because_nothing_else_shows_it() -> None
 
 
 async def test_a_dead_letter_queue_that_is_not_there_is_counted() -> None:
+    # A consumer that declared its own would have this queue, so what is counted
+    # here is the one that was told not to and found nobody else had.
     async def handler(message: Message) -> Ack:
         return reject(ValueError("no"))
 
-    async with running(handler, declare_dead_letter=False) as (transport, metrics, _):
+    async with running(handler, declare_dead_letter=False, declare=False) as (
+        transport,
+        metrics,
+        _,
+    ):
         await transport.deliver(QUEUE, b'{"id": "1"}', headers=wire())
 
     key = metric_key(METRIC_SET_ASIDE_FAILED, {"queue": QUEUE, "target": f"{QUEUE}.dlq"})

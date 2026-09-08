@@ -84,7 +84,7 @@ FIXTURE_PATH = Path(__file__).parent / "fixtures" / "contract-fixtures.json"
 #: this suite rather than waiting for somebody to run the workspace script: a
 #: library that has quietly agreed with its own edited fixture is worse off than
 #: one carrying no fixture at all, because it still passes.
-FIXTURE_SHA256 = "bef3b48f31a985a88b0f682c4d5fd06feed8ec20b1433b6c667bfc54f24b05a0"
+FIXTURE_SHA256 = "7f2fc515bc15c88a8ebe37d2eeac3bde7c6ab420c4958fb13f1aa5a9f0809b9b"
 
 FIXTURES: dict[str, Any] = json.loads(FIXTURE_PATH.read_text())
 
@@ -103,7 +103,6 @@ QUEUE: str = NAMING["queue"]
 #: zero as "no age limit" instead. The number is here so the rows that turn on it
 #: can be recognised rather than listed; see
 #: :func:`test_the_only_rows_python_disagrees_with_are_the_default_age_limit`.
-JAVA_DEFAULT_MAX_MESSAGE_AGE_MILLIS = 365 * 24 * 60 * 60 * 1000
 
 
 # --------------------------------------------------------------------------- #
@@ -333,13 +332,13 @@ def test_the_rungs_are_the_distinct_long_waits_in_the_order_they_are_reached(
 def test_the_attempt_and_age_limits_decide_the_same_way(schedule: dict[str, Any]) -> None:
     """Every ``{attempt, messageAgeMillis, retries}`` row the fixture records.
 
-    Rows covered by :func:`_is_the_recorded_age_divergence` are left to the test
-    that owns that divergence, so this one fails on anything new.
+    No row is exempt. Six used to be: Java defaulted a policy to a 365-day age
+    limit where the other four defaulted to none, so the fixture said a year-old
+    message was abandoned and this library retried it. Java now agrees that zero
+    means no limit, and the exemption went with the divergence.
     """
     policy = _policy_from(schedule["how"])
     for decision in schedule["decisions"]:
-        if _is_the_recorded_age_divergence(schedule, decision):
-            continue
         age = timedelta(milliseconds=decision["messageAgeMillis"])
         retries = policy.next_wait(decision["attempt"], age) is not None
         assert retries == decision["retries"], (
@@ -352,67 +351,45 @@ def test_the_attempt_and_age_limits_decide_the_same_way(schedule: dict[str, Any]
         assert (policy.next_delay(decision["attempt"], age) is not None) == retries
 
 
-def _is_the_recorded_age_divergence(
-    schedule: dict[str, Any], decision: dict[str, Any]
-) -> bool:
-    """Whether this row is the one place Python and the fixture part company.
+def test_no_policy_carries_an_age_limit_nobody_asked_for() -> None:
+    """The agreement that replaced a divergence.
 
-    Java's ``RetryPolicy`` has no "no age limit" value: its default
-    ``maxMessageAge`` is ``Duration.ofDays(365)`` and ``nextWait`` compares
-    against it unconditionally, so a message exactly a year old is abandoned by a
-    policy nobody asked to give up on age. Go (``MaxMessageAge > 0 &&``), .NET
-    (``MaxMessageAge > TimeSpan.Zero &&``), Ruby (``max_message_age.positive?``)
-    and Python (``max_message_age > ZERO and``) all treat zero as no limit and
-    keep retrying. Four libraries to one, and the fixture records Java's answer.
+    Java used to build every policy with ``Duration.ofDays(365)`` and compare
+    against it unconditionally, so a message exactly a year old was abandoned by
+    a policy nobody asked to give up on age, while Go, .NET, Ruby and this
+    library all read zero as no limit and kept retrying. Four to one, and the
+    fixture recorded Java's answer. Java moved: zero is the default and only
+    ``giveUpAfter`` sets a limit.
 
-    Reported rather than resolved here, because the fix belongs in Java and the
-    file belongs to all five repositories. The shape is recognised rather than
-    listed so that a row outside it is a failure:
-    :func:`test_the_only_rows_python_disagrees_with_are_the_default_age_limit`
-    pins the whole set.
+    So this asserts the agreement rather than bounding a disagreement, and it
+    fails if it ever exercises nothing — a test that quietly stops running is
+    how the divergence it replaced survived ten releases.
     """
-    return (
-        schedule["maxMessageAgeMillis"] == JAVA_DEFAULT_MAX_MESSAGE_AGE_MILLIS
-        and decision["messageAgeMillis"] >= JAVA_DEFAULT_MAX_MESSAGE_AGE_MILLIS
-        and decision["attempt"] < schedule["maxAttempts"]
-        and decision["retries"] is False
-    )
-
-
-def test_the_only_rows_python_disagrees_with_are_the_default_age_limit() -> None:
-    """The divergence, asserted as a divergence and bounded to its exact shape.
-
-    Every decision row in the file is put to this library and the disagreements
-    are collected. If the set is anything other than the rows where Java's
-    365-day default is the sole reason for a refusal, something else has drifted
-    and that is what this suite is for.
-    """
-    disagreed: set[tuple[str, int, int]] = set()
+    a_year = timedelta(days=365)
+    checked = 0
     for schedule in SCHEDULES:
+        if schedule["hasMaxMessageAge"]:
+            continue  # asked for a limit; the boundary test owns those
+
+        assert schedule["maxMessageAgeMillis"] == 0, (
+            f"{schedule['name']} has no age limit but records "
+            f"{schedule['maxMessageAgeMillis']}ms; zero is how the fixture says "
+            "unlimited, and hasMaxMessageAge is how it says which zero it means"
+        )
+
         policy = _policy_from(schedule["how"])
-        for decision in schedule["decisions"]:
-            age = timedelta(milliseconds=decision["messageAgeMillis"])
-            retries = policy.next_wait(decision["attempt"], age) is not None
-            if retries != decision["retries"]:
-                disagreed.add(
-                    (schedule["name"], decision["attempt"], decision["messageAgeMillis"])
-                )
-
-    expected = {
-        (schedule["name"], decision["attempt"], decision["messageAgeMillis"])
-        for schedule in SCHEDULES
-        for decision in schedule["decisions"]
-        if _is_the_recorded_age_divergence(schedule, decision)
-    }
-    assert disagreed == expected
-    assert len(disagreed) == 6
-
-    # And the direction, so "they differ" cannot quietly become "they differ the
-    # other way round": the fixture gives up, this library carries on.
-    for name, attempt, age_millis in sorted(disagreed):
-        policy = _policy_from(_named(name)["how"])
         assert policy.max_message_age == ZERO
-        assert policy.next_wait(attempt, timedelta(milliseconds=age_millis)) is not None
+
+        if schedule["maxAttempts"] < 2:
+            continue  # no_retry stops on attempts before age can matter
+
+        assert policy.next_wait(1, a_year) is not None, (
+            f"{schedule['name']} gave up on a year-old message; with no age "
+            "limit it should still retry"
+        )
+        checked += 1
+
+    assert checked, "no unlimited policy was exercised, so this proved nothing"
 
 
 def test_an_age_limit_that_was_asked_for_is_honoured_to_the_millisecond() -> None:
@@ -654,9 +631,11 @@ def test_every_rung_dead_letters_home_through_the_managed_exchange() -> None:
 TOPOLOGY_POLICY = _policy_from(str(TOPOLOGY["policy"]).split(" at ")[0])
 
 
-async def _declared(*, retry: RetryPolicy | None) -> FakeTransport:
+async def _declared(
+    *, retry: RetryPolicy | None, transport: FakeTransport | None = None
+) -> FakeTransport:
     """The fixture's topology, applied to a transport that records rather than connects."""
-    transport = FakeTransport()
+    transport = FakeTransport() if transport is None else transport
     await (
         Topology()
         .exchange("orders", "topic")
@@ -681,14 +660,19 @@ def test_the_topology_policy_is_the_one_the_fixture_describes() -> None:
 async def test_the_whole_declared_plan_is_what_a_topology_produces() -> None:
     """Every exchange, queue and binding in the fixture, whoever declares it there.
 
-    ``declaredBy`` records how Java splits the work: its ``Topology`` builds the
-    source queue and the dead-letter side, and its consumer declares the retry
-    exchange and the rungs when it starts. Python does not split it that way —
-    ``Topology.queue(retry=policy)`` declares the rungs up front and the consumer
-    declares nothing at all (see
-    :func:`test_the_python_consumer_declares_nothing_of_its_own`). One call here
-    therefore produces all three groups, and asserting that is the honest reading
-    of the field rather than a looser one.
+    ``declaredBy`` records which side is *obliged* to declare an entry, not which
+    side is allowed to. Java's consumer declares the retry half and the
+    dead-letter half when it starts; this library's consumer declares the same
+    two since ADR-032 (see
+    :func:`test_the_consumer_declares_its_half_and_only_its_half`). What is left
+    to a topology in both is the ``topology`` group — the source queue, which
+    only its owner can declare correctly, and the exchange a producer publishes
+    to.
+
+    ``Topology.queue(dead_letter=True, retry=policy)`` declares all three groups
+    in one call, which is what a service should apply at deployment: it is
+    reviewable ahead of time, and it is the only place ``x-dead-letter-exchange``
+    can be put on the source queue.
     """
     transport = await _declared(retry=TOPOLOGY_POLICY)
 
@@ -732,15 +716,90 @@ async def test_without_a_policy_a_topology_declares_only_the_half_that_is_not_re
         assert entry["name"] not in transport.queues
 
 
-async def test_the_python_consumer_declares_nothing_of_its_own() -> None:
-    """Where this library's split differs from the one ``declaredBy`` records.
+async def _consumed(transport: FakeTransport, **options: Any) -> None:
+    """Starts and stops a consumer on the fixture's source queue."""
 
-    Java's consumer declares the retry exchange and the rungs it is about to use.
-    Python's consumer declares nothing: it publishes to a rung and, when the
-    broker cannot route it, counts ``acemq.consumer.rung_missing``, says so, and
-    falls back to waiting in the consumer. The rungs must therefore be in the
-    topology, which is why ``Topology.queue`` takes the policy rather than a list
-    of delays.
+    async def handler(message: Message) -> Ack:
+        return accept()
+
+    connection = Connection(transport, retry=TOPOLOGY_POLICY)
+    try:
+        await connection.consume(TOPOLOGY["sourceQueue"], handler, **options)
+    finally:
+        await connection.close()
+
+
+async def test_the_consumer_declares_its_half_and_only_its_half() -> None:
+    """The ``consumer`` and ``both`` groups, declared by a consumer starting.
+
+    This is ADR-032, and it is the assertion that used to say the opposite: this
+    library's consumer declared nothing at all and left every queue to
+    ``Topology``. The union was identical in a correctly deployed system, so
+    nothing was ever missing — but in one where the topology had never been
+    applied, a consumer that gave up republished to ``{queue}.dlq``, the broker
+    could not route it, and the message was discarded without a trace. Declaring
+    at start-up costs a few idempotent declares once per consumer and removes
+    that path.
+
+    Against a broker nothing has been applied to, so what is counted here is what
+    the consumer itself declared. The source queue is not among it, deliberately:
+    it belongs to whoever set the service up, and a guess at its type is a
+    ``PRECONDITION_FAILED`` that stops the consumer starting at all.
+    """
+    transport = FakeTransport()
+    await _consumed(transport)
+
+    assert {name: (spec.kind, spec.durable) for name, spec in transport.exchanges.items()} == {
+        entry["name"]: (entry["type"], entry["durable"])
+        for entry in _expect(TOPOLOGY["exchanges"], "consumer", "both")
+    }
+    assert {name: _queue_shape(spec) for name, spec in transport.queues.items()} == {
+        entry["name"]: (entry["type"], entry["durable"], entry["arguments"])
+        for entry in _expect(TOPOLOGY["queues"], "consumer", "both")
+    }
+    assert set(transport.bindings) == {
+        (entry["queue"], entry["exchange"], entry["routingKey"])
+        for entry in _expect(TOPOLOGY["bindings"], "consumer", "both")
+    }
+
+    # Nothing from the ``topology`` group, which is the half a consumer must not
+    # guess at: the source queue and the exchange a producer publishes to.
+    for entry in _expect(TOPOLOGY["queues"], "topology"):
+        assert entry["name"] not in transport.queues
+    for entry in _expect(TOPOLOGY["exchanges"], "topology"):
+        assert entry["name"] not in transport.exchanges
+
+
+async def test_a_consumer_declares_the_same_arguments_a_topology_would() -> None:
+    """Both ways round, because either order happens in a real deployment.
+
+    A service that applies its topology and then starts a consumer, and one that
+    starts a consumer against a broker somebody applied the topology to later,
+    must both work. They do only if every argument matches to the key: a queue
+    redeclared with anything different is refused with ``PRECONDITION_FAILED``,
+    and the consumer cannot consume at all.
+    """
+    consumer_first = FakeTransport()
+    await _consumed(consumer_first)
+    after_topology = await _declared(retry=TOPOLOGY_POLICY, transport=consumer_first)
+
+    topology_first = await _declared(retry=TOPOLOGY_POLICY)
+    await _consumed(topology_first)
+
+    assert {
+        name: _queue_shape(spec) for name, spec in after_topology.queues.items()
+    } == {name: _queue_shape(spec) for name, spec in topology_first.queues.items()}
+    assert after_topology.exchanges == topology_first.exchanges
+    assert set(after_topology.bindings) == set(topology_first.bindings)
+
+
+async def test_a_consumer_told_not_to_declare_still_declares_nothing() -> None:
+    """The escape hatch, and the only way back to the old behaviour.
+
+    For a login with no ``configure`` permission on the vhost, and for a tool
+    reading a queue it does not own. Everything it needs must then be declared by
+    somebody else — which is what ``acemq.consumer.rung_missing`` and
+    ``acemq.messages.set.aside.failed`` are there to report when it was not.
     """
     transport = await _declared(retry=TOPOLOGY_POLICY)
 
@@ -752,16 +811,7 @@ async def test_the_python_consumer_declares_nothing_of_its_own() -> None:
         )
 
     before = recorded()
-
-    async def handler(message: Message) -> Ack:
-        return accept()
-
-    connection = Connection(transport, retry=TOPOLOGY_POLICY)
-    try:
-        await connection.consume(TOPOLOGY["sourceQueue"], handler)
-    finally:
-        await connection.close()
-
+    await _consumed(transport, declare=False)
     assert recorded() == before
 
 
