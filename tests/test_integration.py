@@ -1222,8 +1222,14 @@ async def test_an_amqps_connection_really_negotiates_tls_and_carries_a_message(
         # correctly-built authority for a reason that had nothing to do with
         # TLS. What matters is that the broker's issuer is the authority named
         # by ACEMQ_TEST_TLS_CERTIFICATES, whatever it is called.
-        trusted = ssl._ssl._test_decode_cert(str(CERTIFICATES / "ca.crt"))  # noqa: SLF001
-        expected = [field for name in trusted["subject"] for field in name]
+        authority = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        authority.load_verify_locations(cafile=str(CERTIFICATES / "ca.crt"))
+        expected = [
+            field
+            for cert in authority.get_ca_certs()
+            for name in cert["subject"]
+            for field in name
+        ]
         issuer = [field for name in presented["issuer"] for field in name]
         assert issuer == expected, f"issued by {issuer}, expected {expected}"
     finally:
