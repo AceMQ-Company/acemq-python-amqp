@@ -557,6 +557,8 @@ from acemq_amqp.patterns import InMemoryIdempotencyStore, chain, idempotent, wit
 | `ordered(key, handler)` | Keep one entity's messages in sequence while everything else runs at once |
 | `ConsumerGroup` | Several consumers over one queue, started and stopped as one thing |
 | `RoutingSlip` / `follow_slip(...)` | An itinerary the message carries, instead of an orchestrator that knows it |
+| `Saga` | Steps that must all happen across systems sharing no transaction, compensated in reverse when one fails. It reports what could **not** be undone rather than raising |
+| `Scheduler` | Deliver a message later, through a ladder of time-to-live queues rather than a per-message expiration that a queue only honours at its head |
 | `chain(...)` / `then(...)` | Wrap a handler in a deadline, logging and the guards; publish what a step produced onwards |
 | `SchemaRegistry` | Remember what a message used to look like, so a producer can add a field without a synchronised deployment |
 | `ClaimCheckCodec` | Put a payload too large for a broker into a store and send the key, above a threshold and inline below it |

@@ -10,7 +10,8 @@ bugs live.
 ```python
 from acemq_amqp.patterns import (
     ClaimCheckCodec, ConsumerGroup, InMemoryIdempotencyStore, Requester,
-    RoutingSlip, chain, idempotent, ordered, replay, serve, with_timeout,
+    RoutingSlip, Saga, Scheduler, chain, idempotent, ordered, replay, serve,
+    with_timeout,
 )
 ```
 
@@ -356,6 +357,195 @@ says how far it got.
 
 The message is accepted only once the next one is out, which is again why a step
 that changes anything should be idempotent.
+
+## Sagas
+
+Several things that must all happen, across systems that share no transaction.
+
+```python
+from acemq_amqp.patterns import Saga
+
+saga = (
+    Saga("place order")
+    .step("reserve stock", reserve, release)
+    .step("charge card", charge, refund)
+    .step("notify", notify)
+)
+
+result = await saga.run(order)
+if result.has_unresolved:
+    alert(result)
+```
+
+Each step has a name, an action and — usually — something that undoes it. The
+steps run in order; when one fails, the ones that already completed are
+compensated in **reverse**, because that is the order the world was changed in
+and a compensation often depends on state a later step has not yet altered. The
+refund has to happen before the stock goes back, not after it.
+
+A step may be a coroutine, because a step that publishes a message will be, and
+a saga is where "reserve the stock" and "publish the reservation" sit next to
+each other.
+
+`run` **returns rather than raises**. A failed saga is not an exceptional
+condition to a caller that has to decide what happens next, and the interesting
+part is not the exception:
+
+| | |
+|---|---|
+| `complete` | every step ran |
+| `compensated` | one failed and the earlier ones were undone |
+| `failed_at` | which step |
+| `failure` | what it raised |
+| `completed` | the steps that ran, in order |
+| `unresolved` | the steps whose compensation *also* failed |
+| `has_unresolved` | whether there are any |
+
+**`has_unresolved` is the flag to alert on.** Everything else a saga reports is
+recoverable by construction. Those are real-world effects that happened, were
+meant to be undone, and were not: nothing else in the system knows about them,
+no retry resolves them, and a person has to.
+
+Two decisions are worth knowing about because they are not obvious.
+
+**A compensation that fails does not stop the others.** It is logged at `error`,
+its step name goes into `unresolved`, and compensation carries on down the list.
+Stopping at the first failure would leave more undone than continuing — the
+label would stay printed and the stock stay reserved because the refund could
+not be reached.
+
+**A completed step with no compensation is skipped, not an error.** A step that
+only read something needs no undo. The cost of that leniency is that a step
+which *should* have had one looks identical, which is the argument for writing
+the compensation first and the action second.
+
+Nothing here touches a broker. A saga is arithmetic over functions, and it is a
+pattern for a single process that orchestrates several systems — not a
+distributed coordinator. If the process dies halfway, nothing resumes it; the
+half-finished work is what an outbox and idempotency at the far end are for.
+
+## Delivering a message later
+
+```python
+from acemq_amqp.patterns import Scheduler
+
+async with await Scheduler.open(mq) as scheduler:
+    await scheduler.after(timedelta(hours=4), "billing", "invoice.due", invoice)
+    await scheduler.at(renewal_date, "policies", "policy.renew", policy)
+```
+
+`at` takes a moment and refuses a naive `datetime`: one would be read as the
+local time of whichever machine scheduled it, and a scheduler is the last place
+to discover that two of them disagree.
+
+### Why not a per-message time to live
+
+The obvious implementation is to set an expiration on the message, drop it in a
+queue nobody consumes and let it dead-letter to its destination. It is what most
+articles suggest and it is wrong for anything but a single fixed delay, because
+**a classic queue expires messages only at its head**.
+
+Put a four-hour message in, then a one-minute message behind it, and the
+one-minute message is delivered in four hours. Nothing reports this: the queue
+looks healthy, the message is not lost, it is simply late by a factor nobody
+predicted. It fails in production under mixed load rather than in testing under
+uniform load.
+
+### The ladder
+
+Five queues, each with a *uniform* time to live, and a message hops through them
+until it is due:
+
+```
+acemq.schedule.1h  acemq.schedule.10m  acemq.schedule.1m
+acemq.schedule.10s  acemq.schedule.1s
+```
+
+Every message in a rung has the same delay, so the head is always the one due
+soonest and head-of-line expiry is harmless. Each expiry dead-letters the
+message into `acemq.schedule.due`, where the scheduler works out what is left
+and either drops it into the largest rung that does not overshoot or delivers
+it. A four-hour delay is four one-hour hops; a ninety-second delay is one
+minute, then three tens; a one-day delay is twenty-four hops and a one-minute
+delay is one, which is the right way round — short delays are common and want
+to be cheap.
+
+The cost is honest and worth stating: a long delay is several broker round trips
+rather than one, and delivery is accurate to about the smallest rung rather than
+to the second. A scheduler that must fire at 09:00:00.000 exactly is a
+scheduler, not a message broker. The alternative is RabbitMQ's
+delayed-message-exchange plugin, which does this properly and is a plugin — so a
+library that silently required it would be a library that works on your laptop.
+
+### What it puts on the broker
+
+`schedule_topology()` is the whole of it, and every name and argument is shared
+with the Java library. Two services scheduling on one broker declare the same
+queues, so a difference would not be a difference in behaviour — it would be a
+`PRECONDITION_FAILED` on whichever of them started second.
+
+```
+exchange  acemq.schedule            direct, durable
+queue     acemq.schedule.1h         classic, x-message-ttl=3600000
+queue     acemq.schedule.10m        classic, x-message-ttl=600000
+queue     acemq.schedule.1m         classic, x-message-ttl=60000
+queue     acemq.schedule.10s        classic, x-message-ttl=10000
+queue     acemq.schedule.1s         classic, x-message-ttl=1000
+queue     acemq.schedule.due        classic, no arguments
+```
+
+Every rung carries exactly three arguments — the TTL,
+`x-dead-letter-exchange: acemq.schedule` and
+`x-dead-letter-routing-key: acemq.schedule.due` — and every queue is bound to
+`acemq.schedule` under its own name. Classic is spelled by leaving
+`x-queue-type` off entirely, which is what the other libraries send and
+therefore the only spelling a broker finds equivalent to theirs.
+
+Declare it yourself from a migration if your services run with a login that has
+no `configure` permission; `Scheduler.open` applies it otherwise.
+
+### What travels with the message
+
+Four application headers, and deliberately **not** under the `x-acemq-` prefix:
+that namespace belongs to the engine, `Envelope` refuses it outright, and a
+scheduler header using it would be written on publish and gone on consume.
+
+| | |
+|---|---|
+| `x-schedule-exchange` | where it is going |
+| `x-schedule-routing-key` | what it will be published under |
+| `x-schedule-due-at` | when it is due, as epoch milliseconds |
+| `x-schedule-content-type` | what the payload was encoded as |
+
+The content type is carried because the scheduler republishes **bytes**. The
+payload is encoded once, when it is scheduled, and moved unchanged from then on
+— the control consumer reads raw bytes with `BytesCodec` and never decodes a
+payload, because a scheduler that decodes acquires opinions about message
+formats it has no business having. Publishing pre-encoded bytes under
+`application/octet-stream` would produce a message the intended consumer cannot
+decode: it arrives, it is the right bytes, and nothing can read it.
+
+None of the four is passed on to the destination. They are bookkeeping, and a
+consumer that started depending on them would be depending on how a message got
+to it. What the consumer sees is an ordinary message of type `ScheduledMessage`.
+
+### The control consumer declares nothing
+
+A consumer normally declares its dead-letter queues when it starts. This one is
+opened with `declare=False`, because `acemq.schedule.due` is a shared name:
+without it, every service running a scheduler would leave `acemq.schedule.due.dlq`
+and `acemq.schedule.due.parked` on the broker — two durable queues that nothing
+publishes to and nobody ever reads. Everything it needs is in
+`schedule_topology()`, which `Scheduler.open` has already applied.
+
+A message that reaches the control queue without the headers a scheduled message
+carries is rejected rather than retried: no number of attempts adds a header,
+and something else publishing into the scheduler's queues is a bug rather than a
+delivery to guess a destination for.
+
+`scheduled`, `delivered` and `hops` say what it has done. `hops` divided by
+`delivered` is the average number of hops, which is the number to look at when a
+scheduler is busier than expected — long delays cost hops.
 
 ## Consumer groups
 

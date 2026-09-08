@@ -6,6 +6,55 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 While the version is `0.x` the public API may change in any release.
 
+## [Unreleased]
+
+### Added
+
+- **Sagas.** `Saga` runs named steps in order and, when one fails, compensates
+  the completed ones in reverse — the order the world was changed in, because a
+  compensation often depends on state a later step has not yet altered. A step
+  may be a coroutine, because a step that publishes a message will be. Two
+  behaviours are the pattern rather than an accident of it and are pinned by
+  tests: a compensation that itself fails is logged, collected into
+  `SagaResult.unresolved` and does **not** stop the others, and a completed step
+  with no compensation is skipped rather than treated as an error. `run` returns
+  a `SagaResult` instead of raising: `complete`, `compensated`, `failed_at`,
+  `failure`, `completed`, `unresolved`, and `has_unresolved` — which is the flag
+  to alert on, because everything else a saga reports is recoverable by
+  construction and those are effects that happened and were not undone.
+
+- **Scheduled delivery.** `Scheduler` delivers a message later through a ladder
+  of five time-to-live queues — an hour, ten minutes, a minute, ten seconds, a
+  second — that dead-letter into `acemq.schedule.due`, where the scheduler either
+  hops the message down a rung or delivers it. A per-message expiration would be
+  simpler and wrong: a classic queue expires messages only at its head, so a
+  one-minute message queued behind a four-hour one is delivered in four hours and
+  nothing reports it. The whole topology is byte for byte what the Java library
+  declares — the `acemq.schedule` direct exchange, `acemq.schedule.{1h,10m,1m,10s,1s}`
+  and `acemq.schedule.due`, all classic, every rung carrying exactly
+  `x-message-ttl`, `x-dead-letter-exchange` and `x-dead-letter-routing-key`, and
+  every queue bound on its own name — so a Python service and a Java service
+  scheduling on one broker declare the same queues rather than meeting a
+  `PRECONDITION_FAILED`. An integration test declares them from Python and then
+  again from a second connection with Java's literal argument table, and proves
+  the broker accepts that and refuses a different one.
+
+- The scheduler carries four headers, deliberately without the reserved
+  `x-acemq-` prefix — `x-schedule-exchange`, `x-schedule-routing-key`,
+  `x-schedule-due-at` (epoch milliseconds, as Java's `Instant.toEpochMilli()`
+  writes it) and `x-schedule-content-type`. The payload is encoded once, when it
+  is scheduled, and moved as bytes from then on: the control consumer reads with
+  `BytesCodec` and never decodes a payload, and the content type travels with it
+  so the eventual consumer can still choose a codec. None of the four is passed
+  on to the destination.
+
+- The scheduler's control consumer is opened with `declare=False`. A consumer
+  declares its dead-letter queues at start-up, which is right for a service queue
+  and wrong for a shared one: without it every service running a scheduler would
+  leave `acemq.schedule.due.dlq` and `acemq.schedule.due.parked` behind on the
+  broker. `schedule_topology()` is public, so a deployment can declare the ladder
+  from a migration and run its services with no `configure` permission at all.
+
 ## [0.3.0] - 2026-09-08
 
 ### Added

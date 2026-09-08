@@ -70,6 +70,7 @@ from acemq_amqp import (
     PublishResult,
     RetryPolicy,
     Security,
+    TextCodec,
     Topology,
     accept,
     connect,
@@ -98,6 +99,7 @@ from acemq_amqp.patterns import (
     Requester,
     ResponderError,
     RoutingSlip,
+    Scheduler,
     SqlOutboxStore,
     StreamRetention,
     claim_key_of,
@@ -109,6 +111,7 @@ from acemq_amqp.patterns import (
     read_stream,
     record,
     replay,
+    schedule_topology,
     serve,
     start,
     then,
@@ -1580,3 +1583,239 @@ def _without_the_login(url: str) -> str:
     if parts.port is not None:
         host = f"{host}:{parts.port}"
     return urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
+
+
+#: Every queue a scheduler puts on a broker, longest rung first. Fixed names
+#: rather than workspace ones, because they are shared with every other service
+#: scheduling on the same broker — which is the whole reason their arguments
+#: have to match Java's.
+SCHEDULER_QUEUES = [
+    "acemq.schedule.1h",
+    "acemq.schedule.10m",
+    "acemq.schedule.1m",
+    "acemq.schedule.10s",
+    "acemq.schedule.1s",
+    "acemq.schedule.due",
+]
+
+#: The argument table Java's ``declareTopology`` sends for a rung, written out
+#: rather than derived, so that a change to :func:`schedule_rung_args` has to
+#: come past this list to reach the broker.
+JAVA_RUNG_ARGUMENTS: Mapping[str, Mapping[str, Any]] = {
+    "acemq.schedule.1h": {
+        "x-message-ttl": 3_600_000,
+        "x-dead-letter-exchange": "acemq.schedule",
+        "x-dead-letter-routing-key": "acemq.schedule.due",
+    },
+    "acemq.schedule.10m": {
+        "x-message-ttl": 600_000,
+        "x-dead-letter-exchange": "acemq.schedule",
+        "x-dead-letter-routing-key": "acemq.schedule.due",
+    },
+    "acemq.schedule.1m": {
+        "x-message-ttl": 60_000,
+        "x-dead-letter-exchange": "acemq.schedule",
+        "x-dead-letter-routing-key": "acemq.schedule.due",
+    },
+    "acemq.schedule.10s": {
+        "x-message-ttl": 10_000,
+        "x-dead-letter-exchange": "acemq.schedule",
+        "x-dead-letter-routing-key": "acemq.schedule.due",
+    },
+    "acemq.schedule.1s": {
+        "x-message-ttl": 1_000,
+        "x-dead-letter-exchange": "acemq.schedule",
+        "x-dead-letter-routing-key": "acemq.schedule.due",
+    },
+}
+
+
+async def without_the_scheduler_queues(mq: Connection) -> None:
+    """Removes the six queues a scheduler declares.
+
+    They are shared names, so a test that left one behind with a message still
+    in a rung would deliver it in the middle of a later test.
+    """
+    for name in SCHEDULER_QUEUES:
+        with contextlib.suppress(Exception):
+            await mq.delete_queue(name)
+
+
+async def test_a_scheduled_message_arrives_late_rather_than_early_or_never(
+    mq: Connection, workspace: Workspace
+) -> None:
+    """The whole of the pattern, on a real broker.
+
+    A message goes in with four seconds on it, and the two things worth proving
+    are that it is *not* there after two — a scheduler that delivers everything
+    immediately passes every other check in this file — and that when it does
+    arrive it is the bytes and the content type that went in.
+    """
+    exchange = workspace.name("scheduled-events")
+    queue = workspace.name("scheduled")
+    await mq.declare(
+        Topology()
+        .exchange(exchange, "direct", auto_delete=True)
+        .queue(queue, dead_letter=True)
+        .binding(queue, exchange, "invoice.due")
+    )
+    workspace.register(queue)
+
+    await without_the_scheduler_queues(mq)
+    try:
+        scheduler = await Scheduler.open(mq)
+        print(f"\nscheduling into {exchange} on invoice.due")
+        for name in SCHEDULER_QUEUES:
+            assert await mq.queue_exists(name) is True
+        print(f"  declared {SCHEDULER_QUEUES}")
+
+        started = asyncio.get_running_loop().time()
+        await scheduler.after(
+            timedelta(seconds=4), exchange, "invoice.due", {"invoice": "INV-1"}
+        )
+
+        # Not there yet, which is the half of this that a broken scheduler
+        # passes anyway if nobody looks.
+        await asyncio.sleep(2)
+        early = await mq.message_count(queue)
+        print(f"  after 2s the target queue holds {early}")
+        assert early == 0
+
+        arrived = (await collect(mq, queue, timeout=30))[0]
+        waited = asyncio.get_running_loop().time() - started
+        print(f"  arrived after {waited:.1f}s as {arrived.content_type}: {arrived.payload}")
+
+        assert waited >= 3.0
+        assert arrived.payload == {"invoice": "INV-1"}
+        # The content type it was scheduled under, carried across four hops of
+        # a queue that never decoded it.
+        assert arrived.content_type == mq.codec.content_type
+        assert arrived.envelope.type == "ScheduledMessage"
+        # None of the scheduler's bookkeeping reached the consumer.
+        assert arrived.envelope.headers == {}
+        assert scheduler.scheduled == 1
+        assert scheduler.delivered == 1
+        assert scheduler.hops >= 3
+        await scheduler.close()
+    finally:
+        await without_the_scheduler_queues(mq)
+
+
+async def test_a_scheduler_moves_bytes_it_cannot_decode_under_the_type_they_came_in_as(
+    mq: Connection, workspace: Workspace
+) -> None:
+    """A payload the scheduler has no codec for still arrives readable.
+
+    The failure this rules out is the quiet one: the bytes arrive, they are the
+    right bytes, and the consumer waiting for them cannot decode them because
+    the scheduler published everything as ``application/octet-stream``.
+    """
+    exchange = workspace.name("documents")
+    queue = workspace.name("document-ready")
+    await mq.declare(
+        Topology()
+        .exchange(exchange, "direct", auto_delete=True)
+        .queue(queue, dead_letter=True)
+        .binding(queue, exchange, "document.ready")
+    )
+    workspace.register(queue)
+
+    await without_the_scheduler_queues(mq)
+    try:
+        async with await Scheduler.open(mq, codec=TextCodec()) as scheduler:
+            await scheduler.after(
+                timedelta(seconds=2), exchange, "document.ready", "not json at all"
+            )
+            # Read as bytes, because the point is that the content type says
+            # text and this connection's codec is JSON: a reader that decoded
+            # would be testing its own codec rather than what arrived.
+            arrived = (await collect(mq, queue, timeout=30, codec=BytesCodec()))[0]
+
+        print(f"\ncarried as {arrived.content_type}: {arrived.body!r}")
+        assert arrived.content_type == TextCodec().content_type
+        assert arrived.body == b"not json at all"
+    finally:
+        await without_the_scheduler_queues(mq)
+
+
+async def test_the_scheduler_queues_are_ones_a_java_service_can_declare_too(
+    mq: Connection,
+) -> None:
+    """The interop claim for the scheduler, answered by the broker.
+
+    Python declares the ladder, then a second connection declares the same six
+    queues with the argument table Java's ``declareTopology`` sends. The broker
+    compares them, so the accepted declare is the proof; the refused one
+    underneath is what stops this passing against a broker that had given up
+    comparing arguments.
+    """
+    await without_the_scheduler_queues(mq)
+    try:
+        await mq.declare(schedule_topology())
+        print("\nscheduler topology")
+        print(f"  {schedule_topology()}".replace("\n", "\n  "))
+
+        for name, arguments in JAVA_RUNG_ARGUMENTS.items():
+            await declared_by_another_service(name, arguments)
+            print(f"  accepted {name} {dict(arguments)}")
+        # The control queue takes no arguments at all in either language.
+        await declared_by_another_service("acemq.schedule.due", {})
+        print("  accepted acemq.schedule.due {}")
+
+        # A different table on the same queue is refused, which is what a
+        # library that got the TTL or the dead-letter target wrong would meet on
+        # a broker a Java service had reached first.
+        wrong = {**JAVA_RUNG_ARGUMENTS["acemq.schedule.1m"], "x-message-ttl": 61_000}
+        with pytest.raises(ChannelPreconditionFailed) as refusal:
+            await declared_by_another_service("acemq.schedule.1m", wrong)
+        said = str(refusal.value)
+        print(f"  refused  acemq.schedule.1m {wrong} -> {said}")
+        assert "x-message-ttl" in said
+
+        # And a rung declared as a quorum queue is refused too: classic is
+        # spelled by leaving x-queue-type off, and sending it is a different
+        # queue rather than the same one described differently.
+        quorum = {**JAVA_RUNG_ARGUMENTS["acemq.schedule.1s"], "x-queue-type": "quorum"}
+        with pytest.raises(ChannelPreconditionFailed) as also_refused:
+            await declared_by_another_service("acemq.schedule.1s", quorum)
+        print(f"  refused  acemq.schedule.1s {quorum} -> {also_refused.value}")
+
+        # Refused declares protect the queues rather than damaging them.
+        for name in SCHEDULER_QUEUES:
+            assert await mq.queue_exists(name) is True
+    finally:
+        await without_the_scheduler_queues(mq)
+
+
+async def test_a_scheduler_leaves_no_dead_letter_queues_of_its_own_behind(
+    mq: Connection,
+) -> None:
+    """The control consumer declares nothing.
+
+    A consumer declares ``{queue}.dlq`` and ``{queue}.parked`` when it starts,
+    which is right for a service queue and wrong for this one: every service
+    running a scheduler would leave two more durable queues on a shared broker
+    that nothing publishes to and nobody ever reads. The scheduler's consumer is
+    opened with ``declare=False`` for exactly this, and this is the check that
+    it stays that way.
+    """
+    leaked = ("acemq.schedule.due.dlq", "acemq.schedule.due.parked")
+    await without_the_scheduler_queues(mq)
+    for name in leaked:
+        # Removed first, because the claim is that opening a scheduler does not
+        # create them and a broker somebody else has already used cannot answer
+        # that question.
+        with contextlib.suppress(Exception):
+            await mq.delete_queue(name)
+    try:
+        async with await Scheduler.open(mq):
+            for name in leaked:
+                assert await mq.queue_exists(name) is False
+                print(f"\n{name} was not created")
+        # And the six it does declare are still exactly the six.
+        for name in SCHEDULER_QUEUES:
+            assert await mq.queue_exists(name) is True
+        for name in leaked:
+            assert await mq.queue_exists(name) is False
+    finally:
+        await without_the_scheduler_queues(mq)
