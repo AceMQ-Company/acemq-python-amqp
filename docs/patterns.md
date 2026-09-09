@@ -366,11 +366,11 @@ the steps vary per message: an order over a threshold visits an approver, a
 document goes to whichever reviewer owns it. Not worth it when every message
 goes the same way, where a fixed chain of consumers is simpler.
 
-The slip travels as JSON in an application header rather than in the payload,
-because a step that rewrites the payload must not be able to lose the itinerary
-by accident. `slip_from(envelope)` reads it, returning `None` when there is
-none and raising `FatalError` when there is one that cannot be parsed — fatal,
-because a slip that will not parse will not parse on the next attempt either.
+The slip travels in a header rather than in the payload, because a step that
+rewrites the payload must not be able to lose the itinerary by accident.
+`slip_from(envelope)` reads it, returning `None` when there is none and raising
+`FatalError` when there is one that cannot be parsed — fatal, because a slip
+that will not parse will not parse on the next attempt either.
 
 `RoutingSlip` is immutable and `advance()` returns a new one: a slip is on a
 message that has already been published by the time anybody reads it, so
@@ -380,6 +380,59 @@ says how far it got.
 
 The message is accepted only once the next one is out, which is again why a step
 that changes anything should be idempotent.
+
+### Two wire forms, and both are read
+
+| Header | Carries | Written by |
+|---|---|---|
+| `acemq-routing-slip` | JSON: an exchange, a routing key and a name per step | Python, Go, Ruby |
+| `x-acemq-route` | the step names, comma-separated, with `x-acemq-route-position` and `x-acemq-route-id` | Java's `Pipeline` |
+
+The JSON slip is **self-describing**: each step says where it goes, so a message
+can be followed by a service that knows nothing about the route, and a route can
+be built per message. That is why it stays the default here.
+
+The declared route says only *what the steps are called*. Where they go is
+resolved against a pipeline declared in advance, whose name is its exchange and
+whose queues are `{pipeline}.{step}`, bound on the step's own name. It buys a
+slip somebody can read in a management console — `validate,enrich,dispatch` at
+position 1 — and costs the ability to send a message anywhere the declaration
+does not already know about.
+
+`slip_from` reads whichever the message carries — the JSON one first, when a
+message somehow has both, because it is the one that needs nothing from the
+reader — and `follow_slip` writes the same one back. That is what lets a Python
+step sit in the middle of a pipeline Java declared:
+
+```python
+consumer = await mq.consume(
+    "fulfilment.enrich", follow_slip(mq, enrich, pipeline="fulfilment")
+)
+```
+
+`pipeline=` is the exchange those step names are bound to, which is the one
+thing the declared form does not put on the wire. Without it the steps are read
+as routing keys on the default exchange, which is right for a route Python
+declared and wrong for one Java did.
+
+Writing that form deliberately is `route_of`, or `form=` on `start`:
+
+```python
+from acemq_amqp.patterns import SlipForm, route_of
+
+await start(mq, route_of("fulfilment", "validate", "enrich", "dispatch"), order)
+await start(mq, slip, order, form=SlipForm.STEP_NAMES)
+```
+
+A slip that cannot be said in that form is refused where it is built rather than
+sent somewhere unexpected: the declared route is one exchange with a queue per
+step, so steps spanning two exchanges, a step with no name, and a step whose
+name and routing key disagree are all a `ValueError`.
+
+The three route headers are reserved, so they are read from
+`Envelope.route`, `.route_position` and `.route_id` rather than from the
+application's own map — and they are carried by `with_`, which is what makes a
+replayed dead letter *resume* a route instead of starting it again.
 
 ## Sagas
 

@@ -39,6 +39,9 @@ was written.
 | `x-acemq-origin` | string | `service@host` |
 | `x-acemq-error` | string | Why it was dead-lettered or parked |
 | `x-acemq-claim` | string | Where the payload is, when it is stored outside the message |
+| `x-acemq-route` | string | The steps of a declared route, by name, comma-separated |
+| `x-acemq-route-position` | int | Which of them this message is for, from 0 |
+| `x-acemq-route-id` | string | One run through that route, across every hop |
 
 `x-acemq-claim` is for saying, in a form an operator reading a dead-letter queue
 can use, where a payload went. It is **not** how a consumer decides that a
@@ -52,14 +55,25 @@ this one. Nothing here is renamed for Python's benefit —
 un-Pythonic that looks — because a Python consumer reads what a Java producer
 writes only if both agree on the strings and on the types of their values.
 
-Empty is **absent**. `causation_id`, `origin`, `error` and `claim` are written
-only when they have a value, because a header carrying `""` is a header somebody
-has to write a special case for at the other end.
+The last three are Java's `Pipeline` form of a
+[routing slip](patterns.md#two-wire-forms-and-both-are-read), read here as
+`envelope.route`, `.route_position` and `.route_id`. They are fields rather than
+application headers because the names are reserved, and a pattern that needs
+them off a delivery would otherwise have nowhere to read them from. `with_`
+carries them, which is what makes replaying a dead-lettered message *resume* its
+route rather than start it again.
+
+Empty is **absent**. `causation_id`, `origin`, `error`, `claim` and the route
+are written only when they have a value, because a header carrying `""` is a
+header somebody has to write a special case for at the other end. The one
+exception is `x-acemq-route-position`, which is written whenever there is a
+route, zero included: a first hop with no position is the only hop whose slip is
+incomplete.
 
 ## The reserved namespace
 
-Everything beginning `x-acemq-` belongs to the library. Setting one of the ten
-by hand in your own headers raises:
+Everything beginning `x-acemq-` belongs to the library. Setting one of them by
+hand in your own headers raises:
 
 ```python
 Envelope(headers={"x-acemq-id": "mine"})

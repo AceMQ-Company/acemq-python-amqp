@@ -96,11 +96,14 @@ from .requestreply import (
     serve,
 )
 from .routingslip import (
+    HEADER_ROUTE,
     HEADER_ROUTING_SLIP,
     RoutingSlip,
+    SlipForm,
     Stage,
     Step,
     follow_slip,
+    route_of,
     slip_from,
     start,
 )
@@ -173,6 +176,7 @@ __all__ = [
     "HEADER_REPLAYED_FROM",
     "HEADER_REPLAY_COUNT",
     "HEADER_REPLY_TO",
+    "HEADER_ROUTE",
     "HEADER_ROUTING_SLIP",
     "HEADER_SCHEDULE_CONTENT_TYPE",
     "HEADER_SCHEDULE_DUE_AT",
@@ -215,6 +219,7 @@ __all__ = [
     "SchemaDefinition",
     "SchemaNotFoundError",
     "SchemaRegistry",
+    "SlipForm",
     "SqlIdempotencyStore",
     "SqlOutboxStore",
     "SqlSchemaRegistry",
@@ -243,6 +248,7 @@ __all__ = [
     "read_stream",
     "record",
     "replay",
+    "route_of",
     "schedule_rung_args",
     "schedule_rung_name",
     "schedule_topology",

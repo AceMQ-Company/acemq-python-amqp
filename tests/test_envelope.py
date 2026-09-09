@@ -148,3 +148,63 @@ def test_an_envelope_cannot_be_changed_underneath_a_log_line() -> None:
     assert envelope.attempt == 1
     assert later.attempt == 2
     assert later.id == "one"
+
+
+def test_a_route_is_a_field_because_its_headers_are_ours() -> None:
+    # ``x-acemq-route`` is a reserved name, so it never reaches the application
+    # map — which is why a pattern that needs it reads it from here. Java's
+    # Envelope carries the same three, for the same reason.
+    envelope = Envelope.from_headers(
+        {
+            headers.ID: "m-1",
+            headers.ROUTE: "validate,enrich,dispatch",
+            headers.ROUTE_POSITION: 1,
+            headers.ROUTE_ID: "run-7",
+        },
+        "enrich",
+    )
+
+    assert envelope.route == "validate,enrich,dispatch"
+    assert envelope.route_position == 1
+    assert envelope.route_id == "run-7"
+    assert envelope.headers == {}
+
+    written = envelope.to_headers("enrich")
+    assert written[headers.ROUTE] == "validate,enrich,dispatch"
+    assert written[headers.ROUTE_POSITION] == 1
+    assert written[headers.ROUTE_ID] == "run-7"
+
+
+def test_a_message_on_no_route_writes_no_route_headers() -> None:
+    # Absent rather than empty, like every other optional header here: one
+    # carrying "" is one somebody has to write a special case for.
+    written = Envelope(id="m-1").to_headers("orders.placed")
+
+    assert headers.ROUTE not in written
+    assert headers.ROUTE_POSITION not in written
+    assert headers.ROUTE_ID not in written
+
+
+def test_the_first_hop_of_a_route_still_says_where_it_is() -> None:
+    written = Envelope(id="m-1", route="validate,enrich").to_headers("validate")
+
+    assert written[headers.ROUTE_POSITION] == 0
+
+
+def test_a_position_before_the_start_is_the_start() -> None:
+    # A negative position would send the message to an arbitrary step.
+    assert Envelope(route="a,b", route_position=-4).route_position == 0
+
+
+def test_a_route_survives_the_copy_a_retry_makes() -> None:
+    # Which is what makes replaying a dead-lettered message resume its route
+    # rather than start it again: the consumer republishes ``with_``.
+    original = Envelope(id="m-1", route="validate,enrich", route_position=1, route_id="run-7")
+
+    carried = original.with_(attempt=2)
+
+    assert (carried.route, carried.route_position, carried.route_id) == (
+        "validate,enrich",
+        1,
+        "run-7",
+    )

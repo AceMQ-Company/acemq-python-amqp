@@ -1323,6 +1323,55 @@ async def test_a_routing_slip_visits_every_stop_on_a_real_broker(
     assert arrived.envelope.causation_id != ""
 
 
+async def test_a_java_shaped_route_is_followed_across_a_real_broker(
+    mq: Connection, workspace: Workspace
+) -> None:
+    """A Python step in the middle of a pipeline Java declared.
+
+    The topology is Java's: one direct exchange named after the pipeline, a
+    queue per step called ``{pipeline}.{step}``, each bound on its own name. The
+    first message is published by hand with nothing but the three
+    ``x-acemq-route`` headers on it — which is exactly what a Java ``Pipeline``
+    puts on the wire, and nothing a Python slip would recognise.
+    """
+    pipeline = workspace.name("fulfilment")
+    steps = ["validate", "enrich", "dispatch"]
+    queues = {step: f"{pipeline}.{step}" for step in steps}
+
+    topology = Topology().exchange(pipeline, "direct", auto_delete=True)
+    for step, queue in queues.items():
+        topology.queue(queue).binding(queue, pipeline, step)
+        workspace.register(queue)
+    await mq.declare(topology)
+
+    async def stamp(message: Message) -> dict[str, object]:
+        visited = list(message.payload.get("visited", []))
+        return {**message.payload, "visited": [*visited, message.routing_key]}
+
+    async with (
+        await mq.consume(queues["validate"], follow_slip(mq, stamp, pipeline=pipeline)),
+        await mq.consume(queues["enrich"], follow_slip(mq, stamp, pipeline=pipeline)),
+    ):
+        await mq.publisher(pipeline, "validate", mandatory=True).send(
+            {"order": "order-1"},
+            envelope=Envelope(
+                route=",".join(steps), route_position=0, route_id="run-7"
+            ),
+        )
+        arrived = (await collect(mq, queues["dispatch"]))[0]
+
+    # It went the whole way, one hop at a time, without either step being told
+    # anything about the route beyond which exchange its names are bound to.
+    assert arrived.payload["visited"] == ["validate", "enrich"]
+
+    # And the message that came out is still one a Java step would read: the
+    # same route, the position moved on by two, the same run.
+    assert arrived.envelope.route == "validate,enrich,dispatch"
+    assert arrived.envelope.route_position == 2
+    assert arrived.envelope.route_id == "run-7"
+    assert HEADER_ROUTING_SLIP not in arrived.envelope.headers
+
+
 async def test_a_pipeline_step_publishes_onwards_or_stops(
     mq: Connection, workspace: Workspace
 ) -> None:

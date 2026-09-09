@@ -10,6 +10,54 @@ While the version is `0.x` the public API may change in any release.
 
 ### Added
 
+- **A routing slip is read in either of the family's two wire forms, and can be
+  written in either.** Python writes the JSON slip, `acemq-routing-slip`, as it
+  always has; Java's `Pipeline` writes `x-acemq-route` — the step names,
+  comma-separated, with `x-acemq-route-position` and `x-acemq-route-id` beside
+  them — resolved against a pipeline declared in advance. Neither could read the
+  other, so a Java step and a Python step could not be on the same route.
+
+  `slip_from` now reads whichever the message carries, and `follow_slip` writes
+  the same one back, which is what lets a Python step sit in the middle of a
+  Java-declared pipeline without either side being told about the other.
+  Answering a declared route with a JSON slip would hand the next Java step a
+  message with no route on it at all, and the run would stop halfway with
+  nothing anywhere saying why — so echoing the form is the default rather than
+  an option.
+
+  ```python
+  consumer = await mq.consume(
+      "fulfilment.enrich", follow_slip(mq, enrich, pipeline="fulfilment")
+  )
+  ```
+
+  `pipeline=` is the exchange the step names are bound to — the pipeline's own
+  name, whose queues are `{pipeline}.{step}` — and it is the one thing the
+  declared form does not put on the wire. Writing that form deliberately is
+  `route_of("fulfilment", "validate", "enrich", "dispatch")`, or `form=` on
+  `start` and `follow_slip`, from the new `SlipForm`.
+
+  **JSON stays the default**, because three of the five libraries write it and
+  it is the self-describing one: each step carries its own exchange and routing
+  key, so a message can be followed by a service that knows nothing about the
+  route, and a route can be built per message. The declared form buys a slip
+  readable in a management console and gives up sending a message anywhere the
+  declaration does not already know about.
+
+  A slip that cannot be said in the declared form is refused where it is built
+  rather than sent somewhere unexpected: steps spanning two exchanges, a step
+  with no name, and a step whose name and routing key disagree are each a
+  `ValueError`, and a step that raises one on the way out rejects the message
+  rather than retrying it — it will not become writable on another attempt.
+
+- **`Envelope.route`, `.route_position` and `.route_id`**, the three reserved
+  headers that form carries. Fields rather than application headers for the same
+  reason `claim` is one: the names are reserved, so the application map refuses
+  them, and a pattern reading one off a delivery had nowhere else to look. They
+  are carried by `with_`, so a retry, a dead-letter and a replay all keep them —
+  which is what makes replaying a dead-lettered message *resume* its route
+  instead of starting it again. Java's `Envelope` carries the same three.
+
 - **`park(error)` joins `accept`, `retry` and `reject` in the handler's
   vocabulary.** It settles the message onto `{queue}.parked`, counts on
   `acemq.messages.dead.lettered.total` with `outcome="parked"`, and puts

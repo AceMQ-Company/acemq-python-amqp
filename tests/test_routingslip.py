@@ -26,7 +26,9 @@ from acemq_amqp import Connection, Envelope, FatalError, Message, headers
 from acemq_amqp.patterns import (
     HEADER_ROUTING_SLIP,
     RoutingSlip,
+    SlipForm,
     follow_slip,
+    route_of,
     slip_from,
     start,
 )
@@ -221,3 +223,231 @@ async def test_the_next_message_failing_to_go_out_retries_this_step() -> None:
 
     assert decision.action.value == "retry"
     assert "the next step did not go out" in str(decision.error)
+
+
+# --------------------------------------------------------------------------
+# The other wire form: a route declared in advance, which is what Java writes
+
+
+#: A message as Java's Pipeline publishes one: the step names, the position, the
+#: run identifier, and nothing at all about where those steps live.
+def java_shaped(
+    route: str = "validate,enrich,dispatch",
+    position: int = 1,
+    *,
+    run: str = "run-7",
+    identifier: str = "order-1",
+) -> Message:
+    raw: dict[str, Any] = {
+        headers.ID: identifier,
+        headers.TYPE: "order.placed",
+        headers.CORRELATION: "cart-9",
+        headers.ROUTE: route,
+        headers.ROUTE_POSITION: position,
+        headers.ROUTE_ID: run,
+    }
+    return Message(
+        payload={"order": identifier},
+        envelope=Envelope.from_headers(raw, "enrich"),
+        routing_key="enrich",
+        content_type="application/json",
+        redelivered=False,
+        body=b"{}",
+    )
+
+
+def test_a_java_route_reads_as_a_slip() -> None:
+    # The steps before the position are done and the rest are still to come,
+    # which is the shape the JSON slip has — so everything downstream works on
+    # either form without knowing which it was handed.
+    read = slip_from(java_shaped().envelope, pipeline="fulfilment")
+
+    assert read is not None
+    assert read.form is SlipForm.STEP_NAMES
+    assert [step.name for step in read.done] == ["validate"]
+    assert [step.name for step in read.steps] == ["enrich", "dispatch"]
+    assert read.run_id == "run-7"
+    # The exchange is the pipeline's own name and the routing key is the step's,
+    # which is how Java resolves a step: the queue behind it is
+    # ``fulfilment.enrich``.
+    assert read.next is not None
+    assert (read.next.exchange, read.next.routing_key) == ("fulfilment", "enrich")
+
+
+def test_a_route_position_past_the_end_is_a_finished_route_rather_than_an_error() -> None:
+    # Which is how Java reads it. A step that raised here would turn the end of
+    # a route into a dead letter.
+    read = slip_from(java_shaped(position=9).envelope, pipeline="fulfilment")
+
+    assert read is not None
+    assert read.finished is True
+
+
+def test_a_route_position_that_will_not_read_starts_the_route_over() -> None:
+    # Rather than sending the message to whichever step happened to be first in
+    # the list, which is what an unreadable position would otherwise mean.
+    raw = {headers.ROUTE: "validate,enrich", headers.ROUTE_POSITION: "not a number"}
+    read = slip_from(Envelope.from_headers(raw), pipeline="fulfilment")
+
+    assert read is not None
+    assert [step.name for step in read.steps] == ["validate", "enrich"]
+    assert read.done == ()
+
+
+def test_a_message_carrying_both_forms_is_read_as_the_one_that_says_where_it_goes() -> None:
+    # The JSON slip carries an exchange and a routing key per step and the
+    # declared one has to be resolved against a pipeline the reader may not have
+    # been told about, so the self-describing one wins.
+    envelope = arriving(ITINERARY).envelope.with_(route="validate,enrich", route_position=0)
+
+    read = slip_from(envelope, pipeline="fulfilment")
+
+    assert read is not None
+    assert read.form is SlipForm.JSON
+    assert [step.name for step in read.steps] == ["validate", "charge", "ship"]
+
+
+async def test_a_java_shaped_message_is_followed_to_the_next_step() -> None:
+    """The point of reading the other form at all.
+
+    A Python step in the middle of a Java-declared pipeline: it reads the route
+    off the headers Java wrote, does its work, and publishes to the pipeline's
+    exchange under the next step's name — which is the queue the next Java step
+    is consuming.
+    """
+    transport = FakeTransport()
+    mq = Connection(transport, origin="enrichment@pod-3")
+
+    async def enrich(message: Message) -> dict[str, Any]:
+        return {**message.payload, "enriched": True}
+
+    decision = await follow_slip(mq, enrich, pipeline="fulfilment")(java_shaped())
+
+    assert decision.action.value == "accept"
+    sent = transport.sent[0]
+    assert (sent.exchange, sent.routing_key) == ("fulfilment", "dispatch")
+    assert json.loads(sent.message.body) == {"order": "order-1", "enriched": True}
+
+    # Written back in the form it arrived in. A JSON slip here would hand the
+    # next Java step a message with no route on it at all.
+    assert sent.headers[headers.ROUTE] == "validate,enrich,dispatch"
+    assert sent.headers[headers.ROUTE_POSITION] == 2
+    assert HEADER_ROUTING_SLIP not in sent.headers
+    # And the run is the same run, which is what joins the hops up afterwards.
+    assert sent.headers[headers.ROUTE_ID] == "run-7"
+    assert sent.headers[headers.CORRELATION] == "cart-9"
+    assert sent.headers[headers.CAUSATION] == "order-1"
+
+
+async def test_the_last_step_of_a_java_route_publishes_nothing() -> None:
+    transport = FakeTransport()
+    mq = Connection(transport)
+
+    async def dispatch(message: Message) -> Any:
+        return message.payload
+
+    decision = await follow_slip(mq, dispatch, pipeline="fulfilment")(
+        java_shaped(position=2)
+    )
+
+    assert decision.action.value == "accept"
+    assert transport.sent == []
+
+
+async def test_a_java_shaped_message_read_back_is_where_it_was_left() -> None:
+    # The round trip that matters: what this library writes, this library reads,
+    # and the position it reads is the step the message was published to.
+    transport = FakeTransport()
+    mq = Connection(transport)
+
+    async def enrich(message: Message) -> Any:
+        return message.payload
+
+    await follow_slip(mq, enrich, pipeline="fulfilment")(java_shaped())
+
+    onwards = Envelope.from_headers(transport.sent[0].headers, "dispatch")
+    read = slip_from(onwards, pipeline="fulfilment")
+
+    assert read is not None
+    assert read.next is not None
+    assert read.next.name == "dispatch"
+    assert [step.name for step in read.done] == ["validate", "enrich"]
+
+
+async def test_a_declared_route_can_be_started_from_here() -> None:
+    transport = FakeTransport()
+    mq = Connection(transport, origin="checkout@pod-7")
+
+    await start(mq, route_of("fulfilment", "validate", "enrich", "dispatch"), {"id": "1"})
+
+    sent = transport.sent[0]
+    assert (sent.exchange, sent.routing_key) == ("fulfilment", "validate")
+    assert sent.headers[headers.ROUTE] == "validate,enrich,dispatch"
+    # Written even though it is zero: a first hop whose position is missing is
+    # the only hop whose slip is incomplete, and a reader would have to guess.
+    assert sent.headers[headers.ROUTE_POSITION] == 0
+    assert sent.headers[headers.ROUTE_ID] != ""
+
+
+def test_a_declared_route_needs_at_least_one_step() -> None:
+    with pytest.raises(ValueError, match="at least one step"):
+        route_of("fulfilment")
+
+
+async def test_a_json_slip_can_be_asked_to_go_out_as_a_declared_route() -> None:
+    transport = FakeTransport()
+    mq = Connection(transport)
+
+    itinerary = (
+        RoutingSlip()
+        .then("fulfilment", "validate", name="validate")
+        .then("fulfilment", "enrich", name="enrich")
+    )
+
+    await start(mq, itinerary, {"id": "1"}, form=SlipForm.STEP_NAMES)
+
+    sent = transport.sent[0]
+    assert sent.headers[headers.ROUTE] == "validate,enrich"
+    assert HEADER_ROUTING_SLIP not in sent.headers
+
+
+def test_a_route_across_two_exchanges_cannot_be_written_as_step_names() -> None:
+    # The declared form has one exchange for the whole route, so this slip means
+    # something the wire form cannot say. Refused where it was built rather than
+    # silently sending the second step somewhere else.
+    both = (
+        RoutingSlip()
+        .then("orders-events", "validate", name="validate")
+        .then("shipping-events", "ship", name="ship")
+    )
+
+    with pytest.raises(ValueError, match="span"):
+        both.written_as(SlipForm.STEP_NAMES)
+
+
+def test_a_step_whose_name_and_routing_key_disagree_cannot_be_written_either() -> None:
+    # A declared route has one word for both, and picking one silently is how a
+    # message ends up on a queue nobody expected.
+    named = RoutingSlip().then("fulfilment", "order.charge", name="charge")
+
+    with pytest.raises(ValueError, match="one word for both"):
+        named.written_as(SlipForm.STEP_NAMES)
+
+
+def test_switching_to_the_declared_form_gives_the_run_an_identifier() -> None:
+    # That form has a header for one, and a run with no identifier cannot be
+    # followed across its hops.
+    switched = ITINERARY.written_as(SlipForm.JSON)
+    assert switched.run_id == ""
+
+    declared = (
+        RoutingSlip().then("fulfilment", "validate", name="validate")
+    ).written_as(SlipForm.STEP_NAMES)
+    assert declared.run_id != ""
+
+
+def test_advancing_keeps_the_form_and_the_run() -> None:
+    advanced = route_of("fulfilment", "validate", "enrich", run_id="run-7").advance()
+
+    assert advanced.form is SlipForm.STEP_NAMES
+    assert advanced.run_id == "run-7"

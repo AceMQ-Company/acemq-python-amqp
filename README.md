@@ -245,6 +245,7 @@ contract is portable; the ergonomics are native.
 | `x-acemq-origin` | `service@host` |
 | `x-acemq-error` | Why it was dead-lettered |
 | `x-acemq-claim` | Where the payload is, when it is stored outside the message |
+| `x-acemq-route` / `-position` / `-id` | A route declared in advance, the step it is at, and the run — Java's `Pipeline` form of a routing slip |
 
 Application headers are kept apart from these. A reserved name in your own
 headers is refused rather than dropped — silently discarding a header somebody
@@ -711,7 +712,7 @@ from acemq_amqp.patterns import InMemoryIdempotencyStore, chain, idempotent, wit
 | `replay(...)` | Put dead letters back, with a filter, a limit and a deadline, and a report of what it did and why it stopped |
 | `ordered(key, handler)` | Keep one entity's messages in sequence while everything else runs at once |
 | `ConsumerGroup` | Several consumers over one queue, started and stopped as one thing |
-| `RoutingSlip` / `follow_slip(...)` | An itinerary the message carries, instead of an orchestrator that knows it |
+| `RoutingSlip` / `follow_slip(...)` | An itinerary the message carries, instead of an orchestrator that knows it. Both wire forms are read — the JSON slip Python, Go and Ruby write, and the declared `x-acemq-route` Java's `Pipeline` writes — and either can be written |
 | `Saga` | Steps that must all happen across systems sharing no transaction, compensated in reverse when one fails. It reports what could **not** be undone rather than raising |
 | `Scheduler` | Deliver a message later, through a ladder of time-to-live queues rather than a per-message expiration that a queue only honours at its head |
 | `chain(...)` / `then(...)` | Wrap a handler in a deadline, logging and the guards; publish what a step produced onwards |

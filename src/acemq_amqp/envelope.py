@@ -64,6 +64,24 @@ class Envelope:
     error: str = ""
     claim: str = ""
 
+    #: The steps of a declared route, by name, comma-separated and in order —
+    #: the form Java's ``Pipeline`` writes. Empty for a message that is not
+    #: travelling one.
+    #:
+    #: A field rather than an application header for the same reason ``claim``
+    #: is one: the name is reserved, so the application map refuses it, and a
+    #: pattern that needs it off a delivery has nowhere else to read it from.
+    #: Carried by :meth:`with_`, so a retry, a dead-letter and a replay all keep
+    #: it, which is what makes replaying a message *resume* a route rather than
+    #: restart it. :mod:`acemq_amqp.patterns.routingslip` is what reads it.
+    route: str = ""
+
+    #: Which step of :attr:`route` this message is for, counting from zero.
+    route_position: int = 0
+
+    #: One run through a route, carried by every hop of it.
+    route_id: str = ""
+
     #: The application's own headers. Never contains a reserved name.
     headers: Mapping[str, Any] = field(default_factory=dict)
 
@@ -74,6 +92,11 @@ class Envelope:
             object.__setattr__(self, "attempt", 1)
         if self.version < 1:
             object.__setattr__(self, "version", 1)
+        if self.route_position < 0:
+            # A position before the start would send the message to an
+            # arbitrary step. Starting over is the only defensible reading, and
+            # it is the one Java takes for a position it cannot parse.
+            object.__setattr__(self, "route_position", 0)
         # Reserved names in the application's map would be written twice and
         # read back inconsistently, so they are refused rather than dropped:
         # silently discarding a header somebody set is worse than saying no.
@@ -128,6 +151,16 @@ class Envelope:
             if value:
                 written[name] = value
 
+        # The position is written whenever there is a route, including the zero
+        # a first hop carries: a route with no position reads as position zero
+        # everywhere, and leaving it off would make the first hop the only one
+        # whose slip is incomplete.
+        if self.route:
+            written[headers.ROUTE] = self.route
+            written[headers.ROUTE_POSITION] = self.route_position
+            if self.route_id:
+                written[headers.ROUTE_ID] = self.route_id
+
         written.update(self.headers)
         return written
 
@@ -163,6 +196,12 @@ class Envelope:
             origin=_text(raw.get(headers.ORIGIN)),
             error=_text(raw.get(headers.ERROR)),
             claim=_text(raw.get(headers.CLAIM)),
+            route=_text(raw.get(headers.ROUTE)),
+            # A position that will not read is taken as the start rather than
+            # dropped: a route whose position is unreadable would otherwise send
+            # the message to whichever step happened to be first in the list.
+            route_position=_number(raw.get(headers.ROUTE_POSITION), 0),
+            route_id=_text(raw.get(headers.ROUTE_ID)),
             headers=application,
         )
 

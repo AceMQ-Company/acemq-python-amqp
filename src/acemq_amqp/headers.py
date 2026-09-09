@@ -56,6 +56,24 @@ ERROR = "x-acemq-error"
 #: The claim-check URI, when the payload is stored outside the message.
 CLAIM = "x-acemq-claim"
 
+#: The steps of a declared route, by name, comma-separated and in order.
+#:
+#: The form Java's ``Pipeline`` writes: a route declared once and resolved
+#: against that declaration at each hop, so the wire carries
+#: ``validate,enrich,dispatch`` and nothing about where those steps live. The
+#: self-describing form, which carries an exchange and a routing key per step,
+#: is the ``acemq-routing-slip`` application header that
+#: :mod:`acemq_amqp.patterns.routingslip` writes by default. Python reads both
+#: and can write either.
+ROUTE = "x-acemq-route"
+
+#: Which step of :data:`ROUTE` this message is for, counting from zero.
+ROUTE_POSITION = "x-acemq-route-position"
+
+#: One run through a route, carried by every hop, and surviving a dead-letter
+#: and a replay so that the whole run can be found from any message in it.
+ROUTE_ID = "x-acemq-route-id"
+
 #: The prefix every reserved name shares.
 PREFIX = "x-acemq-"
 
@@ -80,7 +98,21 @@ TRACESTATE = "tracestate"
 
 #: Every name this library writes and understands.
 RESERVED = frozenset(
-    {ID, TYPE, VERSION, CORRELATION, CAUSATION, ATTEMPT, FIRST_SEEN, ORIGIN, ERROR, CLAIM}
+    {
+        ID,
+        TYPE,
+        VERSION,
+        CORRELATION,
+        CAUSATION,
+        ATTEMPT,
+        FIRST_SEEN,
+        ORIGIN,
+        ERROR,
+        CLAIM,
+        ROUTE,
+        ROUTE_POSITION,
+        ROUTE_ID,
+    }
 )
 
 
