@@ -208,6 +208,22 @@ Avro decodes the shifted bytes into whatever they happen to mean — so a codec
 that accepted the other framing would hand back a record full of silent
 nonsense.
 
+**The content type decides the framing; the leading zero byte is a last
+resort.** The rule, which all five libraries follow:
+
+- a content type naming Avro — `avro/binary`, `application/avro`, anything
+  ending `+avro` — is **believed**, and the body is read as a fixed-schema one
+  whatever its first byte is. A legitimate Avro body starts with a zero byte
+  whenever its first field encodes to one: an empty string does, and so do `0`,
+  `false` and the first branch of a union. Refusing those would be refusing real
+  messages over a guess the sender already answered.
+- `application/vnd.acemq.avro` is **refused** by a fixed-schema codec, because
+  reading five bytes of schema identifier as the first field produces a record
+  whose every value is wrong, silently.
+- only when the content type is **absent, or names something that is not Avro at
+  all** — `application/octet-stream` is as uninformative as silence — does the
+  zero byte get a vote, and then it refuses rather than guesses.
+
 **The registry here is async and a codec is not.** Java's registry is a
 synchronous interface and Go's takes a context, so both can look a schema up
 from inside `encode`. `SchemaRegistry` in this library is a set of coroutines,

@@ -37,7 +37,16 @@ from typing import Any, TypeAlias
 from urllib.parse import urlsplit
 
 from . import naming
-from .ack import Ack, Action, FatalError
+from .ack import (
+    OUTCOME_ACKED,
+    OUTCOME_DEAD_LETTERED,
+    OUTCOME_REJECTED,
+    OUTCOME_RETRIED,
+    Ack,
+    Action,
+    FatalError,
+    Settlement,
+)
 from .codec import Codec, JsonCodec
 from .envelope import Envelope
 from .errors import AceMQError, PublishError
@@ -49,7 +58,7 @@ from .interceptors import (
     consume_chain,
     publish_chain,
 )
-from .retry import ZERO, RetryPolicy, no_retry
+from .retry import ZERO, RetryPolicy, Wait, no_retry
 from .security import Security
 from .telemetry import (
     METRIC_ACCEPTED,
@@ -407,6 +416,9 @@ class Consumer:
             content_type=delivery.content_type,
             routing_key=delivery.routing_key,
             redelivered=delivery.redelivered,
+            # This delivery is being driven by a consumer, so how it ends will
+            # be reported. An interceptor that wants to know can wait for it.
+            reports_settlement=True,
         )
 
         started = time.monotonic()
@@ -440,15 +452,25 @@ class Consumer:
         # and the dead letter as much as for the handler.
         envelope = context.envelope
 
-        if not isinstance(decision, Ack):
-            await self._dead_letter(
-                delivery,
-                envelope,
-                f"the handler returned {type(decision).__name__} instead of an Ack",
+        if isinstance(decision, Ack):
+            settlement, wait = self._decide(envelope, decision)
+        else:
+            settlement, wait = (
+                Settlement(
+                    OUTCOME_DEAD_LETTERED,
+                    reason=(
+                        f"the handler returned {type(decision).__name__} instead of an Ack"
+                    ),
+                ),
+                None,
             )
-            return
 
-        await self._settle(delivery, envelope, decision)
+        # Announced before it is carried out, and so before a consumer-side
+        # retry sleeps out its backoff. A listener told afterwards would be
+        # describing the delivery minutes after the decision, and the span it is
+        # writing on would have stayed open for a wait that is not work.
+        context.settled(settlement)
+        await self._carry_out(delivery, envelope, settlement, wait)
 
     async def _run_handler(self, context: ConsumeContext) -> Ack:
         """The innermost work: build the message the interceptors left, and run
@@ -475,37 +497,79 @@ class Consumer:
         decision: Ack = await returned if inspect.isawaitable(returned) else returned
         return decision
 
-    async def _settle(self, delivery: Delivery, envelope: Envelope, decision: Ack) -> None:
+    def _decide(self, envelope: Envelope, decision: Ack) -> tuple[Settlement, Wait | None]:
+        """What is going to happen to this delivery, before anything happens to
+        it.
+
+        Worked out on its own, and without touching the broker, so that it can
+        be announced first. The gap this closes is a small one to describe and a
+        wide one to fall into: a handler asking for a retry it has no attempts
+        left for is dead-lettered, and anything reading the handler's answer
+        instead of this one records a retry that never happened.
+
+        :param envelope: the message's metadata, for the attempt and the age
+        :param decision: what the handler answered
+        :returns: the settlement, and the wait when there is another attempt —
+            which the settlement does not carry, because whether a wait is spent
+            here or on a rung queue is this consumer's business and not a
+            listener's
+        """
         if decision.action is Action.ACCEPT:
-            self._observer.count(METRIC_ACCEPTED, 1, self._labels)
-            await delivery.ack()
-            return
+            return Settlement(OUTCOME_ACKED), None
 
         if decision.action is Action.REJECT:
-            self._observer.count(METRIC_REJECTED, 1, self._labels)
-            await self._dead_letter(
-                delivery, envelope, f"the handler rejected it: {_describe(decision.error)}"
+            return (
+                Settlement(
+                    OUTCOME_REJECTED,
+                    reason=f"the handler rejected it: {_describe(decision.error)}",
+                ),
+                None,
             )
-            return
 
         if isinstance(decision.error, FatalError):
             # The handler asked for a retry but marked the reason as one that
             # will not change. Honouring the mark rather than the request is the
             # point of having it.
-            await self._dead_letter(
-                delivery,
-                envelope,
-                f"the handler reported an unprocessable message: {_describe(decision.error)}",
+            return (
+                Settlement(
+                    OUTCOME_DEAD_LETTERED,
+                    reason=(
+                        "the handler reported an unprocessable message: "
+                        f"{_describe(decision.error)}"
+                    ),
+                ),
+                None,
             )
-            return
 
         wait = self._retry.next_wait(envelope.attempt, envelope.age)
         if wait is None:
-            await self._dead_letter(
-                delivery,
-                envelope,
-                f"{self._exhausted(envelope)}: {_describe(decision.error)}",
+            return (
+                Settlement(
+                    OUTCOME_DEAD_LETTERED,
+                    reason=f"{self._exhausted(envelope)}: {_describe(decision.error)}",
+                ),
+                None,
             )
+
+        return Settlement(OUTCOME_RETRIED, delay=wait.delay), wait
+
+    async def _carry_out(
+        self,
+        delivery: Delivery,
+        envelope: Envelope,
+        settlement: Settlement,
+        wait: Wait | None,
+    ) -> None:
+        """Does what :meth:`_decide` decided."""
+        if settlement.outcome == OUTCOME_ACKED:
+            self._observer.count(METRIC_ACCEPTED, 1, self._labels)
+            await delivery.ack()
+            return
+
+        if wait is None:
+            if settlement.outcome == OUTCOME_REJECTED:
+                self._observer.count(METRIC_REJECTED, 1, self._labels)
+            await self._dead_letter(delivery, envelope, settlement.reason or "")
             return
 
         if wait.in_broker and await self._retry_in_broker(delivery, envelope, wait.delay):

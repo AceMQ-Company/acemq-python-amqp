@@ -70,6 +70,15 @@ zero-length span at the end of a trace adds a row to the waterfall and no
 information; an event is attached to the span that was actually doing the work,
 which is where somebody reading the trace is already looking.
 
+The last two are emitted by the consumer itself, on the delivery's own
+``process`` span, at the moment it decides. That is later than it sounds: what
+the handler answered is not what happens to the message, because a handler
+asking for another attempt when there are none left is dead-lettered instead. So
+the process span stays open past the handler and takes its outcome from the
+consumer's decision — which is why a message that ran out of attempts reads
+``dead_lettered`` rather than ``retried``, and why searching a backend for
+dead letters finds them.
+
 The dependency
 --------------
 
@@ -84,9 +93,18 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
-from .ack import Ack, Action
+from .ack import (
+    OUTCOME_ACKED,
+    OUTCOME_DEAD_LETTERED,
+    OUTCOME_REJECTED,
+    OUTCOME_RETRIED,
+    Ack,
+    Action,
+    Settlement,
+)
 from .envelope import Envelope
 from .errors import AceMQError
 from .headers import TRACEPARENT, TRACESTATE
@@ -97,6 +115,7 @@ from .interceptors import (
     PublishContext,
     PublishInterceptor,
     PublishNext,
+    SettlementListener,
 )
 from .transport import PublishResult
 
@@ -107,8 +126,11 @@ if TYPE_CHECKING:  # pragma: no cover - imported for types alone
 #: libraries put here, so one dashboard reads across all four.
 DEFAULT_SYSTEM = "rabbitmq"
 
-#: The name this library's spans are recorded under.
-INSTRUMENTATION_NAME = "acemq_amqp"
+#: The name this library's spans are recorded under. The reverse-domain name
+#: Java, Ruby, Go and .NET all register, and not a Python module path: spans
+#: from five libraries are meant to group under one instrumentation scope in a
+#: trace backend, and they do not if one of them answers to something else.
+INSTRUMENTATION_NAME = "org.acemq.amqp"
 
 #: Appended to the destination, with a space. ``orders publish``.
 SPAN_PUBLISH_SUFFIX = " publish"
@@ -135,8 +157,16 @@ ATTR_REASON = "messaging.acemq.reason"
 ATTR_RETRY_DELAY = "messaging.acemq.retry_delay_ms"
 ATTR_RUN_AGE = "messaging.acemq.run_age_ms"
 ATTR_OUTBOX_LAG = "messaging.acemq.outbox_lag_ms"
-ATTR_PIPELINE = "messaging.acemq.pipeline"
-ATTR_STEP = "messaging.acemq.step"
+
+#: The ``pipeline.run_finished`` event's own keys, and bare rather than
+#: namespaced. They are the metric tag names — Java, Ruby and Go all write
+#: ``pipeline``, ``step`` and ``outcome`` on this event — so a query that finds
+#: the event in one library finds it in all five. The span *attribute* for an
+#: outcome stays :data:`ATTR_OUTCOME`, which is a different thing in a different
+#: place and keeps its namespace.
+ATTR_PIPELINE = "pipeline"
+ATTR_STEP = "step"
+ATTR_PIPELINE_OUTCOME = "outcome"
 
 #: A message that reached no queue at all.
 OUTCOME_UNROUTABLE = "unroutable"
@@ -151,17 +181,10 @@ OUTCOME_PUBLISHED = "published"
 #: The publish or the handler raised.
 OUTCOME_FAILED = "failed"
 
-#: The handler accepted the message.
-OUTCOME_ACKED = "acked"
-
-#: The handler asked for another attempt.
-OUTCOME_RETRIED = "retried"
-
-#: The handler refused the message outright.
-OUTCOME_REJECTED = "rejected"
-
-#: It ran out of attempts, or was given up on.
-OUTCOME_DEAD_LETTERED = "dead_lettered"
+# The four a delivery can end in — ``acked``, ``retried``, ``rejected`` and
+# ``dead_lettered`` — are defined in :mod:`acemq_amqp.ack` and re-exported here,
+# because the consumer decides them and this only writes them down. They keep
+# their names: ``tracing.OUTCOME_DEAD_LETTERED`` is where people look for them.
 
 #: The outcomes that make a span an error, and only these.
 #:
@@ -290,12 +313,26 @@ class OpenTelemetryTracing:
     def consume_interceptor(self) -> ConsumeInterceptor:
         """A span around every handler, parented by the publish that caused it.
 
+        **The span outlives the handler on purpose.** What the handler answered
+        is not what happened to the message: a handler asking for another
+        attempt when there are none left is dead-lettered, and a span ended on
+        the handler's answer says ``retried`` for a message nobody will ever
+        try again. So where the consumer has promised to say how the delivery
+        was settled — :meth:`~acemq_amqp.interceptors.ConsumeContext.when_settled`
+        — the span waits for that, takes its outcome from it, and ends. Where
+        nothing has promised, because the chain is being run by something other
+        than a consumer, it ends here with what the handler said.
+
+        The wait itself is not in the span. The consumer announces its decision
+        before it acts on it, so a five-second backoff spent holding the
+        delivery does not turn into a five-second handler.
+
         :returns: an interceptor for
             :meth:`~acemq_amqp.connection.Connection.intercept_consume`
         """
 
         async def traced(context: ConsumeContext, handle: ConsumeNext) -> Ack:
-            with self._tracer.start_as_current_span(
+            span = self._tracer.start_span(
                 context.queue + SPAN_PROCESS_SUFFIX,
                 context=self._parent_of(context.envelope),
                 kind=self._trace.SpanKind.CONSUMER,
@@ -315,7 +352,18 @@ class OpenTelemetryTracing:
                 # the way out and a trace would show every failure twice.
                 record_exception=False,
                 set_status_on_exception=False,
-            ) as span:
+            )
+            settled = context.when_settled(self._settlement_recorder(context, span))
+            with self._trace.use_span(
+                span,
+                # Ended by the settlement listener instead, which knows the
+                # outcome. Not ending it here is the whole point; not ending it
+                # anywhere would be a leak, which is why this is asked rather
+                # than assumed.
+                end_on_exit=not settled,
+                record_exception=False,
+                set_status_on_exception=False,
+            ):
                 try:
                     ack = await handle(context)
                 except BaseException as failure:
@@ -327,6 +375,41 @@ class OpenTelemetryTracing:
                 return ack
 
         return traced
+
+    def _settlement_recorder(
+        self, context: ConsumeContext, span: Any
+    ) -> SettlementListener:
+        """Writes what the consumer did onto the delivery's span, and ends it.
+
+        The event and the outcome together, because separately they mislead: an
+        outcome of ``dead_lettered`` with no event does not say why, and a
+        ``message.dead_lettered`` event on a span whose outcome still reads
+        ``retried`` is the bug this exists to fix.
+        """
+
+        def settled(settlement: Settlement) -> None:
+            try:
+                if settlement.delay is not None:
+                    span.add_event(
+                        EVENT_MESSAGE_RETRIED,
+                        _retry_attributes(
+                            context.queue, context.envelope, _millis(settlement.delay)
+                        ),
+                    )
+                elif settlement.dead_lettered:
+                    span.add_event(
+                        EVENT_MESSAGE_DEAD_LETTERED,
+                        _dead_letter_attributes(
+                            context.queue, context.envelope, settlement.reason or ""
+                        ),
+                    )
+                # Last, and overwriting whatever the handler's answer put there:
+                # this is the one that is true.
+                self._outcome(span, settlement.outcome)
+            finally:
+                span.end()
+
+        return settled
 
     @contextmanager
     def request_span(self, destination: str, envelope: Envelope) -> Iterator[Any]:
@@ -458,7 +541,7 @@ class OpenTelemetryTracing:
             {
                 ATTR_PIPELINE: pipeline,
                 ATTR_STEP: step,
-                ATTR_OUTCOME: outcome,
+                ATTR_PIPELINE_OUTCOME: outcome,
                 ATTR_RUN_AGE: age_ms,
             },
         )
@@ -466,33 +549,27 @@ class OpenTelemetryTracing:
     def message_retried(self, queue: str, envelope: Envelope, delay_ms: int) -> None:
         """Records that a message will be tried again, and how long from now.
 
+        A consumer on a traced connection records this itself, on the delivery's
+        own span. This is for a retry something else arranged.
+
         :param queue: where it came from
         :param envelope: its metadata, for the attempt count
         :param delay_ms: how long it waits first
         """
-        self._event(
-            EVENT_MESSAGE_RETRIED,
-            {
-                ATTR_DESTINATION: queue,
-                ATTR_RETRY_DELAY: delay_ms,
-                ATTR_ATTEMPT: envelope.attempt,
-            },
-        )
+        self._event(EVENT_MESSAGE_RETRIED, _retry_attributes(queue, envelope, delay_ms))
 
     def message_dead_lettered(self, queue: str, envelope: Envelope, reason: str) -> None:
         """Records that a message was given up on.
+
+        A consumer on a traced connection records this itself, on the delivery's
+        own span. This is for a message something else gave up on.
 
         :param queue: where it came from
         :param envelope: its metadata, for the attempt count
         :param reason: why
         """
         self._event(
-            EVENT_MESSAGE_DEAD_LETTERED,
-            {
-                ATTR_DESTINATION: queue,
-                ATTR_REASON: reason,
-                ATTR_ATTEMPT: envelope.attempt,
-            },
+            EVENT_MESSAGE_DEAD_LETTERED, _dead_letter_attributes(queue, envelope, reason)
         )
 
     def _event(self, name: str, attributes: Mapping[str, Any]) -> None:
@@ -516,3 +593,31 @@ class OpenTelemetryTracing:
 
     def __repr__(self) -> str:
         return f"OpenTelemetryTracing(system={self._system!r})"
+
+
+def _retry_attributes(queue: str, envelope: Envelope, delay_ms: int) -> dict[str, Any]:
+    """What a ``message.retried`` event says, wherever it is recorded from."""
+    return {
+        ATTR_DESTINATION: queue,
+        ATTR_RETRY_DELAY: delay_ms,
+        ATTR_ATTEMPT: envelope.attempt,
+    }
+
+
+def _dead_letter_attributes(
+    queue: str, envelope: Envelope, reason: str
+) -> dict[str, Any]:
+    """What a ``message.dead_lettered`` event says, wherever it is recorded from.
+
+    The reason is unbounded text, which a span tolerates and a metric does not.
+    """
+    return {
+        ATTR_DESTINATION: queue,
+        ATTR_REASON: reason,
+        ATTR_ATTEMPT: envelope.attempt,
+    }
+
+
+def _millis(delay: timedelta) -> int:
+    """A delay in whole milliseconds, which is the unit every attribute uses."""
+    return int(delay.total_seconds() * 1000)

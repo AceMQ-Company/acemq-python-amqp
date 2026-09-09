@@ -114,6 +114,44 @@ way in is the one the handler is given **and** the one that gets dead-lettered,
 so an operator reading `{queue}.dlq` is not missing the very field the
 interceptor exists to add.
 
+## Knowing how the delivery really ended
+
+The `Ack` an interceptor sees on the way out is what the handler *asked for*,
+which is not always what happened. A handler asking for another attempt when
+there are none left is dead-lettered, and an interceptor that recorded the `Ack`
+would report a retry that never happened — which is exactly how a trace backend
+ends up with no dead letters in it and a dead-letter queue that is full.
+
+`when_settled` closes that gap:
+
+```python
+async def audited(context: ConsumeContext, handle: ConsumeNext) -> Ack:
+    def settled(settlement: Settlement) -> None:
+        if settlement.dead_lettered:
+            audit.record(context.envelope.id, settlement.reason)
+
+    context.when_settled(settled)
+    return await handle(context)
+```
+
+A `Settlement` carries the `outcome` — `acked`, `retried`, `rejected` or
+`dead_lettered` — the `reason` it was set aside for, and the `delay` before the
+next attempt. Its `dead_lettered` property is true for a rejection as well: both
+end up in the same queue, and the difference between the two words is who
+decided.
+
+The listener is called **once**, on the consumer's task, after the decision and
+before it is carried out. Before, so that a consumer-side backoff is not
+something you are made to wait through. `when_settled` returns whether anything
+will ever call it — `False` when the chain is being run by something other than
+a consumer, so nothing should be waiting on an answer that is not coming. A
+listener that raises is logged and otherwise ignored; the delivery still has to
+be settled.
+
+This is what the tracing adapter uses, and the reason a message that ran out of
+attempts has a span saying `dead_lettered` — see
+[observability](observability.md#what-the-consumer-did-rather-than-what-the-handler-said).
+
 ## Refusing is raising
 
 A **publish** interceptor that raises stops the publish, and the caller sees the

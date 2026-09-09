@@ -42,7 +42,7 @@ that a password never has to be written into a connection string.
 from __future__ import annotations
 
 from . import headers
-from .ack import Ack, Action, FatalError, accept, reject
+from .ack import Ack, Action, FatalError, Settlement, accept, reject
 from .ack import retry as _retry
 from .codec import (
     BYTES_CONTENT_TYPE,
@@ -76,6 +76,7 @@ from .interceptors import (
     PublishContext,
     PublishInterceptor,
     PublishNext,
+    SettlementListener,
     consume_chain,
     publish_chain,
 )
@@ -215,6 +216,8 @@ __all__ = [
     "RetryPolicy",
     "Security",
     "SecurityError",
+    "Settlement",
+    "SettlementListener",
     "TextCodec",
     "Topology",
     "Transport",

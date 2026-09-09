@@ -263,6 +263,64 @@ While the version is `0.x` the public API may change in any release.
   broker. `schedule_topology()` is public, so a deployment can declare the ladder
   from a migration and run its services with no `configure` permission at all.
 
+- **`ConsumeContext.when_settled(listener)`, and `Settlement` in
+  `acemq_amqp.ack`.** What a handler answered is not what happened to the
+  message, and until now nothing could tell the difference: an interceptor saw
+  the `Ack` and never the consumer's decision. A listener registered here is
+  told what the consumer settled on — `acked`, `retried`, `rejected` or
+  `dead_lettered`, with the delay it chose or the reason it gave — once, on the
+  consumer's task, after the decision and before it is carried out. It returns
+  whether anything will ever call it, which is `False` for a chain composed by
+  hand with no consumer driving it.
+
+### Changed
+
+- **The tracer is registered as `org.acemq.amqp` rather than `acemq_amqp`**, and
+  the `pipeline.run_finished` event's keys are `pipeline`, `step` and `outcome`
+  rather than `messaging.acemq.`-prefixed. Java, Ruby, Go and .NET all write the
+  reverse-domain scope name and the bare event keys; Python was the odd one out,
+  three to one, and the cost was exactly the thing the naming exists for — spans
+  from five libraries did not group under one instrumentation scope, and a query
+  that found a pipeline event in one library found it in one library. The span
+  *attribute* for an outcome is still `messaging.acemq.outcome`; only the
+  event's own keys are bare, which is what the others do.
+
+- **A delivery's `process` span now ends when the consumer decides, not when
+  the handler returns**, and takes its outcome from that decision. The backoff
+  is deliberately outside it: the consumer announces what it is going to do
+  before it does it, so a message waiting five minutes in the consumer no longer
+  produces a five-minute handler span.
+
+### Fixed
+
+- **A message that exhausted its attempts carried `outcome='retried'` on its
+  span, and never `dead_lettered`.** `message_retried` and
+  `message_dead_lettered` existed on `OpenTelemetryTracing` and nothing in the
+  library called them; they were hooks an application could reach for and
+  nobody knew to. So every message the system ever gave up on was recorded as
+  one that would be tried again, and a trace backend queried for dead letters
+  came back empty while the dead-letter queue filled up. The consumer now
+  records both events itself, on the delivery's own span: `message.retried` with
+  the delay the policy actually chose — which is a jittered number that exists
+  nowhere else — and `message.dead_lettered` with the reason, alongside an
+  outcome of `dead_lettered` and an `ERROR` status. A handler that raised and
+  was then given up on carries the exception *and* the outcome, in that order,
+  as Java does. An outright rejection still reads `rejected`: it goes to the
+  same queue, and the word records that somebody meant it. The same gap was
+  open in Go, .NET and Ruby and is being closed in all of them.
+
+- **`AvroCodec` in fixed-schema mode applied its leading-zero-byte heuristic
+  only when the content type was absent, and not when it was present and said
+  nothing useful.** A message labelled `application/octet-stream` whose body
+  began with `0x00` was decoded as a fixed-schema body, which is how five bytes
+  of somebody else's schema identifier get read as the first field and every
+  value after it comes back silently wrong. The rule is now exactly the one all
+  five libraries follow: a content type naming Avro — `avro/binary`,
+  `application/avro`, anything ending `+avro` — is believed whatever the first
+  byte is; `application/vnd.acemq.avro` is refused by a fixed-schema codec; and
+  only a content type that is absent or names something other than Avro lets the
+  zero byte have a vote, where it refuses rather than guesses.
+
 ## [0.3.0] - 2026-09-08
 
 ### Added

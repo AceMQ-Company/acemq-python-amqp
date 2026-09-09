@@ -66,6 +66,17 @@ A message carrying an identifier the codec has not been taught raises
 **This codec never volunteers for a message whose sender set no content type.**
 Avro bytes are not recognisable, so answering for an untyped message would mean
 decoding whatever arrived and reporting nonsense as success.
+
+**The content type decides the framing, and the leading zero byte is only ever a
+last resort.** A message that says ``avro/binary`` — or ``application/avro``, or
+anything ending ``+avro`` — is read as a fixed-schema body, whatever its first
+byte happens to be, because a body whose first field encodes to zero is a real
+message and refusing it would be refusing the sender's own word. A message that
+says ``application/vnd.acemq.avro`` is refused by a fixed-schema codec, because
+reading five bytes of schema identifier as the first field produces a record
+full of silent nonsense. Only when the content type is absent, or names
+something that is not Avro at all, does the leading zero byte get a vote — and
+then it refuses rather than guesses. All five libraries follow this rule.
 """
 
 from __future__ import annotations
@@ -297,18 +308,22 @@ class AvroCodec:
         #
         # The content type is the better signal and it is right here, so it is
         # used first: a sender that said avro/binary is believed, and the
-        # heuristic is kept only for the case where nothing was said at all,
-        # where it is the only signal there is.
-        if content_type and content_type.lower().startswith(AVRO_REGISTERED_CONTENT_TYPE):
+        # heuristic is kept only for the case where nothing useful was said,
+        # where it is the only signal there is. "Nothing useful" is no content
+        # type at all or one that does not name Avro — application/octet-stream
+        # is as uninformative as silence, and believing it would be believing
+        # nobody.
+        lowered = (content_type or "").lower()
+        if lowered.startswith(AVRO_REGISTERED_CONTENT_TYPE):
             raise FatalError(
                 "acemq: this message says it carries a schema identifier and this codec has "
                 "a fixed schema, so reading it would silently produce the wrong values. "
                 "Build the codec with AvroCodec.from_registry(...) to read it."
             )
-        if not content_type and len(body) >= _FRAME_BYTES and body[0] == _MAGIC:
+        if "avro" not in lowered and len(body) >= _FRAME_BYTES and body[0] == _MAGIC:
             raise FatalError(
                 "acemq: these bytes look like they carry a schema identifier and nothing "
-                "said what they are, so a fixed-schema codec will not guess. Build the "
+                "said they were Avro, so a fixed-schema codec will not guess. Build the "
                 "codec with AvroCodec.from_registry(...), or set the message's content "
                 "type to avro/binary if it really has a fixed schema."
             )

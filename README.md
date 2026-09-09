@@ -522,7 +522,16 @@ That matters as soon as one reads what another wrote.
 | | |
 |---|---|
 | `PublishContext` | `exchange`, `routing_key`, `envelope`, `payload`, `persistent`, `mandatory`, and `set_header(...)`. Seen **before the codec runs**, so the payload can be changed and not only its metadata |
-| `ConsumeContext` | `queue`, `envelope`, `payload`, `body`, `content_type`, `routing_key`, `redelivered`, and a `state` dict this library never reads |
+| `ConsumeContext` | `queue`, `envelope`, `payload`, `body`, `content_type`, `routing_key`, `redelivered`, a `state` dict this library never reads, and `when_settled(...)` |
+
+**`when_settled` is how an interceptor learns what really happened.** The `Ack`
+it sees on the way out is what the handler *asked for*: a handler asking for
+another attempt when there are none left is dead-lettered, and an interceptor
+recording the `Ack` would report a retry that never happened. A listener
+registered with `when_settled` is told the `Settlement` — `acked`, `retried`,
+`rejected` or `dead_lettered`, with the delay chosen or the reason given — once,
+after the consumer decides and before it acts. It returns `False` when nothing
+is driving the chain and no answer is coming.
 
 **Refusing is raising.** A publish interceptor that raises stops the publish and
 the caller sees the exception — the whole point of intercepting rather than
@@ -654,6 +663,18 @@ the same two.
 `unroutable`, `failed` and `dead_lettered` set the span status to `ERROR`; the
 others, `retried` included, do not — a retry is the system working, and a wall of
 red traces that turned out fine is how people learn to ignore the colour.
+
+**The outcome is the consumer's decision, not the handler's answer.** A
+`process` span stays open past the handler and takes its outcome from what the
+consumer actually did, so a message that ran out of attempts reads
+`dead_lettered` and carries a `message.dead_lettered` event with the reason —
+rather than `retried`, which is what somebody querying for dead letters finds
+nothing under. A retry carries `message.retried` with the delay the policy
+chose, which is a jittered number that exists nowhere else. The backoff itself
+is not inside the span.
+
+Spans are recorded under the instrumentation scope `org.acemq.amqp`, which is
+what Java, Ruby, Go and .NET register too, so one query reads across all five.
 
 The dependency is `opentelemetry-api`, not the SDK, so without an application
 configuring one this exports nothing at all. See

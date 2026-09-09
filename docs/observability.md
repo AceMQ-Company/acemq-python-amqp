@@ -321,19 +321,81 @@ others — including `retried` — do not. A retry is the system working and usu
 succeeds; colouring a trace red for it produces a wall of red traces that turned
 out fine, which is how people learn to ignore the colour.
 
+Spans are recorded under the instrumentation scope `org.acemq.amqp` — the
+reverse-domain name, not a Python module path, and the same one Java, Ruby, Go
+and .NET register. That name is what groups spans in a backend, so five
+libraries tracing the same system have to answer to one of them or a query that
+finds one finds only one.
+
 ### Events, not spans
 
 `outbox.publish_failed`, `pipeline.run_finished`, `message.retried` and
-`message.dead_lettered` are recorded as events on whatever span is current:
+`message.dead_lettered` are recorded as events on whatever span is current.
+A zero-length span at the end of a trace adds a row to the waterfall and no
+information. An event lands on the span that was doing the work, which is where
+whoever is reading the trace is already looking.
+
+`pipeline.run_finished` carries `pipeline`, `step` and `outcome` — bare, without
+a namespace, because they are the metric tag names and all five libraries write
+them that way on this event. The span *attribute* for an outcome is still
+`messaging.acemq.outcome`; different thing, different place.
+
+### What the consumer did, rather than what the handler said
+
+The last two events are emitted by the consumer itself, on the delivery's own
+`process` span. That matters more than it sounds, because the two are not the
+same thing:
+
+```python
+async def handler(message: Message) -> Ack:
+    return retry(TimeoutError("the payment gateway did not answer"))
+```
+
+A handler asking for another attempt when there are none left is **not**
+retried; it is dead-lettered. So the `process` span stays open past the handler,
+waits for the consumer's decision, and takes its outcome from that:
+
+| what happened | outcome | event | status |
+|---|---|---|---|
+| the handler accepted it | `acked` | — | |
+| there is another attempt | `retried` | `message.retried`, with the delay | |
+| the handler rejected it | `rejected` | `message.dead_lettered` | |
+| it ran out of attempts, aged out, or was fatal | `dead_lettered` | `message.dead_lettered`, with the reason | `ERROR` |
+
+The retry delay is the one thing about a retry nobody can reconstruct
+afterwards — it comes from the policy, the attempt and, where there is jitter, a
+random number — so it is recorded where it was chosen. The backoff itself is
+*not* in the span: the consumer announces its decision before acting on it, so a
+message waiting five minutes does not produce a five-minute handler.
+
+The two methods remain callable for a retry or a dead letter something else
+arranged:
 
 ```python
 tracing.message_retried(queue, envelope, delay_ms=5000)
 tracing.message_dead_lettered(queue, envelope, "out of attempts")
 ```
 
-A zero-length span at the end of a trace adds a row to the waterfall and no
-information. An event lands on the span that was doing the work, which is where
-whoever is reading the trace is already looking.
+### Watching a settlement yourself
+
+The same seam is public. An interceptor — or anything else composing one — can
+ask to be told how a delivery ended:
+
+```python
+async def audited(context: ConsumeContext, handle: ConsumeNext) -> Ack:
+    def settled(settlement: Settlement) -> None:
+        if settlement.dead_lettered:
+            audit.record(context.envelope.id, settlement.reason)
+
+    context.when_settled(settled)
+    return await handle(context)
+```
+
+The listener is called once, on the consumer's task, after the decision and
+before it is carried out. `when_settled` returns whether anything will ever call
+it: `False` means the chain is being run by something other than a consumer — a
+test, a bridge — and no answer is coming, so do not wait for one. A listener
+that raises is logged and ignored; the delivery still has to be settled.
 
 ### Propagating by hand
 

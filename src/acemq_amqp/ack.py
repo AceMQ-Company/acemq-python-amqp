@@ -12,12 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""What a handler says about a message."""
+"""What a handler says about a message, and what the consumer then did.
+
+Two different statements, and the difference is the point of
+:class:`Settlement`. A handler saying :func:`retry` is a request; whether there
+is an attempt left to grant it is the retry policy's answer, and a message that
+asked to be retried once too often is dead-lettered. Anything watching a
+delivery — the tracing adapter is the one that matters — needs the answer rather
+than the request, which is why the consumer reports it separately.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 from enum import Enum
+
+#: The consumer acknowledged the message; the handler was happy with it.
+OUTCOME_ACKED = "acked"
+
+#: The message goes round again, after :attr:`Settlement.delay`.
+OUTCOME_RETRIED = "retried"
+
+#: The handler refused it outright. It is dead-lettered, and the word says the
+#: decision was deliberate rather than the end of a losing streak.
+OUTCOME_REJECTED = "rejected"
+
+#: It ran out of attempts, aged out, or was unprocessable.
+OUTCOME_DEAD_LETTERED = "dead_lettered"
 
 
 class Action(Enum):
@@ -43,6 +65,40 @@ class Ack:
 
     def __str__(self) -> str:
         return self.action.value
+
+
+@dataclass(frozen=True, slots=True)
+class Settlement:
+    """What the consumer did with a delivery, once it had decided.
+
+    Reported before it is carried out rather than after, because one of the
+    four takes time: a consumer-side retry sleeps out the backoff before the
+    message is republished, and a listener told afterwards would be describing
+    the delivery minutes later, on a span that had been open the whole while.
+
+    :param outcome: one of :data:`OUTCOME_ACKED`, :data:`OUTCOME_RETRIED`,
+        :data:`OUTCOME_REJECTED` and :data:`OUTCOME_DEAD_LETTERED` — the same
+        four words the other libraries put on a span
+    :param reason: why it was set aside, when it was
+    :param delay: how long until the next attempt, when there is one
+    """
+
+    outcome: str
+    reason: str | None = None
+    delay: timedelta | None = None
+
+    @property
+    def dead_lettered(self) -> bool:
+        """Whether the message went to the dead-letter queue.
+
+        True for an outright rejection as well as for an exhausted one: both
+        end up in the same queue, and the difference between the two words is
+        *who decided*, which :attr:`outcome` records and this does not.
+        """
+        return self.outcome in (OUTCOME_REJECTED, OUTCOME_DEAD_LETTERED)
+
+    def __str__(self) -> str:
+        return self.outcome
 
 
 def accept() -> Ack:

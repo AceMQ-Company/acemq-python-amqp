@@ -27,19 +27,25 @@ can only be answered by looking at what came out.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
+from datetime import timedelta
 from typing import Any
 
 import pytest
+from fake_transport import FakeTransport
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import SpanKind, StatusCode
 
-from acemq_amqp.ack import Ack, Action, accept, reject, retry
+from acemq_amqp.ack import Ack, Action, FatalError, accept, reject, retry
+from acemq_amqp.connection import Connection, Handler
 from acemq_amqp.envelope import Envelope
 from acemq_amqp.headers import TRACEPARENT, TRACESTATE
 from acemq_amqp.interceptors import ConsumeContext, PublishContext
+from acemq_amqp.retry import RetryPolicy, fixed_retry, no_retry
+from acemq_amqp.topology import Topology
 from acemq_amqp.tracing import (
     ATTR_ATTEMPT,
     ATTR_CONVERSATION_ID,
@@ -48,12 +54,18 @@ from acemq_amqp.tracing import (
     ATTR_MESSAGE_TYPE,
     ATTR_OPERATION,
     ATTR_OUTCOME,
+    ATTR_PIPELINE,
+    ATTR_PIPELINE_OUTCOME,
+    ATTR_REASON,
+    ATTR_RETRY_DELAY,
     ATTR_ROUTING_KEY,
+    ATTR_STEP,
     ATTR_SYSTEM,
     EVENT_MESSAGE_DEAD_LETTERED,
     EVENT_MESSAGE_RETRIED,
     EVENT_OUTBOX_PUBLISH_FAILED,
     EVENT_PIPELINE_RUN_FINISHED,
+    INSTRUMENTATION_NAME,
     OpenTelemetryTracing,
 )
 from acemq_amqp.transport import PublishResult
@@ -131,6 +143,51 @@ def delivering(envelope: Envelope, **changes: Any) -> ConsumeContext:
 
 async def _sent(_: PublishContext) -> PublishResult:
     return PublishResult(message_id="m-1", confirmed=True, routed=True)
+
+
+CONSUMED = "orders.new"
+
+
+@asynccontextmanager
+async def consuming(
+    tracing: OpenTelemetryTracing,
+    handler: Handler,
+    *,
+    policy: RetryPolicy | None = None,
+) -> AsyncIterator[FakeTransport]:
+    """A real consumer on a fake broker, with the tracing adapter installed.
+
+    The interceptor cannot be called on its own for any of this: what a
+    delivery's span ends up saying depends on what the *consumer* did with the
+    message afterwards, which is the whole point of these tests.
+    """
+    transport = FakeTransport()
+    policy = policy or no_retry()
+    await Topology().queue(CONSUMED, dead_letter=True, retry=policy).apply(transport)
+    connection = Connection(transport, retry=policy)
+    tracing.install(connection)
+    await connection.consume(CONSUMED, handler)
+    try:
+        yield transport
+    finally:
+        await connection.close()
+
+
+def answering(decision: Ack) -> Handler:
+    """A handler that gives the same answer whatever it is sent."""
+
+    async def handler(message: Any) -> Ack:
+        return decision
+
+    return handler
+
+
+def event(span: Any, name: str) -> Any:
+    for recorded in span.events:
+        if recorded.name == name:
+            return recorded
+    seen = [recorded.name for recorded in span.events]
+    raise AssertionError(f"no {name!r} event on {span.name}; there were {seen}")
 
 
 # --------------------------------------------------------------------------
@@ -614,3 +671,203 @@ def test_the_system_reported_can_be_changed() -> None:
     assert repr(OpenTelemetryTracing(system="in-memory")) == (
         "OpenTelemetryTracing(system='in-memory')"
     )
+
+
+# --------------------------------------------------------------------------
+# What the consumer really did
+
+
+async def test_a_message_that_ran_out_of_attempts_says_dead_lettered_not_retried(
+    tracing: OpenTelemetryTracing, spans: InMemorySpanExporter
+) -> None:
+    """The one this whole seam exists for.
+
+    A handler asking for another attempt when there are none left is not
+    retried; it is dead-lettered. Reading the handler's answer instead of the
+    consumer's decision put ``retried`` on the span of every message the system
+    ever gave up on, so a backend queried for dead letters came back empty while
+    the dead-letter queue filled up.
+    """
+    async with consuming(tracing, answering(retry(RuntimeError("the bank said no")))) as t:
+        settlement = await t.deliver(CONSUMED, b"{}", headers=Envelope(id="m-1").to_headers())
+
+    assert settlement.acked
+    assert t.sent_to("orders.new.dlq"), "the message really was dead-lettered"
+
+    span = named(spans, "orders.new process")
+    assert span.attributes[ATTR_OUTCOME] == "dead_lettered"
+    assert span.status.status_code is StatusCode.ERROR
+
+    recorded = event(span, EVENT_MESSAGE_DEAD_LETTERED)
+    assert recorded.attributes[ATTR_DESTINATION] == CONSUMED
+    assert recorded.attributes[ATTR_ATTEMPT] == 1
+    assert "exhausted 1 attempt" in recorded.attributes[ATTR_REASON]
+    assert "the bank said no" in recorded.attributes[ATTR_REASON]
+
+
+async def test_a_retry_is_recorded_with_the_delay_the_policy_actually_chose(
+    tracing: OpenTelemetryTracing, spans: InMemorySpanExporter
+) -> None:
+    """The delay is the one thing about a retry nobody can work out afterwards.
+
+    It comes from the policy, the attempt and — where there is jitter — a
+    random number, so the only place it exists is the consumer that chose it.
+    """
+    policy = fixed_retry(3, timedelta(milliseconds=40))
+    async with consuming(tracing, answering(retry(RuntimeError("later"))), policy=policy) as t:
+        await t.deliver(CONSUMED, b"{}", headers=Envelope(id="m-1").to_headers())
+
+    span = named(spans, "orders.new process")
+    assert span.attributes[ATTR_OUTCOME] == "retried"
+
+    recorded = event(span, EVENT_MESSAGE_RETRIED)
+    assert recorded.attributes[ATTR_DESTINATION] == CONSUMED
+    assert recorded.attributes[ATTR_RETRY_DELAY] == 40
+    assert recorded.attributes[ATTR_ATTEMPT] == 1
+
+
+async def test_the_backoff_is_not_counted_as_time_spent_handling_the_message(
+    tracing: OpenTelemetryTracing, spans: InMemorySpanExporter
+) -> None:
+    """A consumer-side retry sleeps out its wait holding the delivery.
+
+    The consumer announces its decision before it acts on it, so the span ends
+    at the decision. Otherwise every retried message would show a handler that
+    took as long as the backoff, and a policy with minutes in it would produce
+    spans of minutes for handlers that returned at once.
+    """
+    policy = fixed_retry(3, timedelta(milliseconds=400))
+    async with consuming(tracing, answering(retry(RuntimeError("later"))), policy=policy) as t:
+        await t.deliver(CONSUMED, b"{}", headers=Envelope(id="m-1").to_headers())
+
+    span = named(spans, "orders.new process")
+    took = (span.end_time - span.start_time) / 1_000_000_000
+    assert took < 0.3, f"the span covered the backoff: {took:.3f}s"
+
+
+async def test_an_outright_rejection_is_a_decision_rather_than_a_defeat(
+    tracing: OpenTelemetryTracing, spans: InMemorySpanExporter
+) -> None:
+    """It goes to the dead-letter queue, and the span says who decided.
+
+    ``rejected`` rather than ``dead_lettered``, and so not an error: the handler
+    meant it. The event is still recorded, because the message really did end up
+    in the dead-letter queue and somebody draining it will want the reason.
+    """
+    async with consuming(tracing, answering(reject(ValueError("no such account")))) as t:
+        await t.deliver(CONSUMED, b"{}", headers=Envelope(id="m-1").to_headers())
+
+    span = named(spans, "orders.new process")
+    assert span.attributes[ATTR_OUTCOME] == "rejected"
+    assert span.status.status_code is not StatusCode.ERROR
+    assert "no such account" in event(span, EVENT_MESSAGE_DEAD_LETTERED).attributes[ATTR_REASON]
+
+
+async def test_a_fatal_error_dead_letters_rather_than_reporting_the_retry_it_asked_for(
+    tracing: OpenTelemetryTracing, spans: InMemorySpanExporter
+) -> None:
+    """The handler asked for a retry and marked the reason as one that will not
+    change. The consumer honours the mark, and so does the span."""
+    policy = fixed_retry(5, timedelta(0))
+    fatal = retry(FatalError("the schema is wrong and will stay wrong"))
+    async with consuming(tracing, answering(fatal), policy=policy) as t:
+        await t.deliver(CONSUMED, b"{}", headers=Envelope(id="m-1").to_headers())
+
+    span = named(spans, "orders.new process")
+    assert span.attributes[ATTR_OUTCOME] == "dead_lettered"
+    assert span.events and span.events[-1].name == EVENT_MESSAGE_DEAD_LETTERED
+
+
+async def test_a_handler_that_raised_and_was_given_up_on_says_both(
+    tracing: OpenTelemetryTracing, spans: InMemorySpanExporter
+) -> None:
+    """The exception is on the span and so is the outcome.
+
+    Which one wins is not a matter of taste: the exception says what went wrong
+    and the outcome says what became of the message, and a reader needs both.
+    Java records them in this order too.
+    """
+
+    async def raising(message: Any) -> Ack:
+        raise RuntimeError("the database went away")
+
+    async with consuming(tracing, raising) as t:
+        await t.deliver(CONSUMED, b"{}", headers=Envelope(id="m-1").to_headers())
+
+    span = named(spans, "orders.new process")
+    assert span.attributes[ATTR_OUTCOME] == "dead_lettered"
+    assert [recorded.name for recorded in span.events] == [
+        "exception",
+        EVENT_MESSAGE_DEAD_LETTERED,
+    ]
+
+
+async def test_an_accepted_message_still_ends_its_span_once(
+    tracing: OpenTelemetryTracing, spans: InMemorySpanExporter
+) -> None:
+    """A span whose end waits for a settlement has to be ended by every path,
+    and there is no exporter warning for one that never arrives — it simply
+    never appears."""
+    async with consuming(tracing, answering(accept())) as t:
+        await t.deliver(CONSUMED, b"{}", headers=Envelope(id="m-1").to_headers())
+
+    assert [span.name for span in finished(spans)] == ["orders.new process"]
+    assert finished(spans)[0].attributes[ATTR_OUTCOME] == "acked"
+
+
+async def test_a_chain_nobody_is_driving_still_ends_its_span_where_it_started(
+    tracing: OpenTelemetryTracing, spans: InMemorySpanExporter
+) -> None:
+    """An interceptor chain composed by hand — a test, a bridge, a pattern of
+    somebody's own — has no consumer to report a settlement, so the span ends on
+    the handler's answer as it always did. Waiting for a promise nobody made
+    would mean a span that never ends and never appears."""
+
+    async def handled(_: ConsumeContext) -> Ack:
+        return retry(RuntimeError("nobody is listening"))
+
+    context = delivering(Envelope(id="m-1", attempt=2))
+    assert context.reports_settlement is False
+
+    await tracing.consume_interceptor()(context, handled)
+
+    span = named(spans, "orders.new process")
+    assert span.attributes[ATTR_OUTCOME] == "retried"
+
+
+# --------------------------------------------------------------------------
+# The names, which are a cross-language contract
+
+
+def test_the_tracer_is_registered_under_the_name_the_other_libraries_use(
+    tracing: OpenTelemetryTracing, spans: InMemorySpanExporter
+) -> None:
+    """``org.acemq.amqp``, not a Python module path.
+
+    The instrumentation scope is what groups spans in a backend. Five libraries
+    tracing the same system have to answer to the same name or the query that
+    finds one of them finds only one of them.
+    """
+    with tracing.request_span("pricing", Envelope(id="m-1")):
+        pass
+
+    assert INSTRUMENTATION_NAME == "org.acemq.amqp"
+    assert named(spans, "pricing request").instrumentation_scope.name == INSTRUMENTATION_NAME
+
+
+def test_the_pipeline_event_uses_the_bare_names_the_other_libraries_write(
+    tracing: OpenTelemetryTracing, spans: InMemorySpanExporter, provider: TracerProvider
+) -> None:
+    """``pipeline``, ``step`` and ``outcome`` without a namespace, which is what
+    Java, Ruby and Go put on this event. The span *attribute* for an outcome is
+    still ``messaging.acemq.outcome``; they are different things in different
+    places and only the event's keys are bare."""
+    with provider.get_tracer("test").start_as_current_span("orders.new process"):
+        tracing.pipeline_run_finished("enrichment", "geocode", "failed", 1200)
+
+    recorded = event(finished(spans)[0], EVENT_PIPELINE_RUN_FINISHED)
+    assert (ATTR_PIPELINE, ATTR_STEP, ATTR_PIPELINE_OUTCOME) == ("pipeline", "step", "outcome")
+    assert recorded.attributes["pipeline"] == "enrichment"
+    assert recorded.attributes["step"] == "geocode"
+    assert recorded.attributes["outcome"] == "failed"
+    assert recorded.attributes["messaging.acemq.run_age_ms"] == 1200

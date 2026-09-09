@@ -384,11 +384,24 @@ def test_a_fixed_codec_reads_a_body_whose_first_byte_is_zero_when_told_the_type(
     assert body[0] == 0 and len(body) >= 5
     assert codec.decode(body, "avro/binary") == counter
 
+    # Any content type that names Avro is believed, whatever the first byte is:
+    # the sender said what the bytes are, and the heuristic exists only for when
+    # nobody did.
+    assert codec.decode(body, "application/avro") == counter
+    assert codec.decode(body, "application/vnd.acme.counter+avro") == counter
+
     # With nothing said at all there is no signal but the byte, so it refuses
     # rather than guessing — which is what a CompositeCodec with no content type
     # would hand it.
-    with pytest.raises(FatalError, match="nothing said what they are"):
+    with pytest.raises(FatalError, match="nothing said they were Avro"):
         codec.decode(body, None)
+
+    # And a content type that says nothing useful is silence with extra steps.
+    # application/octet-stream names no framing and no format, so the last-resort
+    # guess applies to it exactly as it does to an absent one — the alternative
+    # is reading five bytes of someone else's schema identifier as a field.
+    with pytest.raises(FatalError, match="nothing said they were Avro"):
+        codec.decode(body, "application/octet-stream")
 
 
 def test_an_unknown_schema_identifier_says_which_one_and_how_to_teach_it() -> None:

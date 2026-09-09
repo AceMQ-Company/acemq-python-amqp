@@ -51,6 +51,12 @@ place rather than in every publisher. A consume interceptor that raises is
 treated exactly as a handler that raised — retried, and then dead-lettered —
 because the alternative is acknowledging a message nothing processed.
 
+What a handler answered is not what happened to the message. A handler asking
+for another attempt when there are none left is dead-lettered, and an
+interceptor that wants to record how a delivery really ended has to wait for the
+consumer to say — :meth:`ConsumeContext.when_settled` is where it waits, and
+:class:`~acemq_amqp.ack.Settlement` is what it is told.
+
 Everything here is built out of the public API and needs no private access. An
 interceptor sees the envelope, the payload, the destination and the body, and
 may change any of them; that is the same rule the patterns in
@@ -60,13 +66,20 @@ a privileged back door.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, TypeAlias
 
-from .ack import Ack
+from .ack import Ack, Settlement
 from .envelope import Envelope
 from .transport import PublishResult
+
+log = logging.getLogger("acemq")
+
+#: Told what the consumer did with a delivery, once it had decided and before it
+#: had done it. Registered with :meth:`ConsumeContext.when_settled`.
+SettlementListener: TypeAlias = Callable[[Settlement], None]
 
 
 @dataclass(slots=True)
@@ -121,6 +134,10 @@ class ConsumeContext:
     :param redelivered: the broker saying it has handed this one over before
     :param state: somewhere for an interceptor to leave something for a later
         one, or for its own way out. Empty, and this library never reads it
+    :param reports_settlement: whether whatever is driving this delivery will
+        say how it was settled. True when a consumer is, and false when an
+        interceptor chain is being run by something else — a test, or a caller
+        composing the chain by hand
     """
 
     queue: str
@@ -131,6 +148,51 @@ class ConsumeContext:
     routing_key: str
     redelivered: bool
     state: dict[str, Any] = field(default_factory=dict)
+    reports_settlement: bool = False
+    _settlement_listeners: list[SettlementListener] = field(
+        default_factory=list, repr=False
+    )
+
+    def when_settled(self, listener: SettlementListener) -> bool:
+        """Asks to be told how this delivery was settled.
+
+        What the handler answered is not what happened to the message: a
+        handler asking for a retry with no attempts left is dead-lettered, and
+        an interceptor that read only the :class:`~acemq_amqp.ack.Ack` would
+        report a retry that never happened. That gap is exactly what somebody
+        querying a trace backend for dead letters falls into, so the consumer
+        reports its decision here and the tracing adapter waits for it.
+
+        The listener is called once, on the consumer's task, after the decision
+        and before it is carried out. It should not block and must not raise;
+        one that does is logged and otherwise ignored, because a delivery still
+        has to be settled when whoever was watching it breaks.
+
+        :param listener: called with the :class:`~acemq_amqp.ack.Settlement`
+        :returns: whether anything will ever call it. ``False`` when this
+            delivery is not being driven by a consumer, in which case the
+            caller should not wait for an answer that is not coming
+        """
+        if not self.reports_settlement:
+            return False
+        self._settlement_listeners.append(listener)
+        return True
+
+    def settled(self, settlement: Settlement) -> None:
+        """Tells the listeners what happened. Called by the consumer.
+
+        :param settlement: what the consumer decided to do with the delivery
+        """
+        for listener in self._settlement_listeners:
+            try:
+                listener(settlement)
+            except Exception:
+                # The delivery still has to be settled. A listener is an
+                # observer, and an observer that breaks must not take the
+                # message with it.
+                log.exception(
+                    "acemq: a settlement listener failed for a delivery from %s", self.queue
+                )
 
 
 #: The rest of a publish: the next interceptor, or the publish itself.
