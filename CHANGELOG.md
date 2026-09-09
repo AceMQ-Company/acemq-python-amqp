@@ -291,6 +291,40 @@ While the version is `0.x` the public API may change in any release.
   before it does it, so a message waiting five minutes in the consumer no longer
   produces a five-minute handler span.
 
+- **A `request` span now ends with an outcome even when nothing went wrong**:
+  `answered` when the reply arrived, `timed_out` when the deadline did, `failed`
+  for anything else. Those are the two words Java's `MetricNames` spells and its
+  requester writes on the same span. Previously an outcome appeared only on a
+  failure, so every round trip that worked carried none at all and "how many
+  requests were answered" had nothing to divide by. A timeout is recognised by
+  type rather than by message — `RequestTimeoutError` is now a `TimeoutError` as
+  well as an `AceMQError`, so `except TimeoutError` catches it and so does
+  anything already catching `AceMQError` — and it keeps the `ERROR` status,
+  because a caller that never got its answer is not a green span whatever the
+  outcome attribute calls it.
+
+- **`messaging.rabbitmq.destination.routing_key` is no longer set on a
+  delivery's `process` span.** It is a publish-side attribute in every other
+  library — Java's `consumeStarted` is not even handed a routing key, and Ruby's
+  process span does not carry one — and Python was the only one writing it. An
+  attribute present on one library's spans and absent from the other four's is
+  worse than one nobody writes, because a query built around it returns the
+  Python services and looks like a complete answer. It is unchanged on the
+  `publish` span.
+
+- **`outbox_published` is documented as an application call, and why it cannot
+  be a library one.** Java's relay calls its equivalent, so
+  `messaging.acemq.outbox_lag_ms` is written by the library there. This one
+  cannot: `OutboxRelay` publishes with `Connection.publish_raw`, which is
+  beneath the interceptor chain and so beneath the `publish` span, and `start()`
+  sweeps on a task of its own where nothing else is current either. An attribute
+  has to land on a span, and there is no span for a relayed record to land on. A
+  hook wired into the relay would compute a lag on every record and hand it to
+  nothing, which is worse than no hook — a number silently dropped looks exactly
+  like a number that is zero. The method stays where it works, inside a span the
+  caller is holding, which is what an on-demand `sweep()` at the end of a request
+  already is. Ruby reached the same conclusion for a related reason.
+
 ### Fixed
 
 - **A message that exhausted its attempts carried `outcome='retried'` on its
@@ -308,6 +342,25 @@ While the version is `0.x` the public API may change in any release.
   as Java does. An outright rejection still reads `rejected`: it goes to the
   same queue, and the word records that somebody meant it. The same gap was
   open in Go, .NET and Ruby and is being closed in all of them.
+
+- **A retry the broker had to hand back was recorded on the span and counted
+  nowhere.** When a consumer's own queue has gone, the message cannot be
+  republished and is returned to the broker unacknowledged instead. That is
+  still the retry the settlement announced and the `process` span records, and
+  it moved no counter at all — the one remaining place where the numbers and the
+  trace disagreed about a single delivery. It now increments
+  `acemq.messages.retried` with `where='requeued'`, a third value beside
+  `consumer` and `broker`; the label *names* are unchanged, so no collector is
+  affected. The agreement itself is now a test, run over every way a delivery
+  can end: the counter that moves and the outcome on the span are asserted to be
+  the same verdict.
+
+  The classification bug that Ruby and .NET carried — counters read from the
+  handler's `Ack` rather than from the consumer's `Settlement`, so a message
+  that exhausted its attempts incremented *retried* — was never present here.
+  `_carry_out` has always switched on the settlement. **These numbers do not
+  move**, unlike .NET's, where a dashboard will show retries falling and
+  dead-letters rising with no change in service behaviour.
 
 - **`AvroCodec` in fixed-schema mode applied its leading-zero-byte heuristic
   only when the content type was absent, and not when it was present and said

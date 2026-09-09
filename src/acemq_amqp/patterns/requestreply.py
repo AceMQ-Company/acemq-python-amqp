@@ -63,12 +63,19 @@ DEFAULT_TIMEOUT = timedelta(seconds=30)
 Responder = Callable[[Message], Any]
 
 
-class RequestTimeoutError(AceMQError):
+class RequestTimeoutError(AceMQError, TimeoutError):
     """No reply arrived before the deadline.
 
     It says nothing about whether the request was handled. A timeout is the
     absence of an answer, not evidence that nothing happened, which is why a
     request that changes anything should be idempotent at the other end.
+
+    Also a :class:`TimeoutError`, so ``except TimeoutError`` catches it — which
+    is what a Python caller writes, and how
+    :meth:`~acemq_amqp.tracing.OpenTelemetryTracing.request_span` tells a
+    deadline apart from a responder that failed without having to import this
+    module. ``except AceMQError`` still catches it too; the extra base only adds
+    a way to be caught.
     """
 
 
@@ -210,6 +217,13 @@ class Requester:
         try:
             await self._publisher.send(request, envelope=outgoing)
             answer = await asyncio.wait_for(waiter, deadline.total_seconds())
+        except RequestTimeoutError:
+            # Already one of ours, from :meth:`close` failing what was still
+            # waiting. Caught first because this class is a ``TimeoutError``
+            # too, and the clause below would otherwise re-describe "the
+            # requester was closed" as "nothing came back in time" — the same
+            # exception type carrying the wrong reason.
+            raise
         except asyncio.TimeoutError as expired:
             raise RequestTimeoutError(
                 f"acemq: no reply to {correlation} arrived within {deadline}"

@@ -44,7 +44,16 @@ from acemq_amqp.connection import Connection, Handler
 from acemq_amqp.envelope import Envelope
 from acemq_amqp.headers import TRACEPARENT, TRACESTATE
 from acemq_amqp.interceptors import ConsumeContext, PublishContext
+from acemq_amqp.patterns.requestreply import RequestTimeoutError
 from acemq_amqp.retry import RetryPolicy, fixed_retry, no_retry
+from acemq_amqp.telemetry import (
+    METRIC_ACCEPTED,
+    METRIC_DEAD_LETTERED,
+    METRIC_REJECTED,
+    METRIC_RETRIED,
+    Metrics,
+    Observer,
+)
 from acemq_amqp.topology import Topology
 from acemq_amqp.tracing import (
     ATTR_ATTEMPT,
@@ -154,17 +163,22 @@ async def consuming(
     handler: Handler,
     *,
     policy: RetryPolicy | None = None,
+    observer: Observer | None = None,
 ) -> AsyncIterator[FakeTransport]:
     """A real consumer on a fake broker, with the tracing adapter installed.
 
     The interceptor cannot be called on its own for any of this: what a
     delivery's span ends up saying depends on what the *consumer* did with the
     message afterwards, which is the whole point of these tests.
+
+    An observer can be handed in as well, because the question of whether the
+    counters and the spans agree can only be asked of one delivery that produced
+    both.
     """
     transport = FakeTransport()
     policy = policy or no_retry()
     await Topology().queue(CONSUMED, dead_letter=True, retry=policy).apply(transport)
-    connection = Connection(transport, retry=policy)
+    connection = Connection(transport, retry=policy, observer=observer)
     tracing.install(connection)
     await connection.consume(CONSUMED, handler)
     try:
@@ -464,6 +478,28 @@ async def test_tracestate_travels_with_traceparent(
     assert process.context.trace_state.get("vendor") == "opaque"
 
 
+async def test_the_delivery_span_carries_no_routing_key(
+    tracing: OpenTelemetryTracing, spans: InMemorySpanExporter
+) -> None:
+    """It is a publish-side attribute, in this library and in the other four.
+
+    Java's ``consumeStarted`` is handed a queue and an envelope and no routing
+    key at all, and Ruby's process span does not carry one either. An attribute
+    that exists on one library's process spans and not on the rest is worse than
+    an attribute nobody writes: a query built around it comes back with the
+    Python services and looks like a complete answer.
+    """
+
+    async def handle(_: ConsumeContext) -> Ack:
+        return accept()
+
+    await tracing.consume_interceptor()(delivering(Envelope(id="m-1")), handle)
+
+    process = named(spans, "orders.new process")
+    assert ATTR_ROUTING_KEY not in process.attributes
+    assert process.attributes[ATTR_DESTINATION] == "orders.new"
+
+
 async def test_the_attempt_is_on_the_handler_span(
     tracing: OpenTelemetryTracing, spans: InMemorySpanExporter
 ) -> None:
@@ -570,15 +606,63 @@ async def test_a_request_is_a_client_span_because_it_waits_for_an_answer(
     assert span.attributes[ATTR_CONVERSATION_ID] == "c-9"
 
 
-async def test_a_request_that_times_out_is_an_error(
+async def test_a_request_that_was_answered_says_so(
     tracing: OpenTelemetryTracing, spans: InMemorySpanExporter
 ) -> None:
-    with pytest.raises(TimeoutError), tracing.request_span("pricing", Envelope(id="r-1")):
-        raise TimeoutError("no answer in 5s")
+    """The outcome that was missing.
+
+    A request span used to carry an outcome only when something went wrong, so
+    every round trip that worked ended with no outcome at all — and "how many
+    requests were answered" had nothing to count. ``answered`` is Java's word for
+    it, from the same ``MetricNames`` the other outcomes come from.
+    """
+    with tracing.request_span("pricing", Envelope(id="r-1")):
+        await asyncio.sleep(0)
+
+    span = named(spans, "pricing request")
+    assert span.attributes[ATTR_OUTCOME] == "answered"
+    assert span.status.status_code is not StatusCode.ERROR
+
+
+@pytest.mark.parametrize(
+    "expired",
+    [
+        pytest.param(TimeoutError("no answer in 5s"), id="builtin"),
+        pytest.param(asyncio.TimeoutError(), id="asyncio"),
+        pytest.param(RequestTimeoutError("acemq: no reply to c-1 arrived"), id="acemq"),
+    ],
+)
+async def test_a_request_that_ran_out_of_time_says_timed_out(
+    tracing: OpenTelemetryTracing, spans: InMemorySpanExporter, expired: BaseException
+) -> None:
+    """``timed_out`` rather than ``failed``, and still red.
+
+    The word is Java's, and it is worth its own value: a responder that answered
+    with a failure and a responder that never answered are different faults with
+    different people to call. The error status stays because the caller did not
+    get its answer, whatever the outcome attribute calls it — and all three
+    spellings of running out of time have to reach the same conclusion, since
+    which one arrives depends on the interpreter and on how the caller waited.
+    """
+    with pytest.raises(type(expired)), tracing.request_span("pricing", Envelope(id="r-1")):
+        raise expired
+
+    span = named(spans, "pricing request")
+    assert span.attributes[ATTR_OUTCOME] == "timed_out"
+    assert span.status.status_code is StatusCode.ERROR
+
+
+async def test_a_request_that_failed_some_other_way_still_says_failed(
+    tracing: OpenTelemetryTracing, spans: InMemorySpanExporter
+) -> None:
+    """A responder that refused is not a deadline that passed."""
+    with pytest.raises(ValueError), tracing.request_span("pricing", Envelope(id="r-1")):
+        raise ValueError("the responder has no such sku")
 
     span = named(spans, "pricing request")
     assert span.attributes[ATTR_OUTCOME] == "failed"
     assert span.status.status_code is StatusCode.ERROR
+    assert "no such sku" in str(span.events[0].attributes["exception.message"])
 
 
 # --------------------------------------------------------------------------
@@ -833,6 +917,118 @@ async def test_a_chain_nobody_is_driving_still_ends_its_span_where_it_started(
 
     span = named(spans, "orders.new process")
     assert span.attributes[ATTR_OUTCOME] == "retried"
+
+
+# --------------------------------------------------------------------------
+# The counters and the span, on the same delivery
+
+
+#: Which counter each outcome is allowed to have moved, and no other.
+#:
+#: ``rejected`` moves two because the message really did go to the dead-letter
+#: queue as well as being refused; the two counters answer different questions —
+#: who decided, and where it ended up — and a dashboard adds them for neither.
+VERDICT_COUNTERS = {
+    "acked": {METRIC_ACCEPTED},
+    "retried": {METRIC_RETRIED},
+    "rejected": {METRIC_REJECTED, METRIC_DEAD_LETTERED},
+    "dead_lettered": {METRIC_DEAD_LETTERED},
+}
+
+
+def moved(metrics: Metrics) -> set[str]:
+    """Which of the four verdict counters this delivery moved."""
+    return {
+        metric
+        for metric in VERDICT_COUNTERS["rejected"] | {METRIC_ACCEPTED, METRIC_RETRIED}
+        for key, count in metrics.counts.items()
+        if count > 0 and (key == metric or key.startswith(metric + "{"))
+    }
+
+
+@pytest.mark.parametrize(
+    ("decision", "policy", "expected"),
+    [
+        pytest.param(accept(), None, "acked", id="accepted"),
+        pytest.param(reject(ValueError("no such account")), None, "rejected", id="rejected"),
+        pytest.param(
+            retry(RuntimeError("the bank said no")),
+            fixed_retry(3, timedelta(milliseconds=1)),
+            "retried",
+            id="retried-with-an-attempt-left",
+        ),
+        pytest.param(
+            retry(RuntimeError("the bank said no")),
+            None,
+            "dead_lettered",
+            id="retried-with-no-attempt-left",
+        ),
+        pytest.param(
+            retry(FatalError("the schema is wrong and will stay wrong")),
+            fixed_retry(5, timedelta(0)),
+            "dead_lettered",
+            id="retried-but-marked-fatal",
+        ),
+    ],
+)
+async def test_the_counters_and_the_span_reach_the_same_verdict(
+    tracing: OpenTelemetryTracing,
+    spans: InMemorySpanExporter,
+    decision: Ack,
+    policy: RetryPolicy | None,
+    expected: str,
+) -> None:
+    """The property, stated once, over every way a delivery can end.
+
+    Counters and spans are two renderings of one decision and they are written
+    in different places, so nothing but a test holds them together. The case
+    that matters is ``retried-with-no-attempt-left``: the handler asked for
+    another attempt, there was none, and both the span and the counters have to
+    say ``dead_lettered``. A counter that read the handler's answer would count
+    a retry for a message nothing will try again, and the dead letters would be
+    short by exactly the messages somebody is looking for.
+    """
+    metrics = Metrics()
+    async with consuming(
+        tracing, answering(decision), policy=policy, observer=metrics
+    ) as transport:
+        await transport.deliver(CONSUMED, b"{}", headers=Envelope(id="m-1").to_headers())
+
+    outcome = named(spans, "orders.new process").attributes[ATTR_OUTCOME]
+    assert outcome == expected
+    assert moved(metrics) == VERDICT_COUNTERS[outcome], (
+        f"the span says {outcome} and the counters say {sorted(moved(metrics))}"
+    )
+
+
+async def test_a_retry_the_broker_has_to_take_back_is_still_counted_as_one(
+    tracing: OpenTelemetryTracing, spans: InMemorySpanExporter
+) -> None:
+    """The last place the two disagreed.
+
+    A consumer whose own queue has gone cannot republish the message, so it
+    returns it to the broker unacknowledged instead. That is still the retry the
+    settlement announced and the span records, and it used to move no counter at
+    all — a retry visible in the trace and invisible in the numbers.
+    """
+    metrics = Metrics()
+    policy = fixed_retry(3, timedelta(0))
+    async with consuming(
+        tracing,
+        answering(retry(RuntimeError("later"))),
+        policy=policy,
+        observer=metrics,
+    ) as transport:
+        headers = Envelope(id="m-1").to_headers()
+        # Every queue goes, including the one being consumed, so no republish
+        # can land and the fallback is the only path left.
+        transport.queues.clear()
+        settlement = await transport.deliver(CONSUMED, b"{}", headers=headers)
+
+    assert settlement.requeued, "the broker was asked to hand it back"
+    outcome = named(spans, "orders.new process").attributes[ATTR_OUTCOME]
+    assert outcome == "retried"
+    assert moved(metrics) == VERDICT_COUNTERS[outcome]
 
 
 # --------------------------------------------------------------------------

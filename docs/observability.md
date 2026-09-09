@@ -116,7 +116,7 @@ one library reads against another. Java publishes them through Micrometer and
 |---|---|
 | `acemq.messages.published` / `.publish.failed` | Handed to the broker, and not. Labelled by exchange and key |
 | `acemq.messages.consumed` | Delivered to a handler. Labelled by queue |
-| `acemq.messages.accepted` / `.retried` / `.rejected` | What handlers decided. A retry says `where`: `consumer` or `broker` |
+| `acemq.messages.accepted` / `.retried` / `.rejected` | What the consumer decided. A retry says `where`: `consumer`, `broker` or `requeued` |
 | `acemq.messages.dead.lettered` | Ran out of attempts and went to `{queue}.dlq` |
 | `acemq.messages.parked` | Never reached the handler and went to `{queue}.parked` |
 | `acemq.handler.duration` | Seconds, timed around the interceptors as well as the handler |
@@ -126,6 +126,25 @@ one library reads against another. Java publishes them through Micrometer and
 
 Every name is a constant — `METRIC_CONSUMED`, `METRIC_RUNG_MISSING` and so on —
 so an alert rule and a test can name the same string the library does.
+
+### The counters say what the consumer decided, not what the handler asked for
+
+The four decision counters are chosen from the settlement, which is the same
+thing [the delivery's span](#what-the-consumer-did-rather-than-what-the-handler-said)
+takes its outcome from. That is worth stating because the two are written in
+different files and a dashboard reads them together:
+
+| span outcome | counter |
+|---|---|
+| `acked` | `acemq.messages.accepted` |
+| `retried` | `acemq.messages.retried` |
+| `rejected` | `acemq.messages.rejected`, and `.dead.lettered` because that is where it went |
+| `dead_lettered` | `acemq.messages.dead.lettered` |
+
+A handler that asks for another attempt when there are none left is
+dead-lettered, so both the counter and the span say `dead_lettered` — not
+`retried`. Counting the request rather than the answer would leave the dead
+letters short by exactly the messages an operator goes looking for.
 
 ### The one to alert on
 
@@ -307,19 +326,37 @@ with tracing.request_span("pricing", envelope):
     answer = await requester.ask(...)
 ```
 
+It ends with an outcome either way: `answered` when the reply came back,
+`timed_out` when the deadline did, `failed` for anything else. The first is the
+one worth having — a span that carried an outcome only when something went wrong
+left every round trip that worked with nothing to count.
+
+A timeout is told apart by its type, not its message. `RequestTimeoutError` is a
+`TimeoutError`, so is anything `asyncio.wait_for` raises, and a caller who waits
+some other way is understood without the tracing module having to know how.
+
 ### The attributes
 
 `messaging.system`, `messaging.destination.name`, `messaging.operation`,
-`messaging.message.id`, `messaging.message.conversation_id`,
-`messaging.rabbitmq.destination.routing_key`, and three of AceMQ's own where the
-conventions have no name: `messaging.acemq.message_type`,
+`messaging.message.id`, `messaging.message.conversation_id`, and three of
+AceMQ's own where the conventions have no name: `messaging.acemq.message_type`,
 `messaging.acemq.attempt` and `messaging.acemq.outcome`. The same names in all
-four libraries, so one dashboard reads across them.
+five libraries, so one dashboard reads across them.
+
+`messaging.rabbitmq.destination.routing_key` is on the **publish** span only. A
+delivery's span does not carry one, because no other library's does — Java's
+`consumeStarted` is not even handed a routing key — and an attribute that exists
+on one library's process spans and not on the rest is worse than one nobody
+writes: a query built around it comes back with the Python services and looks
+like a complete answer.
 
 `unroutable`, `failed` and `dead_lettered` set the span status to `ERROR`. The
 others — including `retried` — do not. A retry is the system working and usually
 succeeds; colouring a trace red for it produces a wall of red traces that turned
-out fine, which is how people learn to ignore the colour.
+out fine, which is how people learn to ignore the colour. A `timed_out` request
+is red too, but by its exception rather than by its outcome: the outcome list is
+Java's, character for character, and a round trip that never got its answer is
+still a failure from where the caller is standing.
 
 Spans are recorded under the instrumentation scope `org.acemq.amqp` — the
 reverse-domain name, not a Python module path, and the same one Java, Ruby, Go
@@ -409,3 +446,37 @@ row["headers"] = tracing.propagation_headers()   # {'traceparent': '00-...'}
 
 A fresh carrier every time, so nothing already on the message is overwritten and
 nothing from a previous one is left behind.
+
+### The outbox lag, and why the library cannot write it for you
+
+`messaging.acemq.outbox_lag_ms` is the one number nothing else can see. A row
+that has been committed and not yet published is a message that exists, is owed
+to somebody, and appears in no queue depth anywhere; a relay that has stopped
+looks exactly like a system with nothing to send until this is measured.
+
+`tracing.outbox_published(destination, lag_ms=...)` writes it — and it is
+**called by your code, never by `OutboxRelay`**. Java's relay calls its
+equivalent; this one cannot, for two reasons that both have to be false before it
+could:
+
+- the relay publishes with `Connection.publish_raw`, which is beneath the
+  interceptor chain and so beneath the `publish` span. There is no span for the
+  record it just sent.
+- `start()` sweeps on a task of its own, where nothing else is current either.
+
+An attribute has to land on a span. A hook wired into the relay would compute a
+lag on every record and hand it to nothing, which is worse than no hook at all,
+because a number that is silently dropped looks the same as a number that is
+zero. So it stays where it works — inside a span you are holding, which is what
+an on-demand `sweep()` at the end of a request already is:
+
+```python
+with tracer.start_as_current_span("checkout"):
+    ...
+    await relay.sweep()
+    tracing.outbox_published("orders", lag_ms=lag)
+```
+
+`outbox_publish_failed(destination, reason)` has no such problem: it is an event
+and is dropped when no span is current, which is the ordinary behaviour of every
+other event here.

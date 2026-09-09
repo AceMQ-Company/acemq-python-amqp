@@ -664,14 +664,21 @@ the same two.
 others, `retried` included, do not — a retry is the system working, and a wall of
 red traces that turned out fine is how people learn to ignore the colour.
 
-**The outcome is the consumer's decision, not the handler's answer.** A
-`process` span stays open past the handler and takes its outcome from what the
-consumer actually did, so a message that ran out of attempts reads
-`dead_lettered` and carries a `message.dead_lettered` event with the reason —
-rather than `retried`, which is what somebody querying for dead letters finds
-nothing under. A retry carries `message.retried` with the delay the policy
-chose, which is a jittered number that exists nowhere else. The backoff itself
-is not inside the span.
+**The outcome is the consumer's decision, not the handler's answer**, and so is
+the counter beside it. A `process` span stays open past the handler and takes
+its outcome from what the consumer actually did, so a message that ran out of
+attempts reads `dead_lettered` and carries a `message.dead_lettered` event with
+the reason — rather than `retried`, which is what somebody querying for dead
+letters finds nothing under. `acemq.messages.dead.lettered` is incremented for
+the same delivery, and `acemq.messages.retried` is not; the counters are chosen
+from the same settlement, and a test holds the two renderings together. A retry
+carries `message.retried` with the delay the policy chose, which is a jittered
+number that exists nowhere else. The backoff itself is not inside the span.
+
+A `request` span ends `answered` or `timed_out` — Java's two words for the same
+span — so a round trip that worked has an outcome to count and not only the ones
+that did not. `messaging.rabbitmq.destination.routing_key` is a publish-side
+attribute only, as it is everywhere else.
 
 Spans are recorded under the instrumentation scope `org.acemq.amqp`, which is
 what Java, Ruby, Go and .NET register too, so one query reads across all five.

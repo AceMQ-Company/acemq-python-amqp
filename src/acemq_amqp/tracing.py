@@ -59,7 +59,15 @@ name                          kind        when
 ``request`` is CLIENT rather than PRODUCER because that span waits for an answer.
 Its duration means something different as a result — a slow publish is a slow
 broker, and a slow request is a slow *responder* — and the kind is what makes a
-tracing backend show them apart rather than averaging one into the other.
+tracing backend show them apart rather than averaging one into the other. It
+ends ``answered`` or ``timed_out``, the two words Java writes on the same span.
+
+The routing key is a ``publish`` attribute and only a ``publish`` attribute. A
+delivery's span does not carry one, because no other library's does — Java is
+not even handed one at ``consumeStarted`` — and an attribute present on one
+library's process spans and absent from the other four's is worse than an
+attribute nobody has: a query written against it quietly returns the Python
+services and calls that the answer.
 
 Events, not spans
 -----------------
@@ -91,6 +99,7 @@ the exporter and the sampler; this module only describes what happened.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from datetime import timedelta
@@ -181,6 +190,16 @@ OUTCOME_PUBLISHED = "published"
 #: The publish or the handler raised.
 OUTCOME_FAILED = "failed"
 
+#: A request got its reply. The only outcome a request span can end well with,
+#: and the reason it has one at all: without it a successful round trip carries
+#: no outcome, and a query for "requests that worked" has nothing to match.
+OUTCOME_ANSWERED = "answered"
+
+#: A request reached its deadline with no reply. Java's ``MetricNames`` spells
+#: both of these, and its requester puts them on the CLIENT span; these are the
+#: same two words.
+OUTCOME_TIMED_OUT = "timed_out"
+
 # The four a delivery can end in — ``acked``, ``retried``, ``rejected`` and
 # ``dead_lettered`` — are defined in :mod:`acemq_amqp.ack` and re-exported here,
 # because the consumer decides them and this only writes them down. They keep
@@ -193,6 +212,13 @@ OUTCOME_FAILED = "failed"
 #: marking it an error paints a trace red for something that turned out fine. A
 #: rejection is a decision the handler made on purpose. What is left is the three
 #: that mean a message did not get where it was going.
+#:
+#: ``timed_out`` is absent for a different reason. It is not the outcome that
+#: makes that span red, the exception is: a request which reached its deadline
+#: raised, and :meth:`~OpenTelemetryTracing.request_span` records that exception
+#: and sets the error status from it. Same colour, with the deadline in the
+#: description rather than the bare word — and the set stays character-identical
+#: to Java's.
 ERROR_OUTCOMES = frozenset({OUTCOME_UNROUTABLE, OUTCOME_FAILED, OUTCOME_DEAD_LETTERED})
 
 #: The events recorded on the current span rather than as spans of their own.
@@ -295,6 +321,12 @@ class OpenTelemetryTracing:
                 try:
                     result = await send(context)
                 except BaseException as failure:
+                    # The outcome is said here rather than inside ``_failed``,
+                    # which only knows that something threw. Java splits it the
+                    # same way — ``Scope.failed`` records the exception and the
+                    # status, and the caller, which knows what kind of operation
+                    # this was, says the word.
+                    self._outcome(span, OUTCOME_FAILED)
                     self._failed(span, failure)
                     raise
                 self._outcome(
@@ -342,9 +374,14 @@ class OpenTelemetryTracing:
                     ATTR_OPERATION: "process",
                     ATTR_MESSAGE_ID: context.envelope.id,
                     ATTR_CONVERSATION_ID: context.envelope.correlation_id,
-                    ATTR_ROUTING_KEY: context.routing_key,
                     ATTR_MESSAGE_TYPE: context.envelope.type,
                     ATTR_ATTEMPT: context.envelope.attempt,
+                    # No routing key. It is a publish-side attribute in every
+                    # other library — Java's ``consumeStarted`` is not even given
+                    # one — and an attribute that exists on one library's process
+                    # spans and not on the other four's is worse than one that
+                    # exists nowhere: a query written against it silently returns
+                    # only the Python services.
                 },
                 # The adapter records the exception and sets the status
                 # itself, in one place, for every way a span can end badly. Left
@@ -367,6 +404,12 @@ class OpenTelemetryTracing:
                 try:
                     ack = await handle(context)
                 except BaseException as failure:
+                    # Provisional, and usually overwritten: the consumer turns a
+                    # handler that raised into a retry request, and the
+                    # settlement listener below writes down what it actually
+                    # decided. It is set at all for the case where nothing is
+                    # driving the chain and this is the last word.
+                    self._outcome(span, OUTCOME_FAILED)
                     self._failed(span, failure)
                     raise
                 self._outcome(span, _ACK_OUTCOMES.get(ack.action, OUTCOME_ACKED))
@@ -422,6 +465,20 @@ class OpenTelemetryTracing:
         round trip and not a handover, and a backend that knows the difference
         will show it against the responder's latency rather than the broker's.
 
+        The span ends with an outcome either way. ``answered`` when the reply
+        came back, ``timed_out`` when the deadline did — the two words Java's
+        ``MetricNames`` spells and its requester writes — and ``failed`` for
+        anything else. The first of those is the one worth having: a request span
+        that carried an outcome only when it went wrong left every successful
+        round trip with no outcome at all, which is not a thing a dashboard can
+        divide by.
+
+        A timeout is told apart by its type rather than by its message.
+        :class:`~acemq_amqp.patterns.RequestTimeoutError` is a
+        :class:`TimeoutError`, so is anything else that ran out of time —
+        :func:`asyncio.wait_for` included — and a caller who waits some other way
+        is understood without this module having to know how.
+
         :param destination: what is being asked
         :param envelope: the request's metadata
         :returns: the span, so a caller can add to it
@@ -444,8 +501,17 @@ class OpenTelemetryTracing:
             try:
                 yield span
             except BaseException as failure:
+                self._outcome(
+                    span,
+                    OUTCOME_TIMED_OUT if _is_deadline(failure) else OUTCOME_FAILED,
+                )
+                # Recorded even for a timeout, and so is the error status: the
+                # outcome vocabulary is Java's, but a round trip that never got
+                # its answer is a failure from where the caller is standing and a
+                # green span would say otherwise.
                 self._failed(span, failure)
                 raise
+            self._outcome(span, OUTCOME_ANSWERED)
 
     # ------------------------------------------------------------ propagation
 
@@ -519,6 +585,25 @@ class OpenTelemetryTracing:
         measurement of the publish that is happening, not a thing that happened
         during it.
 
+        **Called by an application, never by this library**, and that is a
+        limitation rather than an oversight. Java's relay calls its equivalent
+        because its publish opens a span the attribute can land on;
+        :class:`~acemq_amqp.patterns.OutboxRelay` has no such span to write on.
+        It publishes with
+        :meth:`~acemq_amqp.connection.Connection.publish_raw`, which is beneath
+        the interceptor chain and so beneath the ``publish`` span, and it sweeps
+        on a task of its own where nothing else is current either. A hook wired
+        into the relay would compute a lag and hand it to a span that does not
+        exist.
+
+        So it stays where it works: call it from inside a span you are holding,
+        which is what a ``sweep()`` at the end of a request is::
+
+            with tracer.start_as_current_span("checkout"):
+                ...
+                await relay.sweep()
+                tracing.outbox_published("orders", lag_ms=elapsed)
+
         :param destination: where the message went
         :param lag_ms: how long the record sat before it was published
         """
@@ -585,8 +670,14 @@ class OpenTelemetryTracing:
             span.set_status(self._trace.Status(self._trace.StatusCode.ERROR, outcome))
 
     def _failed(self, span: Any, failure: BaseException) -> None:
+        """The exception and the error status, and deliberately not the outcome.
+
+        Java's ``Scope.failed`` draws the line in the same place. What threw is
+        knowable here; what the operation *was* is not, and a method that
+        stamped ``failed`` on every span it touched would overwrite the
+        ``timed_out`` a request had just earned. The caller says the word.
+        """
         span.record_exception(failure)
-        self._outcome(span, OUTCOME_FAILED)
         span.set_status(
             self._trace.Status(self._trace.StatusCode.ERROR, str(failure) or "failed")
         )
@@ -616,6 +707,17 @@ def _dead_letter_attributes(
         ATTR_REASON: reason,
         ATTR_ATTEMPT: envelope.attempt,
     }
+
+
+def _is_deadline(failure: BaseException) -> bool:
+    """Whether a request ran out of time rather than going wrong.
+
+    Both spellings, because they are only the same class from Python 3.11: on
+    3.10 :func:`asyncio.wait_for` raises an ``asyncio.TimeoutError`` that is not
+    the builtin, and a span that said ``failed`` on one interpreter and
+    ``timed_out`` on the next would be the least useful kind of difference.
+    """
+    return isinstance(failure, (TimeoutError, asyncio.TimeoutError))
 
 
 def _millis(delay: timedelta) -> int:

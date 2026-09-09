@@ -560,7 +560,16 @@ class Consumer:
         settlement: Settlement,
         wait: Wait | None,
     ) -> None:
-        """Does what :meth:`_decide` decided."""
+        """Does what :meth:`_decide` decided, and counts it as decided.
+
+        Every counter here is chosen from the :class:`~acemq_amqp.ack.Settlement`
+        and never from the handler's :class:`~acemq_amqp.ack.Ack`, which is the
+        same rule the delivery's span follows. A handler asking for a retry it
+        has no attempts left for is dead-lettered, and a counter that read the
+        request rather than the answer would report a retry for a message
+        nothing will ever try again — so the dead letters would be undercounted
+        by exactly the messages an operator most wants to find.
+        """
         if settlement.outcome == OUTCOME_ACKED:
             self._observer.count(METRIC_ACCEPTED, 1, self._labels)
             await delivery.ack()
@@ -682,6 +691,14 @@ class Consumer:
             # The queue we are consuming has gone. Requeued rather than
             # acknowledged, because dropping it here would lose a message over a
             # broker change nobody told this consumer about.
+            #
+            # Counted as a retry all the same, and it is one: the settlement
+            # said ``retried``, the span says ``retried``, and the broker is
+            # about to hand the message back. Leaving it uncounted was the one
+            # place where the counters and the span disagreed about the same
+            # delivery. The label says which path it took, because a requeue
+            # keeps the attempt header it arrived with and the other two do not.
+            self._observer.count(METRIC_RETRIED, 1, {**self._labels, "where": "requeued"})
             log.error(
                 "acemq: cannot republish %s onto %s for attempt %d; returning it to the broker",
                 envelope.id,
