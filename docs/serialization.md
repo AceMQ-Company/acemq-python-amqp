@@ -453,7 +453,7 @@ That order, always. A keyring holding one key cannot rotate without an outage.
 
 ### Interoperability, and a divergence worth knowing about
 
-All four AceMQ libraries write `application/vnd.acemq.encrypted` and **four
+All five AceMQ libraries write `application/vnd.acemq.encrypted` and **three
 different things underneath it**. This is a real bug in the family, recorded here
 rather than smoothed over, because a consumer cannot tell which it is about to be
 handed:
@@ -462,12 +462,13 @@ handed:
 |---|---|---|---|---|---|---|
 | Java | `0xAE` | `0x01` | 1 byte | 12-byte nonce | AES-GCM | 16 bytes |
 | **Python** | `0xAE` | `0x01` | 1 byte | 12-byte nonce | AES-GCM | 16 bytes |
+| Ruby | `0xAE` | `0x01` | 1 byte | 12-byte nonce | AES-GCM | 16 bytes |
 | Go | none | `0x01` | 2 bytes, big-endian | 12-byte nonce | AES-GCM | 16 bytes |
 | .NET | none | `0x01` | 1 byte | 16-byte IV | AES-256-CBC | HMAC-SHA-256, 32 bytes |
 
-**Python interoperates with Java, and with nothing else.** A body written by Go
-or .NET is refused here — visibly, saying it was not written by this codec —
-rather than being decrypted into something wrong.
+**Python interoperates with Java and Ruby, and with nothing else.** A body
+written by Go or .NET is refused here — visibly, saying it was not written by
+this codec — rather than being decrypted into something wrong.
 
 Java's is the framing to converge on. It is the only one whose first byte
 identifies the format at all, which is what lets a body that was never encrypted

@@ -206,7 +206,8 @@ is not a warning in a docstring; it is the mechanism. A generated authority's
 private key sits next to its certificate and usually ends up in a repository, so
 a development certificate that could reach production would be an authority
 anybody who can read that repository can issue against, and the connection would
-succeed. Java, Go and .NET stamp the same string and enforce it the same way.
+succeed. Java, Go, Ruby and .NET stamp the same string and enforce it the same
+way.
 
 The way through, for the one place it belongs:
 
@@ -251,6 +252,26 @@ Application headers are kept apart from these. A reserved name in your own
 headers is refused rather than dropped — silently discarding a header somebody
 set is worse than saying no — and unknown `x-acemq-` names from a newer version
 of another language's library are not handed back as yours.
+
+### What a handler can answer
+
+```python
+from acemq_amqp import accept, park, reject, retry
+
+accept()                 # done. Acknowledged and gone
+retry(error)             # try again, if the policy has an attempt left
+reject(error)            # do not try again. Straight to {queue}.dlq
+park(error)              # unreadable. Straight to {queue}.parked
+```
+
+Four functions returning an `Ack`, and the error travels with the value into
+`x-acemq-error`, so whoever drains the dead letters reads *why* rather than only
+*that*. `reject` is *understood, and refused*; `park` is *never going to be
+understood* — which is the same conclusion the engine reaches on its own for a
+body no codec will decode, and both land in the same queue for the same reason.
+An exception escaping the handler is read as `retry`, because in Python an
+exception is how a thing says it failed. See
+[consuming](docs/consuming.md#the-decision-is-the-return-value).
 
 ### Retry, and where a message goes when it runs out
 
@@ -317,8 +338,8 @@ it. That is why a policy needs one queue per delay rather than one queue.
 
 ### The two exchanges this library declares
 
-A rung is declared with exactly three arguments, and the same three in Java, Go
-and .NET. Two services consuming one queue declare the same rung by name, so a
+A rung is declared with exactly three arguments, and the same three in Java, Go,
+Ruby and .NET. Two services consuming one queue declare the same rung by name, so a
 rung declared with anything else answers the second service
 `PRECONDITION_FAILED` and leaves it unable to consume at all — which is why the
 table is pinned by a test and why `rung_args(...)` is the only place it is
@@ -476,8 +497,8 @@ No failure message, log line or exception ever contains the plaintext or the key
 and a wrong key and a tampered body fail identically — GCM authenticates before
 it returns anything, and nothing here adds a check that would tell them apart.
 
-**It interoperates with the Java library and with nothing else.** Java, Go and
-.NET currently write three different framings under one content type; a body from
+**It interoperates with the Java and Ruby libraries and with nothing else.** The
+five libraries write three different framings under one content type; a body from
 Go or .NET is refused here, visibly, rather than misread. The table and the test
 vector to converge on are in
 [Codecs → Encryption](docs/serialization.md#encryption).
@@ -582,8 +603,8 @@ from acemq_amqp.prometheus import PrometheusObserver
 mq = await connect(url, observer=PrometheusObserver())
 ```
 
-The names are Java's `MetricNames`, which Go, Python and Ruby all publish, so a
-dashboard built against one reads against another:
+Every name below is Java's `MetricNames`, character for character, so a
+dashboard built against one library reads against another:
 
 | Metric | |
 |---|---|
@@ -595,8 +616,16 @@ dashboard built against one reads against another:
 | `acemq.messages.dead.lettered.total` | Set aside. `outcome="dead_lettered"` went to `{queue}.dlq`; `outcome="parked"` went to `{queue}.parked` because the body would not decode or a handler returned `park(...)` |
 | `acemq.retry.rung.missing` | **Worth an alert.** A long retry that had to wait in the consumer because its rung queue is not on the broker |
 | `acemq.messages.set.aside.failed` | Could not be moved to a dead-letter or parking queue, so was rejected to the broker instead |
+| `acemq.outbox.total` | Outbox records the relay handled. Labelled `exchange`, `routing.key` and `outcome`: `published` or `failed` |
+| `acemq.outbox.lag` | **Worth an alert.** Seconds a record waited between being committed and being published — the one number that reveals a stopped relay. Java, Go and .NET write the same two |
 
-Every name here is Java's `MetricNames`, character for character.
+What this library does *not* write is worth saying, because the alternative is a
+dashboard panel that is empty and looks broken. Java's `MetricNames` also names
+`acemq.publish.duration`, `acemq.consume.attempts`, `acemq.request.duration`,
+`acemq.request.total`, `acemq.pipeline.run.duration` and
+`acemq.pipeline.run.total`; nothing here emits those, and the request and
+pipeline halves of that list are answered by the tracing adapter instead.
+
 `routing.key` and the other dotted tag names are exported to Prometheus with
 underscores, because a Prometheus label name allows nothing else.
 
@@ -725,10 +754,10 @@ so nothing is possible with a pattern that would not be possible without it.
 
 ### Stores that survive a restart
 
-Three of these have a storage seam — `IdempotencyStore`, `OutboxStore`,
-`SchemaRegistry` — and each in-memory implementation says in its own docstring
-why it is not the one to use in production. `acemq_amqp.patterns.sql` is the one
-to use:
+Four of these have a storage seam, and each in-memory implementation says in its
+own docstring why it is not the one to use in production. Three of them —
+`IdempotencyStore`, `OutboxStore` and `SchemaRegistry` — are backed by
+`acemq_amqp.patterns.sql`:
 
 ```python
 import sqlite3
@@ -754,7 +783,13 @@ one — a fresh connection with autocommit on would leave a message queued for
 work that never happened, which is the exact fault the pattern was adopted to
 prevent.
 
-Nothing in the module imports a database driver. It is written against the
+The fourth is `ClaimCheckStore`, which is not in the SQL module and is
+synchronous rather than awaitable, because a `Codec` is called from inside both
+the async and the blocking API. `FilesystemClaimCheckStore` ships; the protocol
+is `put`, `get` and `delete`, so a store over S3 or a blob container is a small
+class.
+
+Nothing in the SQL module imports a database driver. It is written against the
 DB-API 2.0 protocols, so `sqlite3` from the standard library works with nothing
 installed and psycopg works if you have it — `paramstyle="format"` for the
 latter. **The automated suite exercises `sqlite3`**; the same checks have been

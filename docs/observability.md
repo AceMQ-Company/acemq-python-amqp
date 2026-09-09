@@ -111,9 +111,9 @@ database and a handler that calls something slow.
 
 ## What is reported
 
-The names are Java's, spelled out in `MetricNames` in `acemq-amqp-api`, and Go,
-Python and Ruby publish the same ones — so a dashboard built against one library
-reads against another. Java publishes them through Micrometer and .NET through
+Every name below is Java's, spelled out in `MetricNames` in `acemq-amqp-api`,
+character for character — so a dashboard built against one library reads against
+another. Java publishes them through Micrometer and .NET through
 `System.Diagnostics.Metrics`.
 
 | Metric | |
@@ -126,6 +126,29 @@ reads against another. Java publishes them through Micrometer and .NET through
 | `acemq.messages.dead.lettered.total` | Messages set aside, tagged `outcome`: `dead_lettered` went to `{queue}.dlq`, `parked` went to `{queue}.parked` because the body would not decode or a handler returned `park(...)` |
 | `acemq.retry.rung.missing` | **Worth an alert.** A long retry that had to wait in the consumer because its rung queue is not on the broker |
 | `acemq.messages.set.aside.failed` | Could not be moved to a dead-letter or parking queue, so was rejected to the broker instead |
+| `acemq.outbox.total` | Outbox records the relay handled. Labelled `exchange`, `routing.key` and `outcome`: `published` or `failed` |
+| `acemq.outbox.lag` | **Worth an alert.** How long a record waited between being committed and being published, in seconds. See [the outbox](#the-outbox-lag-and-the-half-of-it-this-library-can-write) |
+
+### And the names this library does not write
+
+Worth stating, because a dashboard panel that is empty looks the same as a
+service that has stopped. `MetricNames` also names `acemq.publish.duration`,
+`acemq.consume.attempts`, `acemq.request.duration`, `acemq.request.total`,
+`acemq.pipeline.run.duration` and `acemq.pipeline.run.total`. Nothing here emits
+any of them.
+
+`Observer` has counters, gauges and durations and no general distribution, so
+`acemq.consume.attempts` has nowhere to go — and the number is on every message
+as `Envelope.attempt`, which a handler that wants it records in one line.
+`acemq.publish.duration` is the timing beside `acemq.publish.total`, and only
+the total is written here.
+
+The request and routing-slip names have a different reason. `Requester` and
+`follow_slip` are built over a connection rather than being something the
+connection knows it is doing, so nothing on that path is holding an observer.
+Both are answered on the trace instead — a `request` span that ends `answered`
+or `timed_out`, and a `pipeline.run_finished` event — which is where the shape
+of one particular call belongs anyway.
 
 Parking is not a metric of its own. It is `acemq.messages.dead.lettered.total`
 with `outcome="parked"`, which is what Java settled on: both are a message
@@ -194,6 +217,20 @@ call that would declare it. See
 `acemq.messages.set.aside.failed` is the other one worth a rule: it means a
 message that should have gone to `{queue}.dlq` could not, and was handed back to
 the broker's own dead-lettering instead.
+
+`acemq.outbox.lag` is the third, for a service that has one, and it is the only
+number that shows a relay falling behind: a committed and unpublished row
+appears in no queue depth anywhere, so every other series reads as a service
+with nothing to send.
+
+Read it with `acemq.outbox.total`, because the two failures look different. A
+relay that is running and behind publishes records with a climbing lag, which
+the histogram shows directly. A relay that is *stopped* — its task gone, or the
+broker refusing — publishes nothing, so it records no lag at all and the series
+goes quiet instead of rising; what shows that is
+`acemq.outbox.total{outcome="published"}` at a rate of zero, with
+`outcome="failed"` climbing when the broker is the reason and nothing at all
+when the sweeper is.
 
 ## Health
 
@@ -485,28 +522,52 @@ row["headers"] = tracing.propagation_headers()   # {'traceparent': '00-...'}
 A fresh carrier every time, so nothing already on the message is overwritten and
 nothing from a previous one is left behind.
 
-### The outbox lag, and why the library cannot write it for you
+### The outbox lag, and the half of it this library can write
 
-`messaging.acemq.outbox_lag_ms` is the one number nothing else can see. A row
-that has been committed and not yet published is a message that exists, is owed
-to somebody, and appears in no queue depth anywhere; a relay that has stopped
-looks exactly like a system with nothing to send until this is measured.
+The lag is the one number nothing else can see. A row that has been committed
+and not yet published is a message that exists, is owed to somebody, and appears
+in no queue depth anywhere; a relay that has stopped looks exactly like a system
+with nothing to send until this is measured.
 
-`tracing.outbox_published(destination, lag_ms=...)` writes it — and it is
-**called by your code, never by `OutboxRelay`**. Java's relay calls its
-equivalent; this one cannot, for two reasons that both have to be false before it
-could:
+`OutboxRelay` measures it, and reports it as a **metric**:
+
+| | |
+|---|---|
+| `acemq.outbox.total` | one per record the sweep handled, tagged `outcome="published"` or `outcome="failed"` |
+| `acemq.outbox.lag` | seconds, for a record that went out |
+
+Both go through the connection's observer, labelled with the record's `exchange`
+and `routing.key`, so a relay falling behind on one destination is visible as
+that rather than as a single average. Nothing has to be wired up: a relay left
+running under `start()` reports without anybody calling `sweep()`.
+
+**The lag is measured from the record's own commit**, not from the sweep that
+picked it up. What a lag answers is how long somebody has been owed this
+message, so the wait for a sweep is part of the answer rather than the start of
+it — timed from the sweep, a relay that has been down for an hour reports the
+same handful of milliseconds as one that is keeping up, which is precisely the
+case the number exists to show. A commit clock ahead of the sweeping one reads
+as zero rather than as a negative.
+
+Java, Go and .NET write the same two names for the same records.
+
+#### The span attribute is the half only you can write
+
+`messaging.acemq.outbox_lag_ms` is the same measurement on the trace, beside the
+work that caused it, and `tracing.outbox_published(destination, lag_ms=...)`
+writes it — **from your code, never from `OutboxRelay`**. Java's relay calls its
+equivalent; this one cannot, for two reasons:
 
 - the relay publishes with `Connection.publish_raw`, which is beneath the
   interceptor chain and so beneath the `publish` span. There is no span for the
   record it just sent.
 - `start()` sweeps on a task of its own, where nothing else is current either.
 
-An attribute has to land on a span. A hook wired into the relay would compute a
-lag on every record and hand it to nothing, which is worse than no hook at all,
-because a number that is silently dropped looks the same as a number that is
-zero. So it stays where it works — inside a span you are holding, which is what
-an on-demand `sweep()` at the end of a request already is:
+An attribute has to land on a span, and a hook wired into the relay would
+compute a lag on every record and hand it to nothing. A metric needs no span,
+which is why the numbers above are written and this one is not. So it stays
+where it works — inside a span you are holding, which is what an on-demand
+`sweep()` at the end of a request already is:
 
 ```python
 with tracer.start_as_current_span("checkout"):
@@ -518,3 +579,23 @@ with tracer.start_as_current_span("checkout"):
 `outbox_publish_failed(destination, reason)` has no such problem: it is an event
 and is dropped when no span is current, which is the ordinary behaviour of every
 other event here.
+
+#### A relayed message has no publish span and no publish count
+
+The same `publish_raw` that costs the relay its span costs it the ordinary
+publish telemetry too. A record the relay sends produces no `<destination>
+publish` span and no `acemq.publish.total`, so a service whose events all go out
+through the outbox reads as a service that publishes nothing.
+
+That is deliberate and not fixable from inside the relay. The record's bytes and
+its headers were produced inside the caller's transaction, by `record(...)`, and
+have to reach the broker exactly as they were committed — the class the payload
+came from may not exist by the time the relay runs, and re-encoding would put
+different bytes on the wire from the ones that were promised. `publish_raw`
+hands them to the transport unchanged, and the publish span and the publish
+counter both live on the encoding path above it. Go's and Ruby's relays publish
+below their chains for the same reason.
+
+`acemq.outbox.total` is the count to use instead. It is one per record the relay
+put on the wire, which is the same population `acemq.publish.total` would have
+counted, under a name that says where those messages came from.

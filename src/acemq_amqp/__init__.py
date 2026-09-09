@@ -105,6 +105,8 @@ from .telemetry import (
     METRIC_CONSUME_IN_FLIGHT,
     METRIC_CONSUME_TOTAL,
     METRIC_DEAD_LETTERED_TOTAL,
+    METRIC_OUTBOX_LAG,
+    METRIC_OUTBOX_TOTAL,
     METRIC_PUBLISH_TOTAL,
     METRIC_RETRIED_TOTAL,
     METRIC_RUNG_MISSING,
@@ -143,7 +145,7 @@ from .transport import (
 #: Bound here rather than imported by name, because importing the retry module a
 #: few lines above binds ``acemq_amqp.retry`` to the module and the last write
 #: wins. A module is not what ``from acemq_amqp import retry`` should hand
-#: somebody when the other three libraries hand them the acknowledgement, and
+#: somebody when the other four libraries hand them the acknowledgement, and
 #: ``from acemq_amqp.retry import RetryPolicy`` still reaches the module.
 retry = _retry
 
@@ -159,6 +161,8 @@ __all__ = [
     "METRIC_CONSUME_IN_FLIGHT",
     "METRIC_CONSUME_TOTAL",
     "METRIC_DEAD_LETTERED_TOTAL",
+    "METRIC_OUTBOX_LAG",
+    "METRIC_OUTBOX_TOTAL",
     "METRIC_PUBLISH_TOTAL",
     "METRIC_RETRIED_TOTAL",
     "METRIC_RUNG_MISSING",

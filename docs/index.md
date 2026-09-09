@@ -65,8 +65,8 @@ asyncio.run(main())
 
 **An envelope on every message.** Identity, type, correlation, causation,
 attempt count, origin and the time it was first published — the same fields the
-Java, Go and .NET libraries write, so a message crossing between them keeps its
-history. See [the envelope](envelope.md).
+Java, Go, Ruby and .NET libraries write, so a message crossing between them keeps
+its history. See [the envelope](envelope.md).
 
 **Retries that stop.** A handler returns [`retry()`](consuming.md), and a policy
 decides whether there is another attempt and how long to wait. A retry is
@@ -135,7 +135,7 @@ The exception is the two modules that are a choice rather than the default —
 `acemq_amqp.sync` and `acemq_amqp.prometheus` — and the patterns, which are
 `from acemq_amqp.patterns import ...` because a service uses two of the thirteen.
 
-## One difference from Java, Go and .NET
+## One difference from the other four libraries
 
 **Identical**, because a message crosses languages: the reserved header names
 and their types, the defaults applied when they are absent, the retry schedule

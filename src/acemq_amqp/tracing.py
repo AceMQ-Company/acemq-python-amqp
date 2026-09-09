@@ -141,7 +141,7 @@ if TYPE_CHECKING:  # pragma: no cover - imported for types alone
     from .connection import Connection
 
 #: What is being traced. ``rabbitmq`` by default, and the same value the other
-#: libraries put here, so one dashboard reads across all four.
+#: libraries put here, so one dashboard reads across all five.
 DEFAULT_SYSTEM = "rabbitmq"
 
 #: The name this library's spans are recorded under. The reverse-domain name
@@ -596,6 +596,13 @@ class OpenTelemetryTracing:
         on a task of its own where nothing else is current either. A hook wired
         into the relay would compute a lag and hand it to a span that does not
         exist.
+
+        The lag itself is *not* lost by that. The relay reports it on
+        ``acemq.outbox.lag`` through the connection's observer, tagged and
+        measured from the record's commit, because a metric needs no span to
+        land on. What this method adds is the number *on the trace*, beside the
+        work that caused it, which is worth having and which only a caller
+        holding a span can arrange.
 
         So it stays where it works: call it from inside a span you are holding,
         which is what a ``sweep()`` at the end of a request is::

@@ -27,6 +27,13 @@ neither does, and a relay publishes what was committed. The cost is that the
 relay is at-least-once by construction — a record is removed only after the
 broker has confirmed it, so a crash in between sends it twice — which is what
 :mod:`acemq_amqp.patterns.idempotency` is for at the other end.
+
+The thing to watch is ``acemq.outbox.lag``. A committed, unpublished row is a
+message that exists and is owed to somebody and appears in no queue depth
+anywhere, so a relay that has stopped looks exactly like a service with nothing
+to send — until this is measured. :class:`OutboxRelay` reports it through the
+connection's observer, beside ``acemq.outbox.total``, and measures it from the
+record's commit rather than from the sweep that picked it up.
 """
 
 from __future__ import annotations
@@ -42,6 +49,15 @@ from typing import Any, Protocol, runtime_checkable
 from ..codec import Codec
 from ..connection import Connection
 from ..envelope import Envelope
+from ..telemetry import (
+    METRIC_OUTBOX_LAG,
+    METRIC_OUTBOX_TOTAL,
+    OUTCOME_FAILED,
+    OUTCOME_PUBLISHED,
+    TAG_EXCHANGE,
+    TAG_OUTCOME,
+    TAG_ROUTING_KEY,
+)
 from ..transport import Outbound
 
 log = logging.getLogger("acemq")
@@ -187,6 +203,24 @@ def record(
     )
 
 
+def _lag_seconds(committed: datetime) -> float:
+    """How long ago a record was committed, in seconds and never negative.
+
+    A record's ``created_at`` is written by whoever wrote the record, so it can
+    be naive — the dataclass default and the SQL store are both UTC-aware, but
+    nothing stops a caller passing a bare :class:`~datetime.datetime`. A naive
+    one is read as UTC rather than raising, because a relay is not the place to
+    discover that a timestamp was built without a zone.
+
+    Clamped at zero. Clock skew between the process that wrote the row and the
+    one sweeping it can put the commit in the future, and a negative lag is a
+    number no histogram can hold and no dashboard can read.
+    """
+    if committed.tzinfo is None:
+        committed = committed.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - committed).total_seconds())
+
+
 class OutboxRelay:
     """Publishes what the outbox holds, and removes what the broker confirmed.
 
@@ -194,6 +228,12 @@ class OutboxRelay:
     returned, so a crash in between sends it a second time; removing it first
     would lose it instead, and a repeated message is a problem a consumer can
     solve while a lost one is not.
+
+    Every record it handles is counted on ``acemq.outbox.total`` and every
+    record it publishes is timed on ``acemq.outbox.lag``, both through the
+    connection's observer — see :meth:`sweep` for why those are the only two
+    signals it can raise, and :meth:`sweep` again for what an application can
+    add on top by calling it inside a span of its own.
 
     :param connection: where to publish
     :param store: what to publish from
@@ -239,26 +279,75 @@ class OutboxRelay:
         a request, say, rather than up to a second later — and so a test can
         drive the relay without waiting for a tick.
 
+        **What it reports, and what it cannot.** Every record is counted through
+        the connection's :class:`~acemq_amqp.telemetry.Observer` on
+        ``acemq.outbox.total``, published or failed, and a published one records
+        how long it waited on ``acemq.outbox.lag``. That is the whole of the
+        relay's telemetry, and deliberately so: the tracing adapter has an
+        ``outbox.publish_failed`` event and an ``outbox_lag_ms`` attribute, and
+        neither can be written from here. A sweep started by :meth:`start` runs
+        on a task of its own with no span current, and
+        :meth:`~acemq_amqp.connection.Connection.publish_raw` is beneath the
+        interceptor chain and so opens no ``publish`` span either — so an
+        attribute written here would land on nothing. Metrics need no span,
+        which is why the numbers go out this way and the trace side stays where
+        an application can reach it: call ``sweep()`` from inside a span you are
+        holding and the tracing adapter's methods work as documented.
+
         :returns: how many records were published
         :raises Exception: whatever the store or the broker raised. The records
             are still in the outbox, which is the entire point: a relay that
             fails loses nothing
         """
         waiting = await self._store.pending(self._batch)
+        observer = self._connection.observer
 
         published = 0
         for entry in waiting:
-            await self._connection.publish_raw(
-                entry.exchange,
-                entry.routing_key,
-                Outbound(
-                    body=entry.body,
-                    content_type=entry.content_type,
-                    message_id=entry.id,
-                    headers=entry.headers,
-                    persistent=True,
-                ),
+            labels = {
+                TAG_EXCHANGE: entry.exchange,
+                TAG_ROUTING_KEY: entry.routing_key,
+            }
+            try:
+                await self._connection.publish_raw(
+                    entry.exchange,
+                    entry.routing_key,
+                    Outbound(
+                        body=entry.body,
+                        content_type=entry.content_type,
+                        message_id=entry.id,
+                        headers=entry.headers,
+                        persistent=True,
+                    ),
+                )
+            except Exception:
+                # Counted and re-raised. The record is still in the outbox, and
+                # stopping here rather than carrying on to the next one keeps
+                # the order the records were written in, which is what the
+                # writer intended by writing them in that order.
+                observer.count(
+                    METRIC_OUTBOX_TOTAL, 1, {**labels, TAG_OUTCOME: OUTCOME_FAILED}
+                )
+                raise
+
+            # Counted here rather than after the record has been removed,
+            # because the message is at the broker either way: a store that
+            # cannot mark it published sends it a second time, and a counter
+            # that skipped it would report fewer messages than went out.
+            #
+            # The lag is measured from when the record was committed rather than
+            # from when this sweep started. A relay that has been down for an
+            # hour is publishing hour-old messages, and timing from the sweep
+            # would report the same handful of milliseconds as one keeping up.
+            observer.count(
+                METRIC_OUTBOX_TOTAL, 1, {**labels, TAG_OUTCOME: OUTCOME_PUBLISHED}
             )
+            observer.observe(
+                METRIC_OUTBOX_LAG,
+                _lag_seconds(entry.created_at),
+                {**labels, TAG_OUTCOME: OUTCOME_PUBLISHED},
+            )
+
             await self._store.mark_published(entry.id)
             published += 1
         return published

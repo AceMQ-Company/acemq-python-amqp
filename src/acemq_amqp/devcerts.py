@@ -35,10 +35,10 @@ certificate and usually ends up in a repository, so a certificate that could
 reach production would be an authority anybody who can read the repository can
 issue against.
 
-Java, Go and .NET generate the same three certificates with the same marker and
-enforce it the same way, so a broker set up by any of the four is usable from all
-of them and none of them will speak to it without being told the certificates are
-development ones. The file names match Go's ``acemq-certs`` exactly — ``ca.crt``,
+Java, Go, Ruby and .NET generate the same three certificates with the same marker
+and enforce it the same way, so a broker set up by any of the five is usable from
+all of them and none of them will speak to it without being told the certificates
+are development ones. The file names match Go's ``acemq-certs`` exactly — ``ca.crt``,
 ``ca.key``, ``server.crt``, ``server.key``, ``client.crt``, ``client.key`` — so
 this is a drop-in replacement for it in a script such as ``tls-broker.sh``.
 
@@ -67,11 +67,11 @@ from typing import Any
 from .errors import AceMQError
 from .security import DEVELOPMENT_MARKER
 
-#: What the authority calls itself. The same string in Java, Go and .NET.
+#: What the authority calls itself. The same string in Java, Go, Ruby and .NET.
 AUTHORITY_NAME = "AceMQ development CA"
 
-#: What the client certificate calls itself. Java and Go both write this; .NET
-#: writes ``acemq-dev-client``, and nothing reads either.
+#: What the client certificate calls itself. Java, Go and Ruby all write this;
+#: .NET writes ``acemq-dev-client``, and nothing reads either.
 CLIENT_NAME = "acemq-client"
 
 #: How long a generated certificate lasts, in days.

@@ -6,6 +6,91 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 While the version is `0.x` the public API may change in any release.
 
+## [Unreleased]
+
+### Added
+
+- **`OutboxRelay` reports what it is doing, so a stopped relay is visible.** It
+  counts every record it handles on `acemq.outbox.total`, tagged
+  `outcome="published"` or `outcome="failed"`, and times every record it
+  publishes on `acemq.outbox.lag` — both through the connection's observer,
+  labelled with the record's `exchange` and `routing.key`. Java, Go and .NET
+  write the same two names.
+
+  A committed and unpublished row is a message that exists, is owed to somebody,
+  and appears in no queue depth anywhere, so until now a relay that had stopped
+  read from outside exactly like a service with nothing to send.
+
+  **The lag is measured from the record's own commit**, not from the sweep that
+  picked it up. What a lag answers is how long somebody has been owed this
+  message, so the wait for a sweep is part of the answer rather than the start of
+  it; timed from the sweep, a relay an hour behind reports the same handful of
+  milliseconds as one that is keeping up. A commit timestamp built without a
+  zone is read as UTC, and a commit clock ahead of the sweeping one reads as zero
+  rather than as a negative duration no histogram can hold.
+
+  Nothing has to be wired up: a relay left running under `start()` reports
+  without anybody calling `sweep()`. That is the whole point — the span-attribute
+  path documented below needs a caller holding a span, and a relay sweeping on
+  its own task has none.
+
+- **`METRIC_OUTBOX_TOTAL` and `METRIC_OUTBOX_LAG`** in `acemq_amqp.telemetry`,
+  re-exported from the package root, and both carrying a `HELP` line in
+  `PrometheusObserver`.
+
+### Changed
+
+- **`tracing.outbox_published(...)` is still application-only, and now says why
+  that is a smaller limitation than it read as.** The span attribute
+  `messaging.acemq.outbox_lag_ms` still cannot be written by the relay —
+  `publish_raw` is beneath the interceptor chain and so beneath the `publish`
+  span, and `start()` sweeps where nothing is current — but the measurement is no
+  longer lost with it, because a metric needs no span to land on. The method
+  remains what an application calls from inside a span of its own.
+
+### Fixed
+
+Documentation, all of it a claim the code stopped supporting.
+
+- **The metric-name compatibility claim was wider than the truth.** The README
+  and `docs/observability.md` both said the names here are Java's `MetricNames`
+  and that a dashboard built against one library reads against another, without
+  saying that six of Java's names are not written here at all:
+  `acemq.publish.duration`, `acemq.consume.attempts`, `acemq.request.duration`,
+  `acemq.request.total`, `acemq.pipeline.run.duration` and
+  `acemq.pipeline.run.total`. Every name that *is* written is Java's character
+  for character; the six that are not are now listed, with the reason for each,
+  because a dashboard panel that is empty looks the same as a service that has
+  stopped.
+
+- **The encrypted-body divergence table was missing Ruby**, which writes Java's
+  framing byte for byte. `docs/serialization.md` and
+  `acemq_amqp.codecs.encrypted` said "all four AceMQ libraries write four
+  different things"; it is five libraries writing three, and Python interoperates
+  with Java *and Ruby* rather than with Java alone.
+
+- **A relayed message produces no publish span and no `acemq.publish.total`**,
+  which nothing said. `publish_raw` puts the committed bytes on the wire
+  unchanged — the reason `record(...)` encodes inside the transaction — and both
+  the span and the counter live on the encoding path above it. Recorded in
+  `docs/observability.md` and `docs/patterns.md`, with `acemq.outbox.total` named
+  as the count to read instead.
+
+- **Ruby was missing from a dozen family claims** written when there were four
+  libraries: the development-certificate marker and the certificates it stamps,
+  the envelope fields, the rung arguments, the tracing system value, the
+  acknowledgement vocabulary and the retry acknowledgement's name. All verified
+  against `acemq-ruby-amqp` rather than assumed.
+
+- **`park(...)` and `reject(...)` were absent from the README's handler
+  vocabulary**, which showed only `accept()` and `retry()`. `park` was added in
+  0.5.0 and the README had never named it.
+
+- **The claim check was missing from the storage seams.** The README and
+  `docs/patterns.md` both said three patterns have a storage seam; there are
+  four, and `ClaimCheckStore` is the one that is synchronous and not in
+  `acemq_amqp.patterns.sql`.
+
 ## [0.5.0] - 2026-09-09
 
 ### Added

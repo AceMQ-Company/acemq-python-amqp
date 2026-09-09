@@ -20,8 +20,8 @@ much is failing and how long a handler takes are numbers nobody outside can see;
 whether the connection is really up — as opposed to a socket that is open and
 wedged — is a question only something holding the connection can ask.
 
-The metric names are the same in Java, Go, .NET and here, so a dashboard built
-against one library reads against another. Java publishes them through
+The metric names are the same in Java, Go, Ruby, .NET and here, so a dashboard
+built against one library reads against another. Java publishes them through
 Micrometer and .NET through ``System.Diagnostics.Metrics``; Python's standard
 library has no metrics interface at all, which is why this module defines a
 small one and calls it. Implement :class:`Observer` against Prometheus,
@@ -111,6 +111,31 @@ METRIC_RUNG_MISSING = "acemq.retry.rung.missing"
 #: which is the last thing between it and nothing. Labelled :data:`TAG_QUEUE` and
 #: :data:`TAG_TARGET`.
 METRIC_SET_ASIDE_FAILED = "acemq.messages.set.aside.failed"
+
+#: Outbox records the relay has handled, tagged with :data:`TAG_OUTCOME`:
+#: :data:`OUTCOME_PUBLISHED` or :data:`OUTCOME_FAILED`. Labelled
+#: :data:`TAG_EXCHANGE` and :data:`TAG_ROUTING_KEY` as well, because a relay
+#: drains one outbox into many destinations and "the relay is behind" is nearly
+#: always "the relay is behind *on one exchange*".
+METRIC_OUTBOX_TOTAL = "acemq.outbox.total"
+
+#: How long an outbox record waited between being committed and being published,
+#: in seconds. Recorded only for a record that went out, and carrying the same
+#: labels as :data:`METRIC_OUTBOX_TOTAL`.
+#:
+#: **The one number that reveals a stopped relay.** A committed, unpublished row
+#: is a message that exists, is owed to somebody, and appears in no queue depth
+#: anywhere: publish rates, consume rates and queue depths all read as a system
+#: with nothing to send, which is exactly what a system that has stopped sending
+#: looks like from outside.
+#:
+#: Measured from the record's own ``created_at`` — when the transaction that
+#: decided the message committed — and not from the start of the sweep that
+#: picked it up. The question a lag answers is how long somebody has been owed
+#: this message, so the wait for a sweep is part of the answer rather than the
+#: start of it; timed from the sweep, a relay that has been down for an hour
+#: reports the same handful of milliseconds as one that is keeping up.
+METRIC_OUTBOX_LAG = "acemq.outbox.lag"
 
 # ---------- tag names ----------
 #

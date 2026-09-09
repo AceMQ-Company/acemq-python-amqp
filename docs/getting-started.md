@@ -35,7 +35,8 @@ topology.
 
 Two names are worth reading twice. `retry` at the package root is the
 *acknowledgement* — what a handler returns to ask for another attempt — and it
-is what the Java, Go and .NET libraries call it too. The retry *policy* lives in
+is what the Java, Go, Ruby and .NET libraries call it too. The retry *policy*
+lives in
 `acemq_amqp.retry`, and `from acemq_amqp.retry import RetryPolicy` still reaches
 it; `exponential_retry`, `fixed_retry` and `no_retry` are re-exported from the
 root alongside `RetryPolicy` itself.

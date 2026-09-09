@@ -184,6 +184,37 @@ in the outbox, which is the entire point.
 
 `OutboxRelay` is an async context manager too.
 
+### Watching a relay that has stopped
+
+A relay that has stopped is invisible from outside. A committed, unpublished row
+is a message that exists and is owed to somebody and appears in no queue depth
+anywhere, so publish rates, consume rates and queue depths all read as a service
+with nothing to send — which is exactly what a service that has stopped sending
+looks like.
+
+So the relay says it itself, through the connection's observer:
+
+| | |
+|---|---|
+| `acemq.outbox.total` | one per record the sweep handled, tagged `outcome="published"` or `outcome="failed"` |
+| `acemq.outbox.lag` | seconds a published record waited, **measured from its commit** and not from the sweep that picked it up |
+
+Both carry the record's `exchange` and `routing.key`, and both come out of a
+relay left running under `start()` without anybody calling `sweep()`. Java, Go
+and .NET write the same two names.
+
+Measuring from the commit is the whole point: timed from the sweep, a relay that
+has been down for an hour reports the same handful of milliseconds as one that
+is keeping up.
+
+One thing the relay cannot report is a publish. `publish_raw` puts the
+committed bytes on the wire unchanged — which is why `record` encoded them
+inside the transaction — and the publish span and `acemq.publish.total` both
+live above it, so a relayed message raises neither. `acemq.outbox.total` counts
+the same messages under a name that says where they came from. See
+[the outbox lag](observability.md#the-outbox-lag-and-the-half-of-it-this-library-can-write)
+for the trace side, which an application can add and the relay cannot.
+
 ## Ordering
 
 A queue delivers in order and a consumer with `concurrency` above one stops
@@ -850,16 +881,17 @@ Java's accepts, so the two can share one mount.
 
 ## Stores that survive a restart
 
-Three of these patterns have a storage seam with an in-memory implementation:
-`IdempotencyStore`, `OutboxStore` and `SchemaRegistry`. Each of the in-memory
-versions says in its own docstring why it is not the one to use in production,
-and it is worth repeating here:
+Four of these patterns have a storage seam with an in-memory implementation:
+`IdempotencyStore`, `OutboxStore`, `SchemaRegistry` and `ClaimCheckStore`. Each
+of the in-memory versions says in its own docstring why it is not the one to use
+in production, and it is worth repeating here:
 
 | | |
 |---|---|
 | `InMemoryIdempotencyStore` | right behind one consumer, wrong the moment there are two — each has its own memory, so both believe they are first. Lost on restart, which turns every message in flight into a duplicate |
 | `InMemoryOutboxStore` | has none of the property the pattern exists for. Nothing here shares a transaction with a database, so a crash between the work committing and the record being written loses the message exactly as publishing directly would |
 | `InMemorySchemaRegistry` | not shared between processes, so a consumer cannot look up a schema a producer registered somewhere else — which is the entire point of having one |
+| `InMemoryClaimCheckStore` | holds the payloads in the publisher's own memory, which is where they were going to be anyway — so it takes them off the broker and does nothing else, and every consumer in another process is told the claim check is not in the store |
 
 They are for tests, and for seeing the shape of the thing before writing the
 version that matters. Each seam is a `Protocol` with two to four methods, so the
@@ -867,7 +899,12 @@ real one is a small class over whatever database the service already has — and
 for the outbox and the idempotency store, it must be *that* database, in *that*
 transaction, or the gap the pattern exists to close is still open.
 
-That class ships, in `acemq_amqp.patterns.sql`:
+The claim check is the exception to that: its seam is synchronous, because a
+`Codec` is called from inside both the async and the blocking API, and what it
+holds is the payloads a broker would not carry —
+[`FilesystemClaimCheckStore`](#the-stores) is what ships for it.
+
+The other three ship as SQL, in `acemq_amqp.patterns.sql`:
 
 ```python
 import sqlite3

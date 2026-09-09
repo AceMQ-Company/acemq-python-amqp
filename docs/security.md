@@ -252,9 +252,9 @@ usually ends up in a repository, so a certificate that *could* reach production
 would be an authority anybody who can read that repository can issue against —
 and the failure would be silent, because the connection succeeds.
 
-Java, Go and .NET stamp the same string and enforce it the same way, so a broker
-set up by any of the four is reachable from all of them and none of them will
-speak to it without being told.
+Java, Go, Ruby and .NET stamp the same string and enforce it the same way, so a
+broker set up by any of the five is reachable from all of them and none of them
+will speak to it without being told.
 
 Two checks, because a development certificate arrives from two directions. The
 files this configuration *names* are read when the TLS context is built, where

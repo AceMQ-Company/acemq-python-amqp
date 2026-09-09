@@ -47,6 +47,8 @@ from .telemetry import (
     METRIC_CONSUME_IN_FLIGHT,
     METRIC_CONSUME_TOTAL,
     METRIC_DEAD_LETTERED_TOTAL,
+    METRIC_OUTBOX_LAG,
+    METRIC_OUTBOX_TOTAL,
     METRIC_PUBLISH_TOTAL,
     METRIC_RETRIED_TOTAL,
     METRIC_RUNG_MISSING,
@@ -59,6 +61,13 @@ from .telemetry import (
 #: Reaching to a minute because a handler that talks to something slow really
 #: does take that long, and a histogram whose top bucket is one second reports
 #: every one of those as "over a second" and nothing more useful.
+#:
+#: They serve every duration this observer is given, which includes
+#: :data:`~acemq_amqp.telemetry.METRIC_OUTBOX_LAG` — where a minute is not the
+#: interesting end of the range, because a relay that has been down for an hour
+#: is publishing hour-old records. The overflow bucket still shows it, and the
+#: histogram's ``_sum`` over ``_count`` gives the mean lag exactly; a process
+#: that wants the shape of a long lag as well passes its own ``buckets``.
 DEFAULT_DURATION_BUCKETS = (
     0.005,
     0.01,
@@ -191,6 +200,8 @@ _HELP = {
     METRIC_DEAD_LETTERED_TOTAL: "Messages sent to a dead-letter or parking queue",
     METRIC_RUNG_MISSING: "Long retries that waited in the consumer for want of a rung queue",
     METRIC_SET_ASIDE_FAILED: "Messages that could not be moved out of the way",
+    METRIC_OUTBOX_TOTAL: "Outbox records the relay has handled, by outcome",
+    METRIC_OUTBOX_LAG: "How long an outbox record waited to be published, in seconds",
 }
 
 

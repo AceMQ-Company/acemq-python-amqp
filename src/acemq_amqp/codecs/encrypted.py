@@ -46,16 +46,17 @@ identifier makes the message fail to open rather than quietly opening as
 something else. :func:`key_id_of` reads it back without needing any key, which
 is what an operator staring at an unreadable dead-letter queue actually wants.
 
-This is the Java framing, byte for byte, and Java is the only other library it
-interoperates with. **All four AceMQ libraries currently write something
-different under this one content type**, which is recorded here rather than
-smoothed over because a consumer cannot tell which it is about to be handed:
+This is the Java framing, byte for byte, and Java and Ruby are the libraries it
+interoperates with. **The five AceMQ libraries write three different things
+under this one content type**, which is recorded here rather than smoothed over
+because a consumer cannot tell which it is about to be handed:
 
 ===========  ======  =======  ==========  ==========  ================  ==========
 library      magic   version  id length   iv          cipher            tag
 ===========  ======  =======  ==========  ==========  ================  ==========
 Java         0xAE    0x01     1 byte      12-byte     AES-GCM           16 bytes
 **Python**   0xAE    0x01     1 byte      12-byte     AES-GCM           16 bytes
+Ruby         0xAE    0x01     1 byte      12-byte     AES-GCM           16 bytes
 Go           none    0x01     2, big-end  12-byte     AES-GCM           16 bytes
 .NET         none    0x01     1 byte      16-byte     AES-256-CBC       HMAC-SHA-256,
                                                       then HMAC         32 bytes
