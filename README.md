@@ -222,8 +222,9 @@ deployed configuration. See [Security](docs/security.md#development-certificates
 **Identical**, because a message crosses languages: the reserved header names
 and their types, the defaults applied when they are absent, the retry schedule
 arithmetic, the `{queue}.dlq` / `{queue}.parked` / `{queue}.retry.{delay}`
-naming, the queue type and arguments each of those is declared with, and the
-rules for giving up.
+naming, the queue type and arguments each of those is declared with, the rules
+for giving up, and where a request says to send its answer — the `acemq-reply-to`
+header and AMQP's own `reply-to` property, both written, header read first.
 
 **Not identical**, deliberately: the API shape. Go gets `ctx`, .NET gets
 `IAsyncEnumerable`, and Python gets dataclasses, `async with` and type hints.
@@ -521,15 +522,15 @@ That matters as soon as one reads what another wrote.
 
 | | |
 |---|---|
-| `PublishContext` | `exchange`, `routing_key`, `envelope`, `payload`, `persistent`, `mandatory`, and `set_header(...)`. Seen **before the codec runs**, so the payload can be changed and not only its metadata |
-| `ConsumeContext` | `queue`, `envelope`, `payload`, `body`, `content_type`, `routing_key`, `redelivered`, a `state` dict this library never reads, and `when_settled(...)` |
+| `PublishContext` | `exchange`, `routing_key`, `envelope`, `payload`, `persistent`, `mandatory`, `reply_to`, and `set_header(...)`. Seen **before the codec runs**, so the payload can be changed and not only its metadata |
+| `ConsumeContext` | `queue`, `envelope`, `payload`, `body`, `content_type`, `routing_key`, `redelivered`, `reply_to`, a `state` dict this library never reads, and `when_settled(...)` |
 
 **`when_settled` is how an interceptor learns what really happened.** The `Ack`
 it sees on the way out is what the handler *asked for*: a handler asking for
 another attempt when there are none left is dead-lettered, and an interceptor
 recording the `Ack` would report a retry that never happened. A listener
 registered with `when_settled` is told the `Settlement` — `acked`, `retried`,
-`rejected` or `dead_lettered`, with the delay chosen or the reason given — once,
+`rejected`, `dead_lettered` or `parked`, with the delay chosen or the reason given — once,
 after the consumer decides and before it acts. It returns `False` when nothing
 is driving the chain and no answer is coming.
 
@@ -585,11 +586,11 @@ one reads against another:
 
 | Metric | |
 |---|---|
-| `acemq.messages.published` / `.publish.failed` | Handed to the broker, and not. Labelled by exchange and key |
+| `acemq.messages.published` / `.publish.failed` | Handed to the broker, and not. Labelled `exchange` and `routing.key` |
 | `acemq.messages.consumed` | Delivered to a handler. Labelled by queue |
 | `acemq.messages.accepted` / `.retried` / `.rejected` | What handlers decided. A retry says `where`: `consumer` or `broker` |
 | `acemq.messages.dead.lettered` | Ran out of attempts and went to `{queue}.dlq` |
-| `acemq.messages.parked` | Never reached the handler and went to `{queue}.parked` |
+| `acemq.messages.parked` | Went to `{queue}.parked`: the body would not decode, or a handler returned `park(...)` |
 | `acemq.handler.duration` | Seconds, timed around the interceptors as well as the handler |
 | `acemq.messages.in.flight` | Being handled right now |
 | `acemq.retry.rung.missing` | **Worth an alert.** A long retry that had to wait in the consumer because its rung queue is not on the broker |
@@ -661,8 +662,9 @@ the same two.
 | `<destination> request` | `CLIENT` — because that one *waits*, so its duration measures a responder rather than a broker |
 
 `unroutable`, `failed` and `dead_lettered` set the span status to `ERROR`; the
-others, `retried` included, do not — a retry is the system working, and a wall of
-red traces that turned out fine is how people learn to ignore the colour.
+others, `retried` and `parked` included, do not — a retry is the system working,
+a park is a decision a handler made on purpose, and a wall of red traces that
+turned out fine is how people learn to ignore the colour.
 
 **The outcome is the consumer's decision, not the handler's answer**, and so is
 the counter beside it. A `process` span stays open past the handler and takes
@@ -702,7 +704,7 @@ from acemq_amqp.patterns import InMemoryIdempotencyStore, chain, idempotent, wit
 |---|---|
 | `idempotent(store, handler)` | Handle a message once however many times it arrives. A duplicate is **accepted**, not rejected: the work was done |
 | `record(...)` / `OutboxRelay` | Write the message into the same transaction as the work, and let a relay publish what was committed |
-| `Requester` / `serve(...)` | Ask a question and wait for the answer. A responder's failure comes back as a failure, not as a timeout |
+| `Requester` / `serve(...)` | Ask a question and wait for the answer. A responder's failure comes back as a failure, not as a timeout. The return address is written to both the `acemq-reply-to` header and AMQP's own `reply-to` property, and read header-first, so any of the five can call any other |
 | `replay(...)` | Put dead letters back, with a filter, a limit and a deadline, and a report of what it did and why it stopped |
 | `ordered(key, handler)` | Keep one entity's messages in sequence while everything else runs at once |
 | `ConsumerGroup` | Several consumers over one queue, started and stopped as one thing |

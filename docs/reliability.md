@@ -29,7 +29,14 @@ Two queues, and they are different on purpose:
 | | |
 |---|---|
 | `{queue}.dlq` | ran out of attempts, was rejected, or was marked fatal. Usually the world |
-| `{queue}.parked` | never reached the handler at all — the body would not decode. Usually a producer |
+| `{queue}.parked` | nothing could read it: the body would not decode, or a handler returned `park(...)`. Usually a producer |
+
+The parked queue is reached two ways and they mean the same thing. The engine
+parks a body its codec refuses, before any handler runs; a handler that gets
+one layer further in and finds a schema it was never taught returns
+[`park(error)`](consuming.md#reject-or-park) and lands in the same place. Both
+count on `acemq.messages.parked`, and neither is filed with the dead letters —
+which is the entire reason there are two queues.
 
 `Topology().queue(name, dead_letter=True)` declares both, and **so does the
 consumer, when it starts**. A library that parks messages into a queue nobody

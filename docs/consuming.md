@@ -15,14 +15,15 @@ subscribing is a round trip to the broker.
 ## The decision is the return value
 
 ```python
-from acemq_amqp import accept, reject, retry
+from acemq_amqp import accept, park, reject, retry
 
 accept()                 # done. Acknowledged and gone
 retry(error)             # try again, if the policy has an attempt left
 reject(error)            # do not try again. Straight to {queue}.dlq
+park(error)              # unreadable. Straight to {queue}.parked
 ```
 
-Three functions returning an `Ack`, not three exceptions and not a mutable
+Four functions returning an `Ack`, not four exceptions and not a mutable
 parameter. The value carries the error with it, and that error is what ends up
 in `x-acemq-error` on the dead letter, so an operator draining
 `shipping.orders.dlq` reads *why* rather than only *that*:
@@ -66,6 +67,31 @@ message this consumer is not the right version to read.
 
 A rejected message goes to `{queue}.dlq` immediately, with no attempts spent.
 
+### Reject or park?
+
+`reject` is *understood, and refused* — a bad request. `park` is *never
+understood at all*: a body in a shape nothing here can make sense of, a schema
+version this service was not taught, a field whose type is not what the name
+says it is anywhere.
+
+A parked message goes to `{queue}.parked` immediately, which is the queue the
+engine already uses for a body its codec could not decode. Keeping the two apart
+is the whole reason that queue exists. Everything in `{queue}.dlq` is a message
+this service understood and could not process — usually a business problem, and
+usually transient in aggregate. Everything in `{queue}.parked` is a message
+nobody could read — almost always one producer emitting rubbish, and findable in
+seconds so long as it is not filed among the thousands that merely ran out of
+attempts.
+
+```python
+if message.payload.get("schema") not in KNOWN_VERSIONS:
+    return park(ValueError(f"schema {message.payload.get('schema')} is not one this service reads"))
+```
+
+`park` was added so a handler could reach that queue at all. Before it, a
+handler that knew a message was unreadable had to `reject` it into the dead
+letters and lose the distinction.
+
 ## What the handler receives
 
 `Message` is a frozen dataclass:
@@ -78,6 +104,7 @@ A rejected message goes to `{queue}.dlq` immediately, with no attempts spent.
 | `content_type` | what the producer said the body was, or `None` |
 | `redelivered` | the broker's flag: this delivery has been attempted before |
 | `body` | the raw bytes, before the codec |
+| `reply_to` | AMQP's own `reply-to` property, or `""`. See [request and reply](patterns.md#request-and-reply) |
 
 `redelivered` is the broker's own flag and is not the same as
 `envelope.attempt`. The attempt count is on the message and advances when this

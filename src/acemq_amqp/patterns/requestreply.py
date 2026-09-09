@@ -21,11 +21,20 @@ slows down turns into a caller that stops responding. Reach for it where the
 caller genuinely cannot continue without the answer, and publish an event
 otherwise.
 
-The pairing is the envelope's correlation identifier, and the return address is
-an ordinary application header. Neither uses AMQP's own ``reply-to`` and
-``correlation-id`` properties: those are lost the moment a message passes through
-a service that rebuilds it, and the envelope is the thing this library promises
-to carry end to end.
+The pairing is the envelope's correlation identifier, which does not use AMQP's
+own ``correlation-id`` property: that is lost the moment a message passes
+through a service that rebuilds it, and the envelope is the thing this library
+promises to carry end to end.
+
+The return address is written twice, and read either way round. A request
+carries the ``acemq-reply-to`` header *and* AMQP's own ``reply-to`` property,
+set to the same queue; a responder reads the header first and falls back to the
+property. All five libraries do exactly this, in that order, and the reason is
+that they did not use to: Python, Go and Ruby wrote only the header while Java
+and .NET read only the property, so a Java caller and a Python responder could
+not talk at all. Writing both and reading either makes every one of the
+twenty-five caller/responder pairs work, and keeps what the header was for — it
+is the one of the two that survives a service rebuilding the message.
 """
 
 from __future__ import annotations
@@ -46,9 +55,10 @@ from ..topology import Topology
 
 #: Where a responder should send its answer.
 #:
-#: An application header rather than AMQP's ``reply-to`` property, so it travels
-#: through the same envelope machinery as everything else and survives a hop
-#: through a service that rebuilds the message. It deliberately carries no
+#: An application header *as well as* AMQP's ``reply-to`` property, and the one
+#: a responder reads first. It travels through the same envelope machinery as
+#: everything else and survives a hop through a service that rebuilds the
+#: message, which the native property does not. It deliberately carries no
 #: ``x-acemq-`` prefix: that namespace belongs to the engine and is stripped
 #: before a handler sees it, so a responder could never read this one.
 HEADER_REPLY_TO = "acemq-reply-to"
@@ -215,7 +225,12 @@ class Requester:
         # reply before send() has returned.
         self._waiting[correlation] = waiter
         try:
-            await self._publisher.send(request, envelope=outgoing)
+            # Both addresses, the same value. The header is what a Python, Go or
+            # Ruby responder reads first; the native property is what a Java or
+            # .NET one reads, and without it those two would answer nowhere.
+            await self._publisher.send(
+                request, envelope=outgoing, reply_to=self._reply_queue
+            )
             answer = await asyncio.wait_for(waiter, deadline.total_seconds())
         except RequestTimeoutError:
             # Already one of ours, from :meth:`close` failing what was still
@@ -310,14 +325,20 @@ async def serve(
     """
 
     async def handle(request: Message) -> Ack:
-        reply_to = str(request.envelope.headers.get(HEADER_REPLY_TO) or "")
+        # Header first, native property second — the same order in all five
+        # libraries. A caller written against this library sets both; one
+        # written against Java or .NET sets only the property; and a request
+        # that came through a service which rebuilt the message has only the
+        # header left. Reading either answers all three.
+        reply_to = str(request.envelope.headers.get(HEADER_REPLY_TO) or "") or request.reply_to
         if not reply_to:
             # Retrying cannot make a return address appear, so this is
             # dead-lettered rather than looped.
             return reject(
                 FatalError(
-                    f"acemq: request {request.envelope.id} carries no {HEADER_REPLY_TO} "
-                    "header, so there is nowhere to reply"
+                    f"acemq: request {request.envelope.id} carries neither a "
+                    f"{HEADER_REPLY_TO} header nor a reply-to property, so there "
+                    "is nowhere to reply"
                 )
             )
 

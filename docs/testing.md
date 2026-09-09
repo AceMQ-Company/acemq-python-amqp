@@ -33,8 +33,8 @@ async def test_it_ships_an_order():
 ```
 
 `Ack` carries the action and the error, and prints itself, so an assertion that
-fails says what the handler decided. `accept()`, `retry(e)` and `reject(e)`
-compare equal to each other by value, being a frozen dataclass, so
+fails says what the handler decided. `accept()`, `retry(e)`, `reject(e)` and
+`park(e)` compare equal to each other by value, being a frozen dataclass, so
 `assert await ship(message) == accept()` works too.
 
 This is the test to write most of. Everything else on this page is about the

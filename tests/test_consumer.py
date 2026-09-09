@@ -32,21 +32,31 @@ import pytest
 from fake_transport import FakeTransport
 
 from acemq_amqp import (
+    METRIC_DEAD_LETTERED,
+    METRIC_PARKED,
+    METRIC_REJECTED,
     Ack,
     Envelope,
     FatalError,
     JsonCodec,
     Message,
+    Metrics,
+    Observer,
     RetryPolicy,
+    Settlement,
     accept,
     fixed_retry,
     headers,
     no_retry,
+    park,
     reject,
     retry,
 )
+from acemq_amqp.ack import OUTCOME_PARKED
 from acemq_amqp.codec import Codec
 from acemq_amqp.connection import Connection, Handler
+from acemq_amqp.interceptors import ConsumeContext, ConsumeInterceptor, ConsumeNext
+from acemq_amqp.telemetry import metric_key
 from acemq_amqp.topology import (
     DEAD_LETTER_EXCHANGE,
     RETRY_EXCHANGE,
@@ -70,6 +80,8 @@ async def running(
     declare_dead_letter: bool = True,
     declare_rungs: bool = True,
     declare: bool = True,
+    observer: Observer | None = None,
+    interceptor: ConsumeInterceptor | None = None,
 ) -> AsyncIterator[FakeTransport]:
     """A consumer on a fake broker, closed again afterwards.
 
@@ -89,7 +101,11 @@ async def running(
         )
         .apply(transport)
     )
-    connection = Connection(transport, retry=policy, codec=codec or JsonCodec())
+    connection = Connection(
+        transport, retry=policy, codec=codec or JsonCodec(), observer=observer
+    )
+    if interceptor is not None:
+        connection.intercept_consume(interceptor)
     await connection.consume(QUEUE, handler, declare=declare)
     try:
         yield transport
@@ -193,6 +209,70 @@ async def test_rejecting_dead_letters_with_the_reason() -> None:
     # republished, so the original is a copy that has been dealt with.
     assert settlement.acked is True
     assert settlement.nacked is False
+
+
+async def test_parking_sets_the_message_aside_rather_than_dead_lettering_it() -> None:
+    # The distinction the parked queue exists to make. Before a handler could
+    # ask for this, one that knew a message was unreadable had to reject it into
+    # the dead letters, where it sat among the messages that had merely run out
+    # of luck and could only be told apart by hand.
+    async def handler(message: Message) -> Ack:
+        return park(ValueError("schema version 9, and this service knows up to 4"))
+
+    async with running(handler) as transport:
+        settlement = await transport.deliver(QUEUE, b"{}", headers=wire(Envelope()))
+
+    parked = transport.sent_to(PARKED)
+    assert len(parked) == 1
+    reason = parked[0].headers[headers.ERROR]
+    assert "the handler parked it" in reason
+    assert "schema version 9" in reason
+    # And nowhere near the dead letters.
+    assert transport.sent_to(DLQ) == []
+    # Acknowledged for the same reason a dead-lettered message is: the original
+    # is a copy of something already safely republished.
+    assert settlement.acked is True
+    assert settlement.nacked is False
+
+
+async def test_a_parked_message_is_counted_as_parked_and_not_as_dead_lettered() -> None:
+    metrics = Metrics()
+
+    async def handler(message: Message) -> Ack:
+        return park(ValueError("nothing here is readable"))
+
+    async with running(handler, observer=metrics) as transport:
+        await transport.deliver(QUEUE, b"{}", headers=wire(Envelope()))
+
+    labels = {"queue": QUEUE}
+    # The same counter the engine already used for a body that would not decode.
+    # One parked queue, one parked counter, whether the codec or the handler was
+    # the one that could not read it.
+    assert metrics.counts[metric_key(METRIC_PARKED, labels)] == 1
+    assert metric_key(METRIC_DEAD_LETTERED, labels) not in metrics.counts
+    assert metric_key(METRIC_REJECTED, labels) not in metrics.counts
+
+
+async def test_a_parked_message_says_parked_on_its_settlement() -> None:
+    # What the span reads, because the tracing adapter takes its outcome from
+    # the settlement and never from the handler's Ack.
+    seen: list[Settlement] = []
+
+    async def watching(context: ConsumeContext, call_next: ConsumeNext) -> Ack:
+        context.when_settled(seen.append)
+        return await call_next(context)
+
+    async def handler(message: Message) -> Ack:
+        return park(ValueError("unreadable"))
+
+    async with running(handler, interceptor=watching) as transport:
+        await transport.deliver(QUEUE, b"{}", headers=wire(Envelope()))
+
+    assert [settlement.outcome for settlement in seen] == [OUTCOME_PARKED]
+    # Parked is not dead-lettered, and the property that decides which queue an
+    # operator goes looking in has to agree.
+    assert seen[0].dead_lettered is False
+    assert seen[0].parked is True
 
 
 async def test_retrying_with_no_policy_dead_letters_and_says_why() -> None:

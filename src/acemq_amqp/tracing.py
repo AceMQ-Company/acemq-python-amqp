@@ -108,6 +108,7 @@ from typing import TYPE_CHECKING, Any
 from .ack import (
     OUTCOME_ACKED,
     OUTCOME_DEAD_LETTERED,
+    OUTCOME_PARKED,
     OUTCOME_REJECTED,
     OUTCOME_RETRIED,
     Ack,
@@ -200,10 +201,11 @@ OUTCOME_ANSWERED = "answered"
 #: same two words.
 OUTCOME_TIMED_OUT = "timed_out"
 
-# The four a delivery can end in — ``acked``, ``retried``, ``rejected`` and
-# ``dead_lettered`` — are defined in :mod:`acemq_amqp.ack` and re-exported here,
-# because the consumer decides them and this only writes them down. They keep
-# their names: ``tracing.OUTCOME_DEAD_LETTERED`` is where people look for them.
+# The five a delivery can end in — ``acked``, ``retried``, ``rejected``,
+# ``dead_lettered`` and ``parked`` — are defined in :mod:`acemq_amqp.ack` and
+# re-exported here, because the consumer decides them and this only writes them
+# down. They keep their names: ``tracing.OUTCOME_DEAD_LETTERED`` is where
+# people look for them.
 
 #: The outcomes that make a span an error, and only these.
 #:
@@ -219,6 +221,12 @@ OUTCOME_TIMED_OUT = "timed_out"
 #: and sets the error status from it. Same colour, with the deadline in the
 #: description rather than the bare word — and the set stays character-identical
 #: to Java's.
+#:
+#: ``parked`` is absent for the same reason ``rejected`` is: a handler that
+#: parks a message decided to, on purpose, having read it. The counter
+#: ``acemq.messages.parked`` and the queue itself are what an operator watches
+#: for those; painting the trace red as well would make a deliberate decision
+#: look like a fault.
 ERROR_OUTCOMES = frozenset({OUTCOME_UNROUTABLE, OUTCOME_FAILED, OUTCOME_DEAD_LETTERED})
 
 #: The events recorded on the current span rather than as spans of their own.
@@ -231,6 +239,7 @@ _ACK_OUTCOMES = {
     Action.ACCEPT: OUTCOME_ACKED,
     Action.RETRY: OUTCOME_RETRIED,
     Action.REJECT: OUTCOME_REJECTED,
+    Action.PARK: OUTCOME_PARKED,
 }
 
 

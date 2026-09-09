@@ -97,6 +97,7 @@ from acemq_amqp.codecs.yaml import YamlCodec
 from acemq_amqp.patterns import (
     HEADER_REPLAY_COUNT,
     HEADER_REPLAYED_FROM,
+    HEADER_REPLY_TO,
     HEADER_ROUTING_SLIP,
     NOTHING,
     ClaimCheckCodec,
@@ -908,7 +909,7 @@ async def test_metrics_count_a_real_round_trip(
             "the message was accepted",
         )
 
-    published = metric_key(METRIC_PUBLISHED, {"exchange": "", "key": queue})
+    published = metric_key(METRIC_PUBLISHED, {"exchange": "", "routing.key": queue})
     assert metrics.counts[published] == 1
     assert metrics.counts[metric_key(METRIC_CONSUMED, {"queue": queue})] == 1
     assert metrics.durations[metric_key(METRIC_HANDLER_DURATION, {"queue": queue})].count == 1
@@ -1241,6 +1242,45 @@ async def test_a_question_over_a_queue_comes_back_answered(
         # caller waiting out its whole timeout to learn nothing.
         with pytest.raises(ResponderError, match="no such sku"):
             await caller.ask({"sku": "gone"})
+
+
+async def test_a_caller_that_sets_only_the_native_reply_to_is_answered(
+    mq: Connection, workspace: Workspace
+) -> None:
+    """A Java or .NET requester, spelled out on the wire.
+
+    Those two set AMQP's own ``reply-to`` property and never the
+    ``acemq-reply-to`` header, so this is the exact shape of request a Python
+    responder used to have nowhere to send an answer to. It goes through a real
+    broker rather than the fake because the property is the half of the
+    contract the fake cannot vouch for: it has to survive being written by
+    aio-pika, carried by RabbitMQ and read back off the delivery.
+    """
+    requests = await workspace.queue("native-requests")
+    replies = await workspace.queue("native-replies")
+
+    async def price(message: Message) -> dict[str, object]:
+        # No header at all, and the responder still knows where to answer.
+        assert HEADER_REPLY_TO not in message.envelope.headers
+        assert message.reply_to == replies
+        return {"pence": 250}
+
+    async with await serve(mq, requests, price):
+        await mq.publish_raw(
+            "",
+            requests,
+            Outbound(
+                body=b'{"sku": "A-1"}',
+                content_type="application/json",
+                message_id="native-1",
+                reply_to=replies,
+                headers=Envelope(id="native-1", correlation_id="cart-9").to_headers(),
+            ),
+        )
+        answer = (await collect(mq, replies))[0]
+
+    assert answer.payload == {"pence": 250}
+    assert answer.envelope.correlation_id == "cart-9"
 
 
 async def test_a_routing_slip_visits_every_stop_on_a_real_broker(

@@ -10,6 +10,29 @@ While the version is `0.x` the public API may change in any release.
 
 ### Added
 
+- **`park(error)` joins `accept`, `retry` and `reject` in the handler's
+  vocabulary.** It settles the message onto `{queue}.parked`, counts on
+  `acemq.messages.parked`, and puts `parked` on the delivery's `process` span.
+  The engine could already park — a body its codec refuses goes there before
+  any handler runs — but a handler could not ask for it, so one that got a layer
+  further in and found a schema it was never taught had to `reject` the message
+  into the dead letters and lose the distinction the parked queue exists to
+  make. `reject` is *understood, and refused*; `park` is *never understood at
+  all*, and mixing the two means whoever drains `{queue}.dlq` has to sort the
+  producer emitting rubbish out of the thousands that merely ran out of
+  attempts. `Settlement.parked` is the property for it, and
+  `Settlement.dead_lettered` is deliberately **false** for a parked message: it
+  went to a different queue. Go and Ruby are adding the same word.
+
+- A parked span is **not** an `ERROR`, for the same reason `rejected` is not: it
+  is a decision a handler made on purpose. `acemq.messages.parked` and the queue
+  itself are what an operator watches for those.
+
+- **`Message.reply_to`**, and `reply_to` on `Outbound`, `Delivery`,
+  `PublishContext`, `ConsumeContext` and `Publisher.send(...)` — AMQP's own
+  `reply-to` property, which this library previously neither wrote nor read.
+  See the request-and-reply entry under **Changed**.
+
 - **Payload encryption: `acemq_amqp.codecs.encrypted`, behind the `[crypto]`
   extra.** `EncryptedCodec` wraps any other codec and encrypts what it produced,
   so the broker, its disk, its backups and its management interface hold
@@ -274,6 +297,41 @@ While the version is `0.x` the public API may change in any release.
   hand with no consumer driving it.
 
 ### Changed
+
+- **A request now carries its return address twice, and a responder reads
+  either.** `Requester.ask` sets AMQP's own `reply-to` property *and* the
+  `acemq-reply-to` header to the same queue; `serve` reads the header first and
+  falls back to the property. All five libraries do exactly this, in that order.
+
+  Before this, request and reply **did not work across the family at all**.
+  Python, Go and Ruby wrote only the header; Java and .NET read only the native
+  property. A Java or .NET caller reaching a Python responder had its request
+  dead-lettered for carrying no return address, and a Python caller reaching a
+  Java responder was never answered. No fixture covered the pair, which is how
+  it survived. Writing both and reading either makes all twenty-five
+  caller/responder combinations work.
+
+  The header is kept rather than replaced because it is the half that survives a
+  service which rebuilds the message; the property is what the other four read.
+  Header first is the agreed order, so a request republished under a new reply
+  queue by an intermediary goes where the intermediary said. `Message.reply_to`
+  exposes the property to a handler writing its own responder, and the transport
+  protocol carries it in both directions — `Outbound.reply_to` out,
+  `Delivery.reply_to` in. A transport that cannot report it leaves it empty and
+  the header path is unaffected.
+
+- **The publish counters are tagged `routing.key`, not `key`.**
+  `acemq.messages.published` and `acemq.messages.publish.failed` are labelled
+  `exchange` and `routing.key`; the tag used to be `key`. Java and .NET both
+  spell the fully-qualified name (`MetricNames.TAG_ROUTING_KEY`), Java is the
+  reference, and Go is moving in parallel — so this is Python and Go aligning on
+  the name three of the five already used rather than a new invention.
+
+  **This changes a label an existing dashboard may group by.** In Prometheus the
+  rendered label goes from `key="order.placed"` to `routing_key="order.placed"`,
+  so a query reading `acemq_messages_published{key=...}` or grouping `by (key)`
+  needs the name changed. Nothing else about the counter moves: same metric
+  names, same `exchange` tag, same values. Consumer-side counters are untouched.
 
 - **The tracer is registered as `org.acemq.amqp` rather than `acemq_amqp`**, and
   the `pipeline.run_finished` event's keys are `pipeline`, `step` and `outcome`

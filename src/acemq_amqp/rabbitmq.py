@@ -171,6 +171,11 @@ class RabbitMQTransport:
             headers=dict(message.headers),
             content_type=message.content_type or None,
             message_id=message.message_id or None,
+            # ``None`` rather than an empty string, because AMQP's reply-to is
+            # absent or set and "set to nothing" is neither. A responder in
+            # another language reads the property and would take "" for an
+            # address.
+            reply_to=message.reply_to or None,
             delivery_mode=(
                 aio_pika.DeliveryMode.PERSISTENT
                 if message.persistent
@@ -317,4 +322,5 @@ def _delivery(incoming: AbstractIncomingMessage) -> Delivery:
         redelivered=bool(incoming.redelivered),
         ack=ack,
         nack=nack,
+        reply_to=incoming.reply_to or "",
     )

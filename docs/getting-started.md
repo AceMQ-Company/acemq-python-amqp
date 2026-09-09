@@ -144,6 +144,7 @@ effect on a parameter:
 | `accept()` | done. The message is acknowledged and gone |
 | `retry(error)` | try again, if the policy has an attempt left |
 | `reject(error)` | do not try again. Straight to `{queue}.dlq` |
+| `park(error)` | nothing could read it. Straight to `{queue}.parked` |
 
 A handler that raises is treated as `retry` with that exception, because in
 Python an exception is how a thing says it failed and most failures it carries

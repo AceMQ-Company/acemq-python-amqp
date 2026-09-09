@@ -40,6 +40,7 @@ from . import naming
 from .ack import (
     OUTCOME_ACKED,
     OUTCOME_DEAD_LETTERED,
+    OUTCOME_PARKED,
     OUTCOME_REJECTED,
     OUTCOME_RETRIED,
     Ack,
@@ -109,6 +110,10 @@ class Message:
     :param content_type: what the sender said the body was, or ``None``
     :param redelivered: the broker saying it has handed this one over before
     :param body: the undecoded bytes, for a handler that wants to see them
+    :param reply_to: AMQP's own ``reply-to`` property, empty when the sender set
+        none. A responder reads it as the fallback behind the
+        ``acemq-reply-to`` header, which is what lets a Java or .NET caller —
+        neither of which writes the header — be answered by a Python responder
     """
 
     payload: Any
@@ -117,6 +122,7 @@ class Message:
     content_type: str | None
     redelivered: bool
     body: bytes
+    reply_to: str = ""
 
 
 #: What a handler is. Returning an :class:`~acemq_amqp.Ack` is the decision.
@@ -166,6 +172,7 @@ class Publisher:
         *,
         envelope: Envelope | None = None,
         routing_key: str | None = None,
+        reply_to: str = "",
     ) -> PublishResult:
         """Publishes one message.
 
@@ -179,6 +186,11 @@ class Publisher:
             derived from another
         :param routing_key: what to publish under, for a publisher bound to an
             exchange rather than to one key
+        :param reply_to: where an answer should come back to, written to AMQP's
+            own ``reply-to`` property. Only :mod:`~acemq_amqp.patterns` request
+            and reply sets it, and it sets the ``acemq-reply-to`` header to the
+            same value: the header is what survives a service that rebuilds the
+            message, the property is what the other four libraries read
         :returns: what the broker said
         :raises PublishError: when the publisher is mandatory and the message
             reached no queue
@@ -199,6 +211,7 @@ class Publisher:
             payload=payload,
             persistent=self._persistent,
             mandatory=self._mandatory,
+            reply_to=reply_to,
         )
         # Read here rather than at construction, so an interceptor registered
         # during start-up applies to the publishers that already exist. Building
@@ -212,7 +225,10 @@ class Publisher:
         # run leaves an interceptor with bytes and nothing it can do to them.
         body = self._codec.encode(context.payload)
         observer = self._connection.observer
-        labels = {"exchange": context.exchange, "key": context.routing_key}
+        # ``routing.key`` and not ``key``: Java and .NET both tag a publish with
+        # the fully-qualified name, and a dashboard that groups by it should
+        # read the same in all five languages.
+        labels = {"exchange": context.exchange, "routing.key": context.routing_key}
 
         try:
             result = await self._connection.publish_raw(
@@ -222,6 +238,7 @@ class Publisher:
                     body=body,
                     content_type=self._codec.content_type,
                     message_id=context.envelope.id,
+                    reply_to=context.reply_to,
                     headers=context.envelope.to_headers(routing_key=context.routing_key),
                     persistent=context.persistent,
                     mandatory=context.mandatory,
@@ -419,6 +436,7 @@ class Consumer:
             # This delivery is being driven by a consumer, so how it ends will
             # be reported. An interceptor that wants to know can wait for it.
             reports_settlement=True,
+            reply_to=delivery.reply_to,
         )
 
         started = time.monotonic()
@@ -487,6 +505,7 @@ class Consumer:
             content_type=context.content_type,
             redelivered=context.redelivered,
             body=context.body,
+            reply_to=context.reply_to,
         )
         returned = self._handler(message)
         # Not an Ack is a mistake worth reporting, but it is not this method's
@@ -522,6 +541,20 @@ class Consumer:
                 Settlement(
                     OUTCOME_REJECTED,
                     reason=f"the handler rejected it: {_describe(decision.error)}",
+                ),
+                None,
+            )
+
+        if decision.action is Action.PARK:
+            # The handler read the message and found nothing it could read. The
+            # engine reaches the same conclusion for a body its codec refuses,
+            # and both end up in the same queue for the same reason: a message
+            # nobody can read is a producer problem, and it is only findable if
+            # it is not filed with the messages that merely ran out of luck.
+            return (
+                Settlement(
+                    OUTCOME_PARKED,
+                    reason=f"the handler parked it: {_describe(decision.error)}",
                 ),
                 None,
             )
@@ -573,6 +606,13 @@ class Consumer:
         if settlement.outcome == OUTCOME_ACKED:
             self._observer.count(METRIC_ACCEPTED, 1, self._labels)
             await delivery.ack()
+            return
+
+        if settlement.outcome == OUTCOME_PARKED:
+            # ``_park`` counts it, exactly as it does for a body that would not
+            # decode. There is one parked counter and one parked queue whether
+            # the codec or the handler was the one that could not read it.
+            await self._park(delivery, envelope, settlement.reason or "")
             return
 
         if wait is None:

@@ -51,7 +51,7 @@ scrape body using only the standard library:
 # TYPE acemq_messages_consumed counter
 acemq_messages_consumed{queue="shipping.orders"} 3
 # TYPE acemq_messages_published counter
-acemq_messages_published{exchange="orders-events",key="order.placed"} 1
+acemq_messages_published{exchange="orders-events",routing_key="order.placed"} 1
 # TYPE acemq_messages_in_flight gauge
 acemq_messages_in_flight{queue="shipping.orders"} 2
 # TYPE acemq_handler_duration summary
@@ -114,11 +114,11 @@ one library reads against another. Java publishes them through Micrometer and
 
 | Metric | |
 |---|---|
-| `acemq.messages.published` / `.publish.failed` | Handed to the broker, and not. Labelled by exchange and key |
+| `acemq.messages.published` / `.publish.failed` | Handed to the broker, and not. Labelled `exchange` and `routing.key` |
 | `acemq.messages.consumed` | Delivered to a handler. Labelled by queue |
 | `acemq.messages.accepted` / `.retried` / `.rejected` | What the consumer decided. A retry says `where`: `consumer`, `broker` or `requeued` |
 | `acemq.messages.dead.lettered` | Ran out of attempts and went to `{queue}.dlq` |
-| `acemq.messages.parked` | Never reached the handler and went to `{queue}.parked` |
+| `acemq.messages.parked` | Went to `{queue}.parked`: the body would not decode, or a handler returned `park(...)` |
 | `acemq.handler.duration` | Seconds, timed around the interceptors as well as the handler |
 | `acemq.messages.in.flight` | A gauge: how many are being handled right now |
 | `acemq.retry.rung.missing` | **Worth an alert.** A long retry that had to wait in the consumer because its rung queue is not on the broker |
@@ -140,6 +140,7 @@ different files and a dashboard reads them together:
 | `retried` | `acemq.messages.retried` |
 | `rejected` | `acemq.messages.rejected`, and `.dead.lettered` because that is where it went |
 | `dead_lettered` | `acemq.messages.dead.lettered` |
+| `parked` | `acemq.messages.parked`, and *not* `.dead.lettered` — a different queue |
 
 A handler that asks for another attempt when there are none left is
 dead-lettered, so both the counter and the span say `dead_lettered` — not
@@ -351,9 +352,12 @@ writes: a query built around it comes back with the Python services and looks
 like a complete answer.
 
 `unroutable`, `failed` and `dead_lettered` set the span status to `ERROR`. The
-others — including `retried` — do not. A retry is the system working and usually
-succeeds; colouring a trace red for it produces a wall of red traces that turned
-out fine, which is how people learn to ignore the colour. A `timed_out` request
+others — including `retried` and `parked` — do not. A retry is the system
+working and usually succeeds; colouring a trace red for it produces a wall of
+red traces that turned out fine, which is how people learn to ignore the colour.
+A parked message is a decision a handler made on purpose, and what an operator
+watches for those is `acemq.messages.parked` and the queue itself. A `timed_out`
+request
 is red too, but by its exception rather than by its outcome: the outcome list is
 Java's, character for character, and a round trip that never got its answer is
 still a failure from where the caller is standing.
@@ -398,6 +402,7 @@ waits for the consumer's decision, and takes its outcome from that:
 | there is another attempt | `retried` | `message.retried`, with the delay | |
 | the handler rejected it | `rejected` | `message.dead_lettered` | |
 | it ran out of attempts, aged out, or was fatal | `dead_lettered` | `message.dead_lettered`, with the reason | `ERROR` |
+| the handler parked it | `parked` | — | |
 
 The retry delay is the one thing about a retry nobody can reconstruct
 afterwards — it comes from the policy, the attempt and, where there is jitter, a

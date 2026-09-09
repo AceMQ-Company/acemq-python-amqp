@@ -120,6 +120,10 @@ async def test_a_connection_reports_through_it(registry: object) -> None:
 
     await mq.publisher(routing_key=QUEUE).send({"id": "1"})
 
-    assert 'acemq_messages_published_total{exchange="",key="orders.new"} 1.0' in rendered(
-        registry
+    # The tag is ``routing.key``, which Prometheus spells ``routing_key`` — the
+    # same label Java and .NET already export, so one dashboard reads across all
+    # five.
+    assert (
+        'acemq_messages_published_total{exchange="",routing_key="orders.new"} 1.0'
+        in rendered(registry)
     )

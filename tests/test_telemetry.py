@@ -165,7 +165,11 @@ async def test_a_publish_is_counted_with_where_it_went() -> None:
 
     await mq.publisher(routing_key=QUEUE).send({"id": "1"})
 
-    assert metrics.counts[metric_key(METRIC_PUBLISHED, {"exchange": "", "key": QUEUE})] == 1
+    # ``routing.key`` and not ``key``: the fully-qualified name Java and .NET
+    # already tag a publish with, so one dashboard reads across all five.
+    labels = {"exchange": "", "routing.key": QUEUE}
+    assert metrics.counts[metric_key(METRIC_PUBLISHED, labels)] == 1
+    assert metric_key(METRIC_PUBLISHED, {"exchange": "", "key": QUEUE}) not in metrics.counts
 
 
 async def test_a_publish_that_reached_no_queue_is_counted_as_a_failure() -> None:
@@ -178,9 +182,9 @@ async def test_a_publish_that_reached_no_queue_is_counted_as_a_failure() -> None
     with pytest.raises(Exception, match="no queue"):
         await mq.publisher(routing_key="nowhere", mandatory=True).send({"id": "1"})
 
-    key = metric_key(METRIC_PUBLISH_FAILED, {"exchange": "", "key": "nowhere"})
+    key = metric_key(METRIC_PUBLISH_FAILED, {"exchange": "", "routing.key": "nowhere"})
     assert metrics.counts[key] == 1
-    published = metric_key(METRIC_PUBLISHED, {"exchange": "", "key": "nowhere"})
+    published = metric_key(METRIC_PUBLISHED, {"exchange": "", "routing.key": "nowhere"})
     assert published not in metrics.counts
 
 

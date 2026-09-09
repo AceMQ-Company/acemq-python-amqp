@@ -211,6 +211,7 @@ class FakeTransport:
         content_type: str | None = "application/json",
         routing_key: str | None = None,
         redelivered: bool = False,
+        reply_to: str = "",
         timeout: float = 5.0,
     ) -> Settlement:
         """Hands one message to whoever is consuming the queue.
@@ -244,6 +245,7 @@ class FakeTransport:
                 redelivered=redelivered,
                 ack=ack,
                 nack=nack,
+                reply_to=reply_to,
             )
         )
         await asyncio.wait_for(settled.wait(), timeout)

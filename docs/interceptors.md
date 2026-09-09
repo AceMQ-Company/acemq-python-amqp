@@ -134,11 +134,12 @@ async def audited(context: ConsumeContext, handle: ConsumeNext) -> Ack:
     return await handle(context)
 ```
 
-A `Settlement` carries the `outcome` — `acked`, `retried`, `rejected` or
-`dead_lettered` — the `reason` it was set aside for, and the `delay` before the
-next attempt. Its `dead_lettered` property is true for a rejection as well: both
-end up in the same queue, and the difference between the two words is who
-decided.
+A `Settlement` carries the `outcome` — `acked`, `retried`, `rejected`,
+`dead_lettered` or `parked` — the `reason` it was set aside for, and the `delay`
+before the next attempt. Its `dead_lettered` property is true for a rejection as
+well: both end up in the same queue, and the difference between the two words is
+who decided. It is **false** for `parked`, which went to a different queue on
+purpose; `settlement.parked` is the property for that one.
 
 The listener is called **once**, on the consumer's task, after the decision and
 before it is carried out. Before, so that a consumer-side backoff is not

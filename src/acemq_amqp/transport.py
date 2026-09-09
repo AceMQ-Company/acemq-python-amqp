@@ -88,6 +88,11 @@ class Outbound:
     :param body: the encoded payload
     :param content_type: what the body is, for the consumer's codec
     :param message_id: the AMQP message id, conventionally the envelope's
+    :param reply_to: AMQP's own ``reply-to`` property, naming where an answer
+        should be sent. Empty for the overwhelming majority of messages, which
+        are not questions. It is here as well as in the headers because the four
+        other libraries read the native property, and a Python responder that
+        only ever wrote a header could not be answered by a Java or .NET caller
     :param headers: the envelope's headers plus the application's
     :param persistent: asks the broker to write the message to disk, which is
         not a guarantee on its own — a persistent message on a queue that is not
@@ -99,6 +104,7 @@ class Outbound:
     body: bytes
     content_type: str = ""
     message_id: str = ""
+    reply_to: str = ""
     headers: Mapping[str, Any] = field(default_factory=dict)
     persistent: bool = True
     mandatory: bool = False
@@ -141,6 +147,10 @@ class Delivery:
         attempt header still reads whatever the publisher wrote
     :param ack: confirms the message and removes it from the queue
     :param nack: returns the message, requeued or not
+    :param reply_to: AMQP's own ``reply-to`` property, empty when the sender did
+        not set one. A transport that cannot report it leaves it empty and the
+        responder falls back to the header, which is the only reason this has a
+        default at all
     """
 
     body: bytes
@@ -151,6 +161,7 @@ class Delivery:
     redelivered: bool
     ack: Callable[[], Awaitable[None]]
     nack: Callable[[bool], Awaitable[None]]
+    reply_to: str = ""
 
 
 class Subscription(Protocol):

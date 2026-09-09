@@ -100,6 +100,8 @@ class PublishContext:
     :param persistent: whether the broker is asked to write it to disk
     :param mandatory: whether reaching no queue is an error rather than a
         silence
+    :param reply_to: where an answer should be sent, written to AMQP's own
+        ``reply-to`` property. Empty for anything that is not a question
     """
 
     exchange: str
@@ -108,6 +110,7 @@ class PublishContext:
     payload: Any
     persistent: bool = True
     mandatory: bool = False
+    reply_to: str = ""
 
     def set_header(self, name: str, value: Any) -> None:
         """Adds an application header to the message being published.
@@ -138,6 +141,8 @@ class ConsumeContext:
         say how it was settled. True when a consumer is, and false when an
         interceptor chain is being run by something else — a test, or a caller
         composing the chain by hand
+    :param reply_to: AMQP's own ``reply-to`` property as it arrived, empty when
+        the sender set none
     """
 
     queue: str
@@ -149,6 +154,7 @@ class ConsumeContext:
     redelivered: bool
     state: dict[str, Any] = field(default_factory=dict)
     reports_settlement: bool = False
+    reply_to: str = ""
     _settlement_listeners: list[SettlementListener] = field(
         default_factory=list, repr=False
     )

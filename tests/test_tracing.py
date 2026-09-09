@@ -39,7 +39,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import SpanKind, StatusCode
 
-from acemq_amqp.ack import Ack, Action, FatalError, accept, reject, retry
+from acemq_amqp.ack import Ack, Action, FatalError, accept, park, reject, retry
 from acemq_amqp.connection import Connection, Handler
 from acemq_amqp.envelope import Envelope
 from acemq_amqp.headers import TRACEPARENT, TRACESTATE
@@ -517,6 +517,7 @@ async def test_the_attempt_is_on_the_handler_span(
         (accept, "acked", False),
         (retry, "retried", False),
         (reject, "rejected", False),
+        (park, "parked", False),
     ],
 )
 async def test_what_the_handler_decided_becomes_the_outcome(
@@ -531,7 +532,7 @@ async def test_what_the_handler_decided_becomes_the_outcome(
     A retry is the system working — the message will be tried again and usually
     succeeds — and colouring the trace red for it means a wall of red traces
     that turned out fine, which is how people learn to ignore the colour. A
-    rejection is a decision somebody made deliberately.
+    rejection is a decision somebody made deliberately, and so is a park.
     """
 
     async def handle(_: ConsumeContext) -> Ack:
@@ -845,6 +846,32 @@ async def test_an_outright_rejection_is_a_decision_rather_than_a_defeat(
     assert span.attributes[ATTR_OUTCOME] == "rejected"
     assert span.status.status_code is not StatusCode.ERROR
     assert "no such account" in event(span, EVENT_MESSAGE_DEAD_LETTERED).attributes[ATTR_REASON]
+
+
+async def test_a_parked_message_says_parked_and_carries_no_dead_letter_event(
+    tracing: OpenTelemetryTracing, spans: InMemorySpanExporter
+) -> None:
+    """It went to ``{queue}.parked``, which is not the dead-letter queue.
+
+    So no ``message.dead_lettered`` event: that event names a queue this
+    message never reached, and an operator following it would go and look in
+    the wrong place. Not an error either, for the same reason ``rejected`` is
+    not — the handler meant it, having read the message and found nothing it
+    could read.
+    """
+    unreadable = park(ValueError("schema 9, and this service reads up to 4"))
+    async with consuming(tracing, answering(unreadable)) as t:
+        await t.deliver(CONSUMED, b"{}", headers=Envelope(id="m-1").to_headers())
+
+    span = named(spans, "orders.new process")
+    assert span.attributes[ATTR_OUTCOME] == "parked"
+    assert span.status.status_code is not StatusCode.ERROR
+    assert EVENT_MESSAGE_DEAD_LETTERED not in [
+        recorded.name for recorded in span.events
+    ]
+    # The reason the handler gave is still on the span, as it is for every other
+    # decision that carries one.
+    assert "exception" in [recorded.name for recorded in span.events]
 
 
 async def test_a_fatal_error_dead_letters_rather_than_reporting_the_retry_it_asked_for(

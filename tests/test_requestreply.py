@@ -117,6 +117,7 @@ async def test_a_request_with_nowhere_to_reply_is_dead_lettered_not_looped() -> 
 
     mq = await serving(transport, price)
     try:
+        # Neither address: no header, and no native property either.
         await transport.deliver(REQUESTS, b"{}", headers=request(reply_to=None))
     finally:
         await mq.close()
@@ -125,6 +126,69 @@ async def test_a_request_with_nowhere_to_reply_is_dead_lettered_not_looped() -> 
     reason = transport.sent_to(f"{REQUESTS}.dlq")[0].headers[headers.ERROR]
     assert HEADER_REPLY_TO in reason
     assert transport.sent_to(REPLIES) == []
+
+
+async def test_a_request_carrying_only_the_native_property_is_answered() -> None:
+    # What a Java or .NET caller sends: those two write AMQP's own reply-to and
+    # not the header, so a Python responder that read the header alone could
+    # never answer one of them.
+    transport = FakeTransport()
+
+    async def price(message: Message) -> dict[str, Any]:
+        assert message.reply_to == REPLIES
+        return {"pence": 250}
+
+    mq = await serving(transport, price)
+    try:
+        await transport.deliver(
+            REQUESTS, b"{}", headers=request(reply_to=None), reply_to=REPLIES
+        )
+    finally:
+        await mq.close()
+
+    assert json.loads(transport.sent_to(REPLIES)[0].message.body) == {"pence": 250}
+    assert transport.sent_to(f"{REQUESTS}.dlq") == []
+
+
+async def test_a_request_carrying_only_the_header_is_answered() -> None:
+    # What a request looks like after a hop through a service that rebuilt the
+    # message: the native property is gone and the header is all that is left.
+    # It is also what a Go or Ruby caller of an older version sends.
+    transport = FakeTransport()
+
+    async def price(message: Message) -> dict[str, Any]:
+        assert message.reply_to == ""
+        return {"pence": 250}
+
+    mq = await serving(transport, price)
+    try:
+        await transport.deliver(REQUESTS, b"{}", headers=request(), reply_to="")
+    finally:
+        await mq.close()
+
+    assert json.loads(transport.sent_to(REPLIES)[0].message.body) == {"pence": 250}
+    assert transport.sent_to(f"{REQUESTS}.dlq") == []
+
+
+async def test_the_header_wins_when_a_request_carries_both_addresses() -> None:
+    # Header first, native second — the same order in all five libraries. The
+    # order only shows when the two disagree, which is exactly what a service
+    # that republished the request under a reply queue of its own produces.
+    transport = FakeTransport()
+
+    async def price(message: Message) -> dict[str, Any]:
+        return {"pence": 250}
+
+    mq = await serving(transport, price)
+    try:
+        await transport.deliver(
+            REQUESTS, b"{}", headers=request(), reply_to="somewhere-else"
+        )
+    finally:
+        await mq.close()
+
+    assert len(transport.sent_to(REPLIES)) == 1
+    assert transport.sent_to("somewhere-else") == []
 
 
 async def test_an_answer_that_could_not_be_sent_is_tried_again() -> None:
@@ -163,9 +227,12 @@ async def test_a_reply_finishes_the_request_that_was_waiting_for_it() -> None:
         asking = asyncio.create_task(caller.ask({"sku": "A-1"}))
         went_out = await sent_to(transport, REQUESTS)
 
-        # The return address travels as an ordinary application header, so it
-        # survives a hop through a service that rebuilds the message.
+        # The return address travels twice, and to the same queue. The header is
+        # what survives a hop through a service that rebuilds the message; the
+        # native property is what a Java or .NET responder reads, and without it
+        # neither of those two could answer this caller at all.
         assert went_out.headers[HEADER_REPLY_TO] == caller.reply_queue
+        assert went_out.message.reply_to == caller.reply_queue
 
         correlation = str(went_out.headers[headers.CORRELATION])
         await transport.deliver(

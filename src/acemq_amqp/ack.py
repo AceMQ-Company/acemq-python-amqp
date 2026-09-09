@@ -41,18 +41,25 @@ OUTCOME_REJECTED = "rejected"
 #: It ran out of attempts, aged out, or was unprocessable.
 OUTCOME_DEAD_LETTERED = "dead_lettered"
 
+#: It went to ``{queue}.parked`` rather than to the dead letters, because
+#: nothing could read it. The same word the ``acemq.messages.parked`` counter
+#: uses, and the word the engine already used for a body that would not decode.
+OUTCOME_PARKED = "parked"
+
 
 class Action(Enum):
-    """The three things that can be done with a delivered message."""
+    """The four things that can be done with a delivered message."""
 
     ACCEPT = "accept"
     RETRY = "retry"
     REJECT = "reject"
+    PARK = "park"
 
 
 @dataclass(frozen=True, slots=True)
 class Ack:
-    """A handler's decision: it worked, try it again, or never again.
+    """A handler's decision: it worked, try it again, never again, or nobody
+    can read it.
 
     Returned rather than performed, so a handler that forgets to decide is a
     handler that returns ``None`` and is caught immediately, rather than one
@@ -71,14 +78,15 @@ class Ack:
 class Settlement:
     """What the consumer did with a delivery, once it had decided.
 
-    Reported before it is carried out rather than after, because one of the
-    four takes time: a consumer-side retry sleeps out the backoff before the
-    message is republished, and a listener told afterwards would be describing
-    the delivery minutes later, on a span that had been open the whole while.
+    Reported before it is carried out rather than after, because one of them
+    takes time: a consumer-side retry sleeps out the backoff before the message
+    is republished, and a listener told afterwards would be describing the
+    delivery minutes later, on a span that had been open the whole while.
 
     :param outcome: one of :data:`OUTCOME_ACKED`, :data:`OUTCOME_RETRIED`,
-        :data:`OUTCOME_REJECTED` and :data:`OUTCOME_DEAD_LETTERED` — the same
-        four words the other libraries put on a span
+        :data:`OUTCOME_REJECTED`, :data:`OUTCOME_DEAD_LETTERED` and
+        :data:`OUTCOME_PARKED` — the same words the other libraries put on a
+        span
     :param reason: why it was set aside, when it was
     :param delay: how long until the next attempt, when there is one
     """
@@ -94,8 +102,18 @@ class Settlement:
         True for an outright rejection as well as for an exhausted one: both
         end up in the same queue, and the difference between the two words is
         *who decided*, which :attr:`outcome` records and this does not.
+
+        False for :data:`OUTCOME_PARKED`, and that is the whole point of the
+        parked queue: a message nobody could read is a different problem with a
+        different answer from one that failed five times, and whoever drains
+        the dead letters should not have to sort the two apart by hand.
         """
         return self.outcome in (OUTCOME_REJECTED, OUTCOME_DEAD_LETTERED)
+
+    @property
+    def parked(self) -> bool:
+        """Whether the message went to the parked queue."""
+        return self.outcome == OUTCOME_PARKED
 
     def __str__(self) -> str:
         return self.outcome
@@ -125,6 +143,23 @@ def reject(error: BaseException | None = None) -> Ack:
     temporarily unhelpful.
     """
     return Ack(Action.REJECT, error)
+
+
+def park(error: BaseException | None = None) -> Ack:
+    """Sets the message aside on ``{queue}.parked`` without trying again.
+
+    For when the message is not readable at all: a body in a format nothing
+    here understands, a version this service was never taught. The engine
+    already parks a body its codec cannot decode; this is how a handler that
+    worked out the same thing one layer further in says so.
+
+    :func:`reject` is the neighbouring word and the difference is worth
+    keeping. A rejected message is a *bad request* — understood, and refused —
+    and it belongs with the other dead letters. A parked one was never
+    understood, and mixing the two means whoever drains the dead-letter queue
+    has to sort them by hand to find the producer that is emitting rubbish.
+    """
+    return Ack(Action.PARK, error)
 
 
 class FatalError(Exception):

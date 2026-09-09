@@ -48,11 +48,34 @@ slows down turns into a caller that stops responding. Reach for it where the
 caller genuinely cannot continue without the answer, and publish an event
 otherwise.
 
-The pairing is the envelope's **correlation identifier**, and the return address
-is an ordinary application header. Neither uses AMQP's own `reply-to` and
-`correlation-id` properties: those are lost the moment a message passes through
-a service that rebuilds it, and the envelope is the thing this library promises
-to carry end to end.
+The pairing is the envelope's **correlation identifier**, and not AMQP's own
+`correlation-id` property: that is lost the moment a message passes through a
+service that rebuilds it, and the envelope is the thing this library promises to
+carry end to end.
+
+### The return address is written twice and read either way
+
+A request carries the `acemq-reply-to` **header** *and* AMQP's own `reply-to`
+**property**, set to the same queue. A responder reads the header first and
+falls back to the property.
+
+| | |
+|---|---|
+| requester | sets both, to the same value |
+| responder | header first, native property second |
+
+All five libraries do exactly this, in that order, and the reason is that they
+did not use to. Python, Go and Ruby wrote only the header; Java and .NET read
+only the property. A Java caller and a Python responder therefore could not talk
+at all — the request arrived, the responder found no header, and dead-lettered
+it for having nowhere to reply. Writing both and reading either makes all
+twenty-five caller/responder pairs work.
+
+The header is kept because it is the half that survives a service which
+rebuilds the message; the property is what the other four libraries read, and a
+Python service that only ever wrote the header could not be answered from
+outside Python. `Message.reply_to` exposes the native property to a handler
+writing its own responder.
 
 `Requester.open` generates the reply queue — transient, exclusive,
 auto-deleting and classic, belonging to this process. Name one only when replies
