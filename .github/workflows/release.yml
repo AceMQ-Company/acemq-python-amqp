@@ -90,9 +90,9 @@ jobs:
           # every lockfile that already names it working. Lift this when the
           # line moves on.
           case "$VERSION" in
-            0.3.*) ;;
+            0.5.*) ;;
             *)
-              echo "::error::this library releases 0.3.x only; '$VERSION' needs the guard in release.yml lifted first"
+              echo "::error::this library releases 0.5.x only; '$VERSION' needs the guard in release.yml lifted first"
               exit 1
               ;;
           esac
