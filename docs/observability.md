@@ -48,32 +48,35 @@ test, or a signal handler that prints them. `prometheus_text` renders it as a
 scrape body using only the standard library:
 
 ```
-# TYPE acemq_messages_consumed counter
-acemq_messages_consumed{queue="shipping.orders"} 3
-# TYPE acemq_messages_published counter
-acemq_messages_published{exchange="orders-events",routing_key="order.placed"} 1
-# TYPE acemq_messages_in_flight gauge
-acemq_messages_in_flight{queue="shipping.orders"} 2
-# TYPE acemq_handler_duration summary
-acemq_handler_duration_count{queue="shipping.orders"} 2
-acemq_handler_duration_sum{queue="shipping.orders"} 0.06
+# TYPE acemq_consume_total counter
+acemq_consume_total{outcome="acked",queue="shipping.orders"} 3
+# TYPE acemq_publish_total counter
+acemq_publish_total{exchange="orders-events",outcome="confirmed",routing_key="order.placed"} 1
+# TYPE acemq_consume_in_flight gauge
+acemq_consume_in_flight{queue="shipping.orders"} 2
+# TYPE acemq_consume_duration summary
+acemq_consume_duration_count{outcome="acked",queue="shipping.orders"} 2
+acemq_consume_duration_sum{outcome="acked",queue="shipping.orders"} 0.06
 ```
 
-Dots become underscores because Prometheus does not allow them in a metric name.
+Dots become underscores because Prometheus does not allow them in a metric name
+— **and neither in a label name**, so the `routing.key` tag is exported as
+`routing_key`. The label *values* keep their dots: a routing key is where the
+dots mean something.
 
 `Metrics` also prints itself, which is what a signal handler or a failing test
 wants:
 
 ```python
 print(metrics)
-# acemq.messages.consumed{queue="shipping.orders"} 3
-# acemq.handler.duration{queue="shipping.orders"} count=2 mean=0.0300s
+# acemq.consume.total{outcome="acked",queue="shipping.orders"} 3
+# acemq.consume.duration{outcome="acked",queue="shipping.orders"} count=2 mean=0.0300s
 ```
 
 and exposes the three maps for assertions:
 
 ```python
-metrics.counts       # {'acemq.messages.consumed{queue="shipping.orders"}': 3}
+metrics.counts       # {'acemq.consume.total{outcome="acked",queue="shipping.orders"}': 3}
 metrics.gauges
 metrics.durations    # DurationSummary(count, total, fastest, slowest), and .mean
 ```
@@ -108,39 +111,68 @@ database and a handler that calls something slow.
 
 ## What is reported
 
-The names are the same in Java, Go, .NET and here, so a dashboard built against
-one library reads against another. Java publishes them through Micrometer and
-.NET through `System.Diagnostics.Metrics`.
+The names are Java's, spelled out in `MetricNames` in `acemq-amqp-api`, and Go,
+Python and Ruby publish the same ones — so a dashboard built against one library
+reads against another. Java publishes them through Micrometer and .NET through
+`System.Diagnostics.Metrics`.
 
 | Metric | |
 |---|---|
-| `acemq.messages.published` / `.publish.failed` | Handed to the broker, and not. Labelled `exchange` and `routing.key` |
-| `acemq.messages.consumed` | Delivered to a handler. Labelled by queue |
-| `acemq.messages.accepted` / `.retried` / `.rejected` | What the consumer decided. A retry says `where`: `consumer`, `broker` or `requeued` |
-| `acemq.messages.dead.lettered` | Ran out of attempts and went to `{queue}.dlq` |
-| `acemq.messages.parked` | Went to `{queue}.parked`: the body would not decode, or a handler returned `park(...)` |
-| `acemq.handler.duration` | Seconds, timed around the interceptors as well as the handler |
-| `acemq.messages.in.flight` | A gauge: how many are being handled right now |
+| `acemq.publish.total` | Publishes. Labelled `exchange`, `routing.key` and `outcome`: `confirmed`, `unroutable`, `failed` |
+| `acemq.consume.total` | Deliveries settled. Labelled `queue` and `outcome`: `acked`, `retried`, `rejected`, `dead_lettered`, `parked` |
+| `acemq.consume.duration` | Seconds, timed around the interceptors as well as the handler, and carrying the same `outcome` |
+| `acemq.consume.in.flight` | A gauge: how many are being handled right now |
+| `acemq.messages.retried.total` | Messages given another attempt. Says `where`: `consumer`, `broker` or `requeued` |
+| `acemq.messages.dead.lettered.total` | Messages set aside, tagged `outcome`: `dead_lettered` went to `{queue}.dlq`, `parked` went to `{queue}.parked` because the body would not decode or a handler returned `park(...)` |
 | `acemq.retry.rung.missing` | **Worth an alert.** A long retry that had to wait in the consumer because its rung queue is not on the broker |
 | `acemq.messages.set.aside.failed` | Could not be moved to a dead-letter or parking queue, so was rejected to the broker instead |
 
-Every name is a constant — `METRIC_CONSUMED`, `METRIC_RUNG_MISSING` and so on —
-so an alert rule and a test can name the same string the library does.
+Parking is not a metric of its own. It is `acemq.messages.dead.lettered.total`
+with `outcome="parked"`, which is what Java settled on: both are a message
+this queue gave up on, and an operator asking how much a queue is giving up on
+wants one number that can then be split. The split still matters — a message
+that failed five times and a message nothing could read are different problems
+with different answers — which is exactly what the tag is for.
+
+There is no counter for "a message arrived". Every delivery is counted once when
+it is settled, and the sum across the outcomes of `acemq.consume.total` is how
+many arrived — one counter that leads the others by however many messages are in
+flight is a counter that makes an operator wonder which one is lying.
+
+Every name is a constant — `METRIC_CONSUME_TOTAL`, `METRIC_RUNG_MISSING` and so
+on — so an alert rule and a test can name the same string the library does. The
+tag names and the publish outcomes are constants too, in `acemq_amqp.telemetry`;
+the delivery outcomes are the `OUTCOME_*` names in `acemq_amqp.ack`, which the
+settlement and the span already use.
+
+### One counter with an outcome, not one counter per outcome
+
+Python used to publish `acemq.messages.published`, `.accepted`, `.rejected` and
+their neighbours — a name per outcome, and none of them a name Java knew. A
+dashboard could read Python or it could read Java, and the claim in this file
+that it read both was simply wrong. The mapping from the old names to these is
+in the changelog, under the release that made the change.
 
 ### The counters say what the consumer decided, not what the handler asked for
 
-The four decision counters are chosen from the settlement, which is the same
-thing [the delivery's span](#what-the-consumer-did-rather-than-what-the-handler-said)
-takes its outcome from. That is worth stating because the two are written in
-different files and a dashboard reads them together:
+The outcome on `acemq.consume.total` is chosen from the settlement, which is the
+same thing [the delivery's span](#what-the-consumer-did-rather-than-what-the-handler-said)
+takes its outcome from — the same word, in both places. That is worth stating
+because the two are written in different files and a dashboard reads them
+together:
 
-| span outcome | counter |
+| span outcome | counters |
 |---|---|
-| `acked` | `acemq.messages.accepted` |
-| `retried` | `acemq.messages.retried` |
-| `rejected` | `acemq.messages.rejected`, and `.dead.lettered` because that is where it went |
-| `dead_lettered` | `acemq.messages.dead.lettered` |
-| `parked` | `acemq.messages.parked`, and *not* `.dead.lettered` — a different queue |
+| `acked` | `acemq.consume.total{outcome="acked"}` |
+| `retried` | `acemq.consume.total{outcome="retried"}`, and `acemq.messages.retried.total` |
+| `rejected` | `acemq.consume.total{outcome="rejected"}`, and `acemq.messages.dead.lettered.total{outcome="dead_lettered"}` because that is where it went |
+| `dead_lettered` | `acemq.consume.total{outcome="dead_lettered"}`, and `acemq.messages.dead.lettered.total{outcome="dead_lettered"}` |
+| `parked` | `acemq.consume.total{outcome="parked"}`, and `acemq.messages.dead.lettered.total{outcome="parked"}` — the same counter as a dead letter, told apart by the outcome and still a different queue |
+
+The standalone `retried` and `dead.lettered` counters are not a redundancy, and
+Java keeps them for the same reason: the outcome says what was decided about a
+delivery, and the counter says how many messages are going round again or have
+been set aside, which is the number an alert is written against.
 
 A handler that asks for another attempt when there are none left is
 dead-lettered, so both the counter and the span say `dead_lettered` — not
@@ -356,7 +388,8 @@ others — including `retried` and `parked` — do not. A retry is the system
 working and usually succeeds; colouring a trace red for it produces a wall of
 red traces that turned out fine, which is how people learn to ignore the colour.
 A parked message is a decision a handler made on purpose, and what an operator
-watches for those is `acemq.messages.parked` and the queue itself. A `timed_out`
+watches for those is `acemq.messages.dead.lettered.total{outcome="parked"}` and
+the queue itself. A `timed_out`
 request
 is red too, but by its exception rather than by its outcome: the outcome list is
 Java's, character for character, and a round trip that never got its answer is

@@ -179,7 +179,7 @@ handler wrapper.
 
 ## Timing
 
-`acemq.handler.duration` is measured around the interceptors **as well as** the
+`acemq.consume.duration` is measured around the interceptors **as well as** the
 handler, because what an operator wants to know is how long a message takes to
 deal with, and an interceptor that opens a transaction is part of dealing with
 it.

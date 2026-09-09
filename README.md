@@ -581,20 +581,23 @@ from acemq_amqp.prometheus import PrometheusObserver
 mq = await connect(url, observer=PrometheusObserver())
 ```
 
-The names are the same in Java, Go, .NET and here, so a dashboard built against
-one reads against another:
+The names are Java's `MetricNames`, which Go, Python and Ruby all publish, so a
+dashboard built against one reads against another:
 
 | Metric | |
 |---|---|
-| `acemq.messages.published` / `.publish.failed` | Handed to the broker, and not. Labelled `exchange` and `routing.key` |
-| `acemq.messages.consumed` | Delivered to a handler. Labelled by queue |
-| `acemq.messages.accepted` / `.retried` / `.rejected` | What handlers decided. A retry says `where`: `consumer` or `broker` |
-| `acemq.messages.dead.lettered` | Ran out of attempts and went to `{queue}.dlq` |
-| `acemq.messages.parked` | Went to `{queue}.parked`: the body would not decode, or a handler returned `park(...)` |
-| `acemq.handler.duration` | Seconds, timed around the interceptors as well as the handler |
-| `acemq.messages.in.flight` | Being handled right now |
+| `acemq.publish.total` | Publishes. Labelled `exchange`, `routing.key` and `outcome`: `confirmed`, `unroutable`, `failed` |
+| `acemq.consume.total` | Deliveries settled. Labelled `queue` and `outcome`: `acked`, `retried`, `rejected`, `dead_lettered`, `parked` |
+| `acemq.consume.duration` | Seconds, timed around the interceptors as well as the handler, carrying the same `outcome` |
+| `acemq.consume.in.flight` | Being handled right now |
+| `acemq.messages.retried.total` | Given another attempt. A retry says `where`: `consumer`, `broker` or `requeued` |
+| `acemq.messages.dead.lettered.total` | Set aside. `outcome="dead_lettered"` went to `{queue}.dlq`; `outcome="parked"` went to `{queue}.parked` because the body would not decode or a handler returned `park(...)` |
 | `acemq.retry.rung.missing` | **Worth an alert.** A long retry that had to wait in the consumer because its rung queue is not on the broker |
 | `acemq.messages.set.aside.failed` | Could not be moved to a dead-letter or parking queue, so was rejected to the broker instead |
+
+Every name here is Java's `MetricNames`, character for character.
+`routing.key` and the other dotted tag names are exported to Prometheus with
+underscores, because a Prometheus label name allows nothing else.
 
 `acemq.retry.rung.missing` is the one to alert on, because nothing else shows
 it. The message is still retried and the wait still happens, so a dashboard
@@ -671,8 +674,8 @@ the counter beside it. A `process` span stays open past the handler and takes
 its outcome from what the consumer actually did, so a message that ran out of
 attempts reads `dead_lettered` and carries a `message.dead_lettered` event with
 the reason — rather than `retried`, which is what somebody querying for dead
-letters finds nothing under. `acemq.messages.dead.lettered` is incremented for
-the same delivery, and `acemq.messages.retried` is not; the counters are chosen
+letters finds nothing under. `acemq.messages.dead.lettered.total` is incremented
+for the same delivery, and `acemq.messages.retried.total` is not; the counters are chosen
 from the same settlement, and a test holds the two renderings together. A retry
 carries `message.retried` with the delay the policy chose, which is a jittered
 number that exists nowhere else. The backoff itself is not inside the span.

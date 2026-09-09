@@ -48,10 +48,9 @@ from aiormq.exceptions import AMQPConnectionError, ChannelPreconditionFailed
 
 from acemq_amqp import (
     DEAD_LETTER_EXCHANGE,
-    METRIC_ACCEPTED,
-    METRIC_CONSUMED,
-    METRIC_HANDLER_DURATION,
-    METRIC_PUBLISHED,
+    METRIC_CONSUME_DURATION,
+    METRIC_CONSUME_TOTAL,
+    METRIC_PUBLISH_TOTAL,
     RETRY_EXCHANGE,
     Ack,
     BytesCodec,
@@ -897,6 +896,7 @@ async def test_metrics_count_a_real_round_trip(
 ) -> None:
     queue = await workspace.queue("counted")
     metrics = Metrics()
+    acked = {"queue": queue, "outcome": "acked"}
 
     async def handler(message: Message) -> Ack:
         return accept()
@@ -905,14 +905,17 @@ async def test_metrics_count_a_real_round_trip(
     async with counted, await counted.consume(queue, handler):
         await counted.publisher(routing_key=queue, mandatory=True).send({"id": "1"})
         await until(
-            lambda: _counted(metrics, METRIC_ACCEPTED, {"queue": queue}),
+            lambda: _counted(metrics, METRIC_CONSUME_TOTAL, acked),
             "the message was accepted",
         )
 
-    published = metric_key(METRIC_PUBLISHED, {"exchange": "", "routing.key": queue})
+    published = metric_key(
+        METRIC_PUBLISH_TOTAL,
+        {"exchange": "", "routing.key": queue, "outcome": "confirmed"},
+    )
     assert metrics.counts[published] == 1
-    assert metrics.counts[metric_key(METRIC_CONSUMED, {"queue": queue})] == 1
-    assert metrics.durations[metric_key(METRIC_HANDLER_DURATION, {"queue": queue})].count == 1
+    assert metrics.counts[metric_key(METRIC_CONSUME_TOTAL, acked)] == 1
+    assert metrics.durations[metric_key(METRIC_CONSUME_DURATION, acked)].count == 1
 
 
 async def _counted(metrics: Metrics, metric: str, labels: dict[str, str]) -> bool:

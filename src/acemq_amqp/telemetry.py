@@ -50,39 +50,52 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
-#: Messages handed to the broker.
-METRIC_PUBLISHED = "acemq.messages.published"
+#: Publishes, tagged with :data:`TAG_OUTCOME`.
+#:
+#: One counter with an outcome rather than one counter per outcome, because a
+#: dashboard that wants the failure rate wants a ratio of two series of the same
+#: metric and not a division between two differently-named ones.
+METRIC_PUBLISH_TOTAL = "acemq.publish.total"
 
-#: Publishes that did not succeed, including one an interceptor refused and one
-#: the broker could not route.
-METRIC_PUBLISH_FAILED = "acemq.messages.publish.failed"
+#: Deliveries that were settled, tagged with :data:`TAG_OUTCOME`.
+#:
+#: Counted once per delivery, from the settlement rather than from what the
+#: handler asked for: a handler asking for a retry it has no attempts left for
+#: is dead-lettered, and this says so. The sum across the outcomes is how many
+#: messages were handled.
+METRIC_CONSUME_TOTAL = "acemq.consume.total"
 
-#: Messages delivered to a handler.
-METRIC_CONSUMED = "acemq.messages.consumed"
+#: How long a delivery took, in seconds, tagged with :data:`TAG_OUTCOME`.
+#:
+#: Timed around the interceptors as well as the handler, because what an
+#: operator wants to know is how long a message takes to deal with, and an
+#: interceptor that opens a transaction is part of dealing with it.
+METRIC_CONSUME_DURATION = "acemq.consume.duration"
 
-#: What handlers decided. Three counters rather than one with an outcome label,
-#: because that is what the other libraries publish and a shared dashboard has
-#: to read the same.
-METRIC_ACCEPTED = "acemq.messages.accepted"
-METRIC_RETRIED = "acemq.messages.retried"
-METRIC_REJECTED = "acemq.messages.rejected"
+#: How many messages are in a handler right now, as a gauge. Bounded by prefetch
+#: times concurrency.
+METRIC_CONSUME_IN_FLIGHT = "acemq.consume.in.flight"
 
-#: Messages that ran out of attempts, or were given up on for any other reason,
-#: and went to ``{queue}.dlq``.
-METRIC_DEAD_LETTERED = "acemq.messages.dead.lettered"
+#: Messages sent to a retry queue, or otherwise given another attempt. Labelled
+#: ``where``: ``broker``, ``consumer`` or ``requeued``.
+#:
+#: Kept beside :data:`METRIC_CONSUME_TOTAL` rather than folded into it, exactly
+#: as Java keeps it: the outcome on a delivery says what was decided, and this
+#: says how many messages are going round again, which is the number an alert is
+#: written against.
+METRIC_RETRIED_TOTAL = "acemq.messages.retried.total"
 
-#: Messages that never reached the handler at all and went to
-#: ``{queue}.parked``. Separate from the dead letters on purpose: a message that
-#: failed five times and a message nothing could read are different problems
-#: with different answers, and whoever drains the queue should not have to sort
-#: them by hand.
-METRIC_PARKED = "acemq.messages.parked"
-
-#: How long handlers take, in seconds.
-METRIC_HANDLER_DURATION = "acemq.handler.duration"
-
-#: How many messages are being handled right now.
-METRIC_IN_FLIGHT = "acemq.messages.in.flight"
+#: Messages set aside, tagged with :data:`TAG_OUTCOME`: ``dead_lettered`` for one
+#: that ran out of attempts and went to ``{queue}.dlq``, ``parked`` for one that
+#: nothing could read and went to ``{queue}.parked``.
+#:
+#: One counter split by the outcome rather than two metrics, which is what Java
+#: settled on: both are a message this queue gave up on, and an operator asking
+#: how much a queue is giving up on wants one number that can then be split. The
+#: split still matters — a message that failed five times and a message nothing
+#: could read are different problems with different answers, and whoever drains
+#: the queue should not have to sort them by hand — which is what the tag is for.
+METRIC_DEAD_LETTERED_TOTAL = "acemq.messages.dead.lettered.total"
 
 #: Long retries that had to wait in the consumer because the rung queue they
 #: were meant to wait on is not on the broker.
@@ -95,8 +108,56 @@ METRIC_RUNG_MISSING = "acemq.retry.rung.missing"
 
 #: Messages that could not be moved to a dead-letter or parking queue, usually
 #: because it was never declared. The message is rejected to the broker instead,
-#: which is the last thing between it and nothing.
+#: which is the last thing between it and nothing. Labelled :data:`TAG_QUEUE` and
+#: :data:`TAG_TARGET`.
 METRIC_SET_ASIDE_FAILED = "acemq.messages.set.aside.failed"
+
+# ---------- tag names ----------
+#
+# Dotted, because Micrometer and OpenTelemetry are dotted and these have to be
+# the same words in five languages. ``routing.key`` and ``message.type`` are
+# both illegal Prometheus label names; :mod:`acemq_amqp.prometheus` and
+# :func:`prometheus_text` rewrite the dots to underscores at the point of
+# export, which is the only place the restriction applies.
+
+#: The exchange a message was published to, empty for the default exchange.
+TAG_EXCHANGE = "exchange"
+
+#: The routing key used, or the queue name when publishing without an exchange.
+TAG_ROUTING_KEY = "routing.key"
+
+#: The queue a delivery came from.
+TAG_QUEUE = "queue"
+
+#: Where a message was being set aside to when that failed: the dead-letter
+#: queue or the parking lot. Bounded by the topology, so it is safe as a tag.
+TAG_TARGET = "target"
+
+#: What happened. The publish outcomes are below; the delivery outcomes are
+#: :data:`~acemq_amqp.ack.OUTCOME_ACKED` and its neighbours in
+#: :mod:`acemq_amqp.ack`, which are the same words the settlement and the span
+#: already use.
+TAG_OUTCOME = "outcome"
+
+#: A publish the broker took responsibility for.
+OUTCOME_CONFIRMED = "confirmed"
+
+#: A publish that went out with nothing promising anything about it. Publisher
+#: confirms were not on.
+OUTCOME_PUBLISHED = "published"
+
+#: A mandatory publish the broker had no queue for. The quietest failure AMQP
+#: has, and the reason ``mandatory`` is worth setting.
+OUTCOME_UNROUTABLE = "unroutable"
+
+#: A publish that did not get to the broker at all.
+OUTCOME_FAILED = "failed"
+
+#: A request that got its reply.
+OUTCOME_ANSWERED = "answered"
+
+#: A request that reached its deadline with no reply.
+OUTCOME_TIMED_OUT = "timed_out"
 
 
 @runtime_checkable
@@ -251,8 +312,10 @@ def prometheus_text(metrics: Metrics) -> str:
 
     Written out rather than through a client library, so a service that only
     wants a scrape endpoint needs nothing installed. The format is small and
-    stable: a TYPE line, then samples, with dots in the metric name replaced by
-    underscores because Prometheus does not allow them.
+    stable: a TYPE line, then samples, with dots in the metric name — and in the
+    label names, where ``routing.key`` and ``message.type`` have the same
+    problem — replaced by underscores, because Prometheus allows them in
+    neither.
 
     A real registry — exemplars, native histograms, a shared process collector —
     is what :mod:`acemq_amqp.prometheus` is for, and it needs the extra.
@@ -281,11 +344,47 @@ def prometheus_text(metrics: Metrics) -> str:
 
 
 def _split_key(key: str) -> tuple[str, str]:
-    """A key back into its metric and its rendered labels."""
+    """A key back into its metric and its labels, both ready for a scraper.
+
+    The label names are rewritten here as well as the metric name, because
+    ``routing.key`` and ``message.type`` are no more legal as Prometheus label
+    names than a dotted metric name is, and a scrape carrying one is a scrape
+    the server rejects in full — the sample it could not parse is not the only
+    one lost.
+    """
     if "{" not in key:
         return key, ""
     metric, _, labels = key.partition("{")
-    return metric, "{" + labels
+    return metric, "{" + _prometheus_labels(labels[:-1]) + "}"
+
+
+def _prometheus_labels(rendered: str) -> str:
+    """``routing.key="a.b"`` becomes ``routing_key="a.b"``.
+
+    Names only. A label *value* is where a queue name lives, and queue names
+    have dots in them that mean something — rewriting those would report a
+    different queue than the one the message came from.
+
+    The parse leans on :func:`metric_key` having written this string: a name, an
+    equals sign, then a value between the next two quotes. Anything that does
+    not read that way is handed back untouched, because a mangled scrape line is
+    worse than an odd one.
+    """
+    pairs: list[str] = []
+    rest = rendered
+    while rest:
+        name, equals, rest = rest.partition('=')
+        if not equals or not rest.startswith('"'):
+            return rendered
+        value, quote, rest = rest[1:].partition('"')
+        if not quote:
+            return rendered
+        pairs.append(f'{name.replace(".", "_")}="{value}"')
+        if rest.startswith(","):
+            rest = rest[1:]
+        elif rest:
+            return rendered
+    return ",".join(pairs)
 
 
 def _prometheus_name(metric: str) -> str:

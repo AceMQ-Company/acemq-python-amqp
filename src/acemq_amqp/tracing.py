@@ -127,6 +127,14 @@ from .interceptors import (
     PublishNext,
     SettlementListener,
 )
+from .telemetry import (
+    OUTCOME_ANSWERED,
+    OUTCOME_CONFIRMED,
+    OUTCOME_FAILED,
+    OUTCOME_PUBLISHED,
+    OUTCOME_TIMED_OUT,
+    OUTCOME_UNROUTABLE,
+)
 from .transport import PublishResult
 
 if TYPE_CHECKING:  # pragma: no cover - imported for types alone
@@ -178,29 +186,13 @@ ATTR_PIPELINE = "pipeline"
 ATTR_STEP = "step"
 ATTR_PIPELINE_OUTCOME = "outcome"
 
-#: A message that reached no queue at all.
-OUTCOME_UNROUTABLE = "unroutable"
-
-#: The broker took responsibility for the message.
-OUTCOME_CONFIRMED = "confirmed"
-
-#: It went out, and nothing promised anything about it. Publisher confirms were
-#: not on.
-OUTCOME_PUBLISHED = "published"
-
-#: The publish or the handler raised.
-OUTCOME_FAILED = "failed"
-
-#: A request got its reply. The only outcome a request span can end well with,
-#: and the reason it has one at all: without it a successful round trip carries
-#: no outcome, and a query for "requests that worked" has nothing to match.
-OUTCOME_ANSWERED = "answered"
-
-#: A request reached its deadline with no reply. Java's ``MetricNames`` spells
-#: both of these, and its requester puts them on the CLIENT span; these are the
-#: same two words.
-OUTCOME_TIMED_OUT = "timed_out"
-
+# The words a publish or a request can end in — ``confirmed``, ``published``,
+# ``unroutable``, ``failed``, ``answered`` and ``timed_out`` — are defined in
+# :mod:`acemq_amqp.telemetry` beside the metrics that are tagged with them, and
+# re-exported here: a span and a counter describing the same publish have to say
+# the same word, and the only way to be sure of that is for there to be one
+# word. ``tracing.OUTCOME_CONFIRMED`` still resolves, and is the same string.
+#
 # The five a delivery can end in — ``acked``, ``retried``, ``rejected``,
 # ``dead_lettered`` and ``parked`` — are defined in :mod:`acemq_amqp.ack` and
 # re-exported here, because the consumer decides them and this only writes them
@@ -223,10 +215,10 @@ OUTCOME_TIMED_OUT = "timed_out"
 #: to Java's.
 #:
 #: ``parked`` is absent for the same reason ``rejected`` is: a handler that
-#: parks a message decided to, on purpose, having read it. The counter
-#: ``acemq.messages.parked`` and the queue itself are what an operator watches
-#: for those; painting the trace red as well would make a deliberate decision
-#: look like a fault.
+#: parks a message decided to, on purpose, having read it. The ``parked`` outcome
+#: on ``acemq.messages.dead.lettered.total`` and the queue itself are what an
+#: operator watches for those; painting the trace red as well would make a
+#: deliberate decision look like a fault.
 ERROR_OUTCOMES = frozenset({OUTCOME_UNROUTABLE, OUTCOME_FAILED, OUTCOME_DEAD_LETTERED})
 
 #: The events recorded on the current span rather than as spans of their own.

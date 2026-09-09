@@ -31,16 +31,12 @@ import pytest
 from fake_transport import FakeTransport
 
 from acemq_amqp import (
-    METRIC_ACCEPTED,
-    METRIC_CONSUMED,
-    METRIC_DEAD_LETTERED,
-    METRIC_HANDLER_DURATION,
-    METRIC_IN_FLIGHT,
-    METRIC_PARKED,
-    METRIC_PUBLISH_FAILED,
-    METRIC_PUBLISHED,
-    METRIC_REJECTED,
-    METRIC_RETRIED,
+    METRIC_CONSUME_DURATION,
+    METRIC_CONSUME_IN_FLIGHT,
+    METRIC_CONSUME_TOTAL,
+    METRIC_DEAD_LETTERED_TOTAL,
+    METRIC_PUBLISH_TOTAL,
+    METRIC_RETRIED_TOTAL,
     METRIC_RUNG_MISSING,
     METRIC_SET_ASIDE_FAILED,
     Ack,
@@ -60,8 +56,20 @@ from acemq_amqp import (
     reject,
     retry,
 )
+from acemq_amqp.ack import (
+    OUTCOME_ACKED,
+    OUTCOME_DEAD_LETTERED,
+    OUTCOME_PARKED,
+    OUTCOME_REJECTED,
+    OUTCOME_RETRIED,
+)
 from acemq_amqp.connection import Handler
-from acemq_amqp.telemetry import DurationSummary, metric_key
+from acemq_amqp.telemetry import (
+    OUTCOME_CONFIRMED,
+    OUTCOME_UNROUTABLE,
+    DurationSummary,
+    metric_key,
+)
 from acemq_amqp.topology import Topology
 
 QUEUE = "orders.new"
@@ -106,38 +114,47 @@ def wire() -> dict[str, Any]:
 
 
 def test_the_metric_names_are_the_ones_the_other_libraries_publish() -> None:
-    # A dashboard built against Java or Go has to read against this. Pinned
-    # rather than merely used, because a rename here is silent everywhere else
-    # until somebody notices a panel has gone blank.
-    assert METRIC_PUBLISHED == "acemq.messages.published"
-    assert METRIC_PUBLISH_FAILED == "acemq.messages.publish.failed"
-    assert METRIC_CONSUMED == "acemq.messages.consumed"
-    assert METRIC_ACCEPTED == "acemq.messages.accepted"
-    assert METRIC_RETRIED == "acemq.messages.retried"
-    assert METRIC_REJECTED == "acemq.messages.rejected"
-    assert METRIC_DEAD_LETTERED == "acemq.messages.dead.lettered"
-    assert METRIC_PARKED == "acemq.messages.parked"
-    assert METRIC_HANDLER_DURATION == "acemq.handler.duration"
-    assert METRIC_IN_FLIGHT == "acemq.messages.in.flight"
-    assert METRIC_RUNG_MISSING == "acemq.retry.rung.missing"
+    # These are Java's, spelled out in acemq-amqp-api MetricNames. A dashboard
+    # built against Java or Go has to read against this. Pinned rather than
+    # merely used, because a rename here is silent everywhere else until
+    # somebody notices a panel has gone blank.
+    assert METRIC_PUBLISH_TOTAL == "acemq.publish.total"
+    assert METRIC_CONSUME_TOTAL == "acemq.consume.total"
+    assert METRIC_CONSUME_DURATION == "acemq.consume.duration"
+    assert METRIC_CONSUME_IN_FLIGHT == "acemq.consume.in.flight"
+    assert METRIC_RETRIED_TOTAL == "acemq.messages.retried.total"
+    assert METRIC_DEAD_LETTERED_TOTAL == "acemq.messages.dead.lettered.total"
     assert METRIC_SET_ASIDE_FAILED == "acemq.messages.set.aside.failed"
+    assert METRIC_RUNG_MISSING == "acemq.retry.rung.missing"
+
+
+def test_the_outcome_values_are_the_ones_the_other_libraries_tag_with() -> None:
+    # One counter with an outcome, not one counter per outcome — so the words
+    # are as much a part of the contract as the metric names are.
+    assert (OUTCOME_CONFIRMED, OUTCOME_UNROUTABLE) == ("confirmed", "unroutable")
+    assert (OUTCOME_ACKED, OUTCOME_RETRIED, OUTCOME_REJECTED) == (
+        "acked",
+        "retried",
+        "rejected",
+    )
+    assert (OUTCOME_DEAD_LETTERED, OUTCOME_PARKED) == ("dead_lettered", "parked")
 
 
 def test_a_key_is_the_same_however_the_labels_were_built() -> None:
     # Unsorted, one counter quietly becomes several that each hold part of the
     # answer, and the total on the dashboard is wrong rather than missing.
-    assert metric_key("acemq.messages.published", {"key": "a", "exchange": "b"}) == (
-        'acemq.messages.published{exchange="b",key="a"}'
+    assert metric_key("acemq.publish.total", {"key": "a", "exchange": "b"}) == (
+        'acemq.publish.total{exchange="b",key="a"}'
     )
-    assert metric_key("acemq.messages.published", {}) == "acemq.messages.published"
+    assert metric_key("acemq.publish.total", {}) == "acemq.publish.total"
 
 
 def test_a_duration_summary_keeps_the_count_the_total_and_the_extremes() -> None:
     metrics = Metrics()
     for seconds in (0.1, 0.5, 0.2):
-        metrics.observe(METRIC_HANDLER_DURATION, seconds, {"queue": QUEUE})
+        metrics.observe(METRIC_CONSUME_DURATION, seconds, {"queue": QUEUE})
 
-    summary = metrics.durations[metric_key(METRIC_HANDLER_DURATION, {"queue": QUEUE})]
+    summary = metrics.durations[metric_key(METRIC_CONSUME_DURATION, {"queue": QUEUE})]
     assert summary.count == 3
     assert summary.fastest == 0.1
     assert summary.slowest == 0.5
@@ -152,9 +169,9 @@ def test_the_null_observer_satisfies_the_interface_and_does_nothing() -> None:
     # Real object rather than None checked for at each call site, because the
     # alternative is a branch on every publish and one is eventually wrong.
     observer: Observer = NullObserver()
-    observer.count(METRIC_PUBLISHED, 1, {})
-    observer.gauge(METRIC_IN_FLIGHT, 1, {})
-    observer.observe(METRIC_HANDLER_DURATION, 1.0, {})
+    observer.count(METRIC_PUBLISH_TOTAL, 1, {})
+    observer.gauge(METRIC_CONSUME_IN_FLIGHT, 1, {})
+    observer.observe(METRIC_CONSUME_DURATION, 1.0, {})
 
 
 async def test_a_publish_is_counted_with_where_it_went() -> None:
@@ -166,10 +183,14 @@ async def test_a_publish_is_counted_with_where_it_went() -> None:
     await mq.publisher(routing_key=QUEUE).send({"id": "1"})
 
     # ``routing.key`` and not ``key``: the fully-qualified name Java and .NET
-    # already tag a publish with, so one dashboard reads across all five.
-    labels = {"exchange": "", "routing.key": QUEUE}
-    assert metrics.counts[metric_key(METRIC_PUBLISHED, labels)] == 1
-    assert metric_key(METRIC_PUBLISHED, {"exchange": "", "key": QUEUE}) not in metrics.counts
+    # already tag a publish with, so one dashboard reads across all five. The
+    # outcome is a label rather than a second metric, for the same reason.
+    labels = {"exchange": "", "routing.key": QUEUE, "outcome": OUTCOME_CONFIRMED}
+    assert metrics.counts[metric_key(METRIC_PUBLISH_TOTAL, labels)] == 1
+    assert (
+        metric_key(METRIC_PUBLISH_TOTAL, {"exchange": "", "key": QUEUE})
+        not in metrics.counts
+    )
 
 
 async def test_a_publish_that_reached_no_queue_is_counted_as_a_failure() -> None:
@@ -182,10 +203,13 @@ async def test_a_publish_that_reached_no_queue_is_counted_as_a_failure() -> None
     with pytest.raises(Exception, match="no queue"):
         await mq.publisher(routing_key="nowhere", mandatory=True).send({"id": "1"})
 
-    key = metric_key(METRIC_PUBLISH_FAILED, {"exchange": "", "routing.key": "nowhere"})
+    where = {"exchange": "", "routing.key": "nowhere"}
+    key = metric_key(METRIC_PUBLISH_TOTAL, {**where, "outcome": OUTCOME_UNROUTABLE})
     assert metrics.counts[key] == 1
-    published = metric_key(METRIC_PUBLISHED, {"exchange": "", "routing.key": "nowhere"})
-    assert published not in metrics.counts
+    # Unroutable and not merely failed: the broker took the message and had
+    # nowhere to put it, which is a topology problem rather than a broker one.
+    confirmed = metric_key(METRIC_PUBLISH_TOTAL, {**where, "outcome": OUTCOME_CONFIRMED})
+    assert confirmed not in metrics.counts
 
 
 async def test_a_handled_message_is_counted_timed_and_its_decision_recorded() -> None:
@@ -196,12 +220,15 @@ async def test_a_handled_message_is_counted_timed_and_its_decision_recorded() ->
         await transport.deliver(QUEUE, b'{"id": "1"}', headers=wire())
 
     labels = {"queue": QUEUE}
-    assert metrics.counts[metric_key(METRIC_CONSUMED, labels)] == 1
-    assert metrics.counts[metric_key(METRIC_ACCEPTED, labels)] == 1
-    assert metrics.durations[metric_key(METRIC_HANDLER_DURATION, labels)].count == 1
+    acked = {**labels, "outcome": OUTCOME_ACKED}
+    assert metrics.counts[metric_key(METRIC_CONSUME_TOTAL, acked)] == 1
+    # Timed with the outcome on it too: how long a message took and what
+    # happened to it are one question, and a p99 that mixes the messages that
+    # worked with the ones that failed answers neither half.
+    assert metrics.durations[metric_key(METRIC_CONSUME_DURATION, acked)].count == 1
     # Back to nothing in flight: the gauge is set on the way out as well as on
     # the way in, or it only ever goes up.
-    assert metrics.gauges[metric_key(METRIC_IN_FLIGHT, labels)] == 0
+    assert metrics.gauges[metric_key(METRIC_CONSUME_IN_FLIGHT, labels)] == 0
 
 
 async def test_a_rejected_message_is_counted_as_rejected_and_dead_lettered() -> None:
@@ -212,8 +239,12 @@ async def test_a_rejected_message_is_counted_as_rejected_and_dead_lettered() -> 
         await transport.deliver(QUEUE, b'{"id": "1"}', headers=wire())
 
     labels = {"queue": QUEUE}
-    assert metrics.counts[metric_key(METRIC_REJECTED, labels)] == 1
-    assert metrics.counts[metric_key(METRIC_DEAD_LETTERED, labels)] == 1
+    rejected = metric_key(METRIC_CONSUME_TOTAL, {**labels, "outcome": OUTCOME_REJECTED})
+    assert metrics.counts[rejected] == 1
+    # And the standalone counter as well, which Java also keeps: the outcome
+    # says what was decided, this says how many messages have been set aside.
+    dead = {**labels, "outcome": OUTCOME_DEAD_LETTERED}
+    assert metrics.counts[metric_key(METRIC_DEAD_LETTERED_TOTAL, dead)] == 1
 
 
 async def test_a_message_that_would_not_decode_is_counted_as_parked() -> None:
@@ -226,8 +257,17 @@ async def test_a_message_that_would_not_decode_is_counted_as_parked() -> None:
         await transport.deliver(QUEUE, b"not json at all", headers=wire())
 
     labels = {"queue": QUEUE}
-    assert metrics.counts[metric_key(METRIC_PARKED, labels)] == 1
-    assert metric_key(METRIC_DEAD_LETTERED, labels) not in metrics.counts
+    # The same counter a dead-lettering moves, told apart by the outcome — which
+    # is the whole of the difference, and enough of it: a message that failed
+    # five times and a message nothing could read are different problems, and
+    # they are two series of one metric rather than two metrics.
+    parked = {**labels, "outcome": OUTCOME_PARKED}
+    dead = {**labels, "outcome": OUTCOME_DEAD_LETTERED}
+    assert metrics.counts[metric_key(METRIC_DEAD_LETTERED_TOTAL, parked)] == 1
+    assert metric_key(METRIC_DEAD_LETTERED_TOTAL, dead) not in metrics.counts
+    # Settled without a handler ever running, and still counted once: a total
+    # that missed the messages nothing could read would not add up.
+    assert metrics.counts[metric_key(METRIC_CONSUME_TOTAL, parked)] == 1
 
 
 async def test_a_retry_says_where_the_wait_happened() -> None:
@@ -239,7 +279,7 @@ async def test_a_retry_says_where_the_wait_happened() -> None:
     async with running(handler, policy=policy) as (transport, metrics, _):
         await transport.deliver(QUEUE, b'{"id": "1"}', headers=wire())
 
-    here = metric_key(METRIC_RETRIED, {"queue": QUEUE, "where": "consumer"})
+    here = metric_key(METRIC_RETRIED_TOTAL, {"queue": QUEUE, "where": "consumer"})
     assert metrics.counts[here] == 1
 
 
@@ -252,7 +292,7 @@ async def test_a_long_retry_reaching_the_rung_is_counted_against_the_broker() ->
     async with running(handler, policy=policy) as (transport, metrics, _):
         await transport.deliver(QUEUE, b'{"id": "1"}', headers=wire())
 
-    there = metric_key(METRIC_RETRIED, {"queue": QUEUE, "where": "broker"})
+    there = metric_key(METRIC_RETRIED_TOTAL, {"queue": QUEUE, "where": "broker"})
     assert metrics.counts[there] == 1
     assert METRIC_RUNG_MISSING not in str(metrics)
 
@@ -283,7 +323,7 @@ async def test_a_missing_rung_is_counted_because_nothing_else_shows_it() -> None
     missing = metric_key(METRIC_RUNG_MISSING, {"queue": QUEUE, "rung": rung})
     assert metrics.counts[missing] == 1
     # And it fell back to waiting here, which is the whole point of the counter.
-    here = metric_key(METRIC_RETRIED, {"queue": QUEUE, "where": "consumer"})
+    here = metric_key(METRIC_RETRIED_TOTAL, {"queue": QUEUE, "where": "consumer"})
     assert metrics.counts[here] == 1
 
 
@@ -319,17 +359,39 @@ def test_metrics_render_in_the_prometheus_text_format_with_nothing_installed() -
     # A service that only wants a scrape endpoint should not have to install a
     # client library to get one, which is what this is for.
     metrics = Metrics()
-    metrics.count(METRIC_PUBLISHED, 3, {"exchange": "events", "key": "order.placed"})
-    metrics.gauge(METRIC_IN_FLIGHT, 2, {"queue": QUEUE})
-    metrics.observe(METRIC_HANDLER_DURATION, 0.25, {"queue": QUEUE})
+    metrics.count(METRIC_PUBLISH_TOTAL, 3, {"exchange": "events", "key": "order.placed"})
+    metrics.gauge(METRIC_CONSUME_IN_FLIGHT, 2, {"queue": QUEUE})
+    metrics.observe(METRIC_CONSUME_DURATION, 0.25, {"queue": QUEUE})
 
     body = prometheus_text(metrics)
 
-    assert '# TYPE acemq_messages_published counter' in body
-    assert 'acemq_messages_published{exchange="events",key="order.placed"} 3' in body
-    assert 'acemq_messages_in_flight{queue="orders.new"} 2' in body
-    assert 'acemq_handler_duration_count{queue="orders.new"} 1' in body
-    assert 'acemq_handler_duration_sum{queue="orders.new"} 0.25' in body
+    assert "# TYPE acemq_publish_total counter" in body
+    assert 'acemq_publish_total{exchange="events",key="order.placed"} 3' in body
+    assert 'acemq_consume_in_flight{queue="orders.new"} 2' in body
+    assert 'acemq_consume_duration_count{queue="orders.new"} 1' in body
+    assert 'acemq_consume_duration_sum{queue="orders.new"} 0.25' in body
+
+
+def test_a_dotted_label_name_is_rendered_as_prometheus_spells_it() -> None:
+    # ``routing.key`` is a legal tag name in Micrometer and OpenTelemetry and an
+    # illegal label name here: Prometheus allows [a-zA-Z_][a-zA-Z0-9_]* and
+    # nothing else, and one unparseable line loses the whole scrape rather than
+    # that sample. The value keeps its dots, because a routing key is where the
+    # dots mean something.
+    metrics = Metrics()
+    metrics.count(
+        METRIC_PUBLISH_TOTAL,
+        1,
+        {"exchange": "orders", "routing.key": "order.placed", "outcome": "confirmed"},
+    )
+
+    body = prometheus_text(metrics)
+
+    assert (
+        'acemq_publish_total{exchange="orders",outcome="confirmed",'
+        'routing_key="order.placed"} 1'
+    ) in body
+    assert "routing.key=" not in body
 
 
 def test_rendering_nothing_is_empty_rather_than_broken() -> None:

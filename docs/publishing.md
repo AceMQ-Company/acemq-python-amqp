@@ -192,7 +192,7 @@ its codec by reading that. See [codecs](serialization.md).
 |---|---|
 | The payload will not encode | `TypeError` from the codec, naming the type. Nothing is published |
 | An interceptor refused | whatever it raised, reaching the caller. Nothing is published — that is the point of intercepting rather than observing |
-| The broker rejected the publish | the transport's exception, unwrapped. `acemq.messages.publish.failed` is counted |
+| The broker rejected the publish | the transport's exception, unwrapped. `acemq.publish.total` is counted with `outcome="failed"` |
 | Nothing was bound to receive it | `PublishError` when `mandatory=True`; `result.routed` is `False` either way |
 
 Most of what goes wrong with a broker is the broker's own exception, and this

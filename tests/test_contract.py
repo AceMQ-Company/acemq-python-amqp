@@ -798,7 +798,7 @@ async def test_a_consumer_told_not_to_declare_still_declares_nothing() -> None:
 
     For a login with no ``configure`` permission on the vhost, and for a tool
     reading a queue it does not own. Everything it needs must then be declared by
-    somebody else — which is what ``acemq.consumer.rung_missing`` and
+    somebody else — which is what ``acemq.retry.rung.missing`` and
     ``acemq.messages.set.aside.failed`` are there to report when it was not.
     """
     transport = await _declared(retry=TOPOLOGY_POLICY)

@@ -42,8 +42,9 @@ OUTCOME_REJECTED = "rejected"
 OUTCOME_DEAD_LETTERED = "dead_lettered"
 
 #: It went to ``{queue}.parked`` rather than to the dead letters, because
-#: nothing could read it. The same word the ``acemq.messages.parked`` counter
-#: uses, and the word the engine already used for a body that would not decode.
+#: nothing could read it. The same word the ``parked`` outcome on
+#: ``acemq.messages.dead.lettered.total`` uses, and the word the engine already
+#: used for a body that would not decode.
 OUTCOME_PARKED = "parked"
 
 

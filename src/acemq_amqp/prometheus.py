@@ -43,11 +43,17 @@ from typing import Any
 
 from .errors import AceMQError
 from .telemetry import (
-    METRIC_HANDLER_DURATION,
-    METRIC_IN_FLIGHT,
+    METRIC_CONSUME_DURATION,
+    METRIC_CONSUME_IN_FLIGHT,
+    METRIC_CONSUME_TOTAL,
+    METRIC_DEAD_LETTERED_TOTAL,
+    METRIC_PUBLISH_TOTAL,
+    METRIC_RETRIED_TOTAL,
+    METRIC_RUNG_MISSING,
+    METRIC_SET_ASIDE_FAILED,
 )
 
-#: Buckets for :data:`~acemq_amqp.telemetry.METRIC_HANDLER_DURATION`, in
+#: Buckets for :data:`~acemq_amqp.telemetry.METRIC_CONSUME_DURATION`, in
 #: seconds.
 #:
 #: Reaching to a minute because a handler that talks to something slow really
@@ -113,13 +119,13 @@ class PrometheusObserver:
         self._label_names: dict[str, tuple[str, ...]] = {}
 
     def count(self, metric: str, delta: int, labels: Mapping[str, str]) -> None:
-        self._for(metric, labels, self._counter).labels(**labels).inc(delta)
+        self._for(metric, labels, self._counter).labels(**_named(labels)).inc(delta)
 
     def gauge(self, metric: str, value: int, labels: Mapping[str, str]) -> None:
-        self._for(metric, labels, self._gauge).labels(**labels).set(value)
+        self._for(metric, labels, self._gauge).labels(**_named(labels)).set(value)
 
     def observe(self, metric: str, seconds: float, labels: Mapping[str, str]) -> None:
-        self._for(metric, labels, self._histogram).labels(**labels).observe(seconds)
+        self._for(metric, labels, self._histogram).labels(**_named(labels)).observe(seconds)
 
     def _for(self, metric: str, labels: Mapping[str, str], make: Any) -> Any:
         """The collector for a metric, made once and kept.
@@ -129,7 +135,7 @@ class PrometheusObserver:
         raises rather than corrupting anything. Everything after the first
         message reads a dictionary.
         """
-        names = tuple(sorted(labels))
+        names = tuple(sorted(_named(labels)))
         known = self._label_names.get(metric)
         if known is None:
             self._label_names[metric] = names
@@ -177,8 +183,14 @@ class PrometheusObserver:
 
 #: What each metric means, for the HELP line a scraper shows beside it.
 _HELP = {
-    METRIC_HANDLER_DURATION: "How long a handler takes, in seconds",
-    METRIC_IN_FLIGHT: "Messages being handled right now",
+    METRIC_PUBLISH_TOTAL: "Publishes, by outcome",
+    METRIC_CONSUME_TOTAL: "Deliveries settled, by outcome",
+    METRIC_CONSUME_DURATION: "How long a delivery takes, in seconds",
+    METRIC_CONSUME_IN_FLIGHT: "Messages being handled right now",
+    METRIC_RETRIED_TOTAL: "Messages given another attempt",
+    METRIC_DEAD_LETTERED_TOTAL: "Messages sent to a dead-letter or parking queue",
+    METRIC_RUNG_MISSING: "Long retries that waited in the consumer for want of a rung queue",
+    METRIC_SET_ASIDE_FAILED: "Messages that could not be moved out of the way",
 }
 
 
@@ -187,9 +199,25 @@ def _documentation(metric: str) -> str:
 
 
 def _prometheus_name(metric: str) -> str:
-    """``acemq.messages.published`` becomes ``acemq_messages_published``.
+    """``acemq.consume.total`` becomes ``acemq_consume_total``.
 
     Prometheus does not allow dots in a metric name, and the AceMQ names use
     them because Micrometer and OpenTelemetry do.
     """
     return metric.replace(".", "_")
+
+
+def _named(labels: Mapping[str, str]) -> dict[str, str]:
+    """The same labels under names Prometheus will accept.
+
+    ``routing.key`` and ``message.type`` are legal tag names everywhere else in
+    the family and illegal here: a Prometheus label name is
+    ``[a-zA-Z_][a-zA-Z0-9_]*`` and nothing else, and prometheus-client refuses
+    the collector rather than the sample — so a publish counter tagged with the
+    routing key would take the whole publisher down at the first message rather
+    than quietly under-report.
+
+    Values are left exactly as they are. A routing key is a value, and its dots
+    are the meaning.
+    """
+    return {name.replace(".", "_"): value for name, value in labels.items()}

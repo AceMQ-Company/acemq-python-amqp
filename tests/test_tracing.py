@@ -47,10 +47,9 @@ from acemq_amqp.interceptors import ConsumeContext, PublishContext
 from acemq_amqp.patterns.requestreply import RequestTimeoutError
 from acemq_amqp.retry import RetryPolicy, fixed_retry, no_retry
 from acemq_amqp.telemetry import (
-    METRIC_ACCEPTED,
-    METRIC_DEAD_LETTERED,
-    METRIC_REJECTED,
-    METRIC_RETRIED,
+    METRIC_CONSUME_TOTAL,
+    METRIC_DEAD_LETTERED_TOTAL,
+    METRIC_RETRIED_TOTAL,
     Metrics,
     Observer,
 )
@@ -950,26 +949,37 @@ async def test_a_chain_nobody_is_driving_still_ends_its_span_where_it_started(
 # The counters and the span, on the same delivery
 
 
-#: Which counter each outcome is allowed to have moved, and no other.
+#: Which standalone counter each outcome is allowed to have moved, beside the
+#: one ``acemq.consume.total`` that every settled delivery moves.
 #:
-#: ``rejected`` moves two because the message really did go to the dead-letter
-#: queue as well as being refused; the two counters answer different questions —
-#: who decided, and where it ended up — and a dashboard adds them for neither.
-VERDICT_COUNTERS = {
-    "acked": {METRIC_ACCEPTED},
-    "retried": {METRIC_RETRIED},
-    "rejected": {METRIC_REJECTED, METRIC_DEAD_LETTERED},
-    "dead_lettered": {METRIC_DEAD_LETTERED},
+#: ``rejected`` moves the dead-letter counter because the message really did go
+#: to the dead-letter queue as well as being refused; the outcome says who
+#: decided and the counter says where it ended up, and a dashboard adds them for
+#: neither.
+VERDICT_COUNTERS: dict[str, set[str]] = {
+    "acked": set(),
+    "retried": {METRIC_RETRIED_TOTAL},
+    "rejected": {METRIC_DEAD_LETTERED_TOTAL},
+    "dead_lettered": {METRIC_DEAD_LETTERED_TOTAL},
 }
 
 
 def moved(metrics: Metrics) -> set[str]:
-    """Which of the four verdict counters this delivery moved."""
+    """Which of the standalone counters this delivery moved."""
     return {
         metric
-        for metric in VERDICT_COUNTERS["rejected"] | {METRIC_ACCEPTED, METRIC_RETRIED}
+        for metric in (METRIC_RETRIED_TOTAL, METRIC_DEAD_LETTERED_TOTAL)
         for key, count in metrics.counts.items()
         if count > 0 and (key == metric or key.startswith(metric + "{"))
+    }
+
+
+def counted_outcomes(metrics: Metrics) -> set[str]:
+    """The outcomes ``acemq.consume.total`` was tagged with."""
+    return {
+        key.partition('outcome="')[2].partition('"')[0]
+        for key, count in metrics.counts.items()
+        if count > 0 and key.startswith(METRIC_CONSUME_TOTAL + "{")
     }
 
 
@@ -1023,6 +1033,9 @@ async def test_the_counters_and_the_span_reach_the_same_verdict(
 
     outcome = named(spans, "orders.new process").attributes[ATTR_OUTCOME]
     assert outcome == expected
+    assert counted_outcomes(metrics) == {outcome}, (
+        f"the span says {outcome} and the counter says {sorted(counted_outcomes(metrics))}"
+    )
     assert moved(metrics) == VERDICT_COUNTERS[outcome], (
         f"the span says {outcome} and the counters say {sorted(moved(metrics))}"
     )
@@ -1055,6 +1068,7 @@ async def test_a_retry_the_broker_has_to_take_back_is_still_counted_as_one(
     assert settlement.requeued, "the broker was asked to hand it back"
     outcome = named(spans, "orders.new process").attributes[ATTR_OUTCOME]
     assert outcome == "retried"
+    assert counted_outcomes(metrics) == {outcome}
     assert moved(metrics) == VERDICT_COUNTERS[outcome]
 
 

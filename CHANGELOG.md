@@ -12,7 +12,8 @@ While the version is `0.x` the public API may change in any release.
 
 - **`park(error)` joins `accept`, `retry` and `reject` in the handler's
   vocabulary.** It settles the message onto `{queue}.parked`, counts on
-  `acemq.messages.parked`, and puts `parked` on the delivery's `process` span.
+  `acemq.messages.dead.lettered.total` with `outcome="parked"`, and puts
+  `parked` on the delivery's `process` span.
   The engine could already park — a body its codec refuses goes there before
   any handler runs — but a handler could not ask for it, so one that got a layer
   further in and found a schema it was never taught had to `reject` the message
@@ -25,8 +26,9 @@ While the version is `0.x` the public API may change in any release.
   went to a different queue. Go and Ruby are adding the same word.
 
 - A parked span is **not** an `ERROR`, for the same reason `rejected` is not: it
-  is a decision a handler made on purpose. `acemq.messages.parked` and the queue
-  itself are what an operator watches for those.
+  is a decision a handler made on purpose. The `parked` outcome on
+  `acemq.messages.dead.lettered.total` and the queue itself are what an operator
+  watches for those.
 
 - **`Message.reply_to`**, and `reply_to` on `Outbound`, `Delivery`,
   `PublishContext`, `ConsumeContext` and `Publisher.send(...)` — AMQP's own
@@ -298,6 +300,74 @@ While the version is `0.x` the public API may change in any release.
 
 ### Changed
 
+- **Every metric is renamed onto Java's vocabulary. This breaks every existing
+  Python dashboard.** Java's `MetricNames` in `acemq-amqp-api` is the family's
+  vocabulary and Go, Python and Ruby are moving onto it. Python's names were an
+  entirely disjoint set: no dashboard could read Python and Java together,
+  though `docs/observability.md` said one could — that claim is corrected here
+  as well as the names.
+
+  | Old | New |
+  |---|---|
+  | `acemq.messages.published` | `acemq.publish.total{outcome="confirmed"}` |
+  | `acemq.messages.publish.failed` | `acemq.publish.total{outcome="unroutable"}` for a mandatory publish that reached no queue, `{outcome="failed"}` for one that did not reach the broker |
+  | `acemq.messages.consumed` | *gone* — the sum of `acemq.consume.total` across its outcomes is how many arrived |
+  | `acemq.messages.accepted` | `acemq.consume.total{outcome="acked"}` |
+  | `acemq.messages.retried` | `acemq.consume.total{outcome="retried"}`, and `acemq.messages.retried.total`, which keeps its `where` label |
+  | `acemq.messages.rejected` | `acemq.consume.total{outcome="rejected"}` |
+  | `acemq.messages.dead.lettered` | `acemq.messages.dead.lettered.total{outcome="dead_lettered"}`, and `acemq.consume.total{outcome="dead_lettered"}` |
+  | `acemq.messages.parked` | `acemq.messages.dead.lettered.total{outcome="parked"}`, and `acemq.consume.total{outcome="parked"}` |
+  | `acemq.handler.duration` | `acemq.consume.duration`, now tagged with the outcome |
+  | `acemq.messages.in.flight` | `acemq.consume.in.flight` |
+  | `acemq.retry.rung.missing` | unchanged |
+  | `acemq.messages.set.aside.failed` | unchanged |
+
+  The shape changes as well as the spelling: **where Python had one counter per
+  outcome, there is now one counter with an `outcome` tag**, which is what a
+  dashboard wants — a failure rate is a ratio between two series of one metric
+  and not a division between two differently-named ones. `acemq.messages.retried.total`
+  and `acemq.messages.dead.lettered.total` stay as standalone counters beside
+  the tagged one, exactly as Java keeps them: the outcome says what was decided
+  about a delivery, the counter says how many messages are going round again or
+  have been set aside, and that second number is the one an alert is written
+  against.
+
+  `acemq.messages.consumed` has no replacement on purpose. It counted arrivals
+  and the others counted settlements, so it always led them by however many
+  messages were in flight — two counters for one thing that never agreed. Every
+  delivery is now counted exactly once, when it is settled, including a body
+  that would not decode.
+
+  **Parking is no longer a metric of its own.** Java had no name for it when
+  this began and has one now — it is `acemq.messages.dead.lettered.total` with
+  `outcome="parked"`, the same counter a dead-lettering moves — so
+  `acemq.messages.parked` and `METRIC_PARKED` are gone. Both are a message this
+  queue gave up on, and an operator asking how much a queue is giving up on
+  wants one number that can then be split; the split still matters, and the tag
+  is what keeps it. `acemq.messages.set.aside.failed` is unchanged and is now
+  Java's name too, `target` tag included.
+
+  The constants are renamed with the metrics — `METRIC_PUBLISH_TOTAL`,
+  `METRIC_CONSUME_TOTAL`, `METRIC_CONSUME_DURATION`, `METRIC_CONSUME_IN_FLIGHT`,
+  `METRIC_RETRIED_TOTAL`, `METRIC_DEAD_LETTERED_TOTAL` — and the tag names and
+  publish outcomes are constants too, in `acemq_amqp.telemetry`. The delivery
+  outcomes are the `OUTCOME_*` names in `acemq_amqp.ack` that the settlement and
+  the span already used, so the counter and the span now carry the same word for
+  the same delivery by construction.
+
+- **Dotted tag names are rewritten for Prometheus rather than emitted as they
+  are.** `routing.key` and `message.type` are legal tag names in Micrometer and
+  OpenTelemetry and illegal label names in Prometheus, which allows
+  `[a-zA-Z_][a-zA-Z0-9_]*` and nothing else. `prometheus_text` was rendering
+  `acemq_messages_published{routing.key="…"}`, which a scraper rejects *in
+  full* — the whole scrape, not the one sample it could not parse — so the
+  publish counters were reaching nobody. It now writes `routing_key`.
+  `PrometheusObserver` sanitises the names it registers too: a
+  prometheus-client old enough to validate label names refuses the collector
+  outright, which takes the publisher down at the first message rather than
+  under-reporting. Label **values** are untouched: a routing key is where the
+  dots mean something.
+
 - **A request now carries its return address twice, and a responder reads
   either.** `Requester.ask` sets AMQP's own `reply-to` property *and* the
   `acemq-reply-to` header to the same queue; `serve` reads the header first and
@@ -330,8 +400,9 @@ While the version is `0.x` the public API may change in any release.
   **This changes a label an existing dashboard may group by.** In Prometheus the
   rendered label goes from `key="order.placed"` to `routing_key="order.placed"`,
   so a query reading `acemq_messages_published{key=...}` or grouping `by (key)`
-  needs the name changed. Nothing else about the counter moves: same metric
-  names, same `exchange` tag, same values. Consumer-side counters are untouched.
+  needs the name changed. The metric names moved in the same release — see the
+  rename onto Java's vocabulary above — so a dashboard is being rewritten
+  anyway; the tag is `routing.key` on whichever counter it lands on.
 
 - **The tracer is registered as `org.acemq.amqp` rather than `acemq_amqp`**, and
   the `pipeline.run_finished` event's keys are `pipeline`, `step` and `outcome`

@@ -32,9 +32,8 @@ import pytest
 from fake_transport import FakeTransport
 
 from acemq_amqp import (
-    METRIC_DEAD_LETTERED,
-    METRIC_PARKED,
-    METRIC_REJECTED,
+    METRIC_CONSUME_TOTAL,
+    METRIC_DEAD_LETTERED_TOTAL,
     Ack,
     Envelope,
     FatalError,
@@ -248,9 +247,14 @@ async def test_a_parked_message_is_counted_as_parked_and_not_as_dead_lettered() 
     # The same counter the engine already used for a body that would not decode.
     # One parked queue, one parked counter, whether the codec or the handler was
     # the one that could not read it.
-    assert metrics.counts[metric_key(METRIC_PARKED, labels)] == 1
-    assert metric_key(METRIC_DEAD_LETTERED, labels) not in metrics.counts
-    assert metric_key(METRIC_REJECTED, labels) not in metrics.counts
+    parked = {**labels, "outcome": "parked"}
+    dead = {**labels, "outcome": "dead_lettered"}
+    assert metrics.counts[metric_key(METRIC_DEAD_LETTERED_TOTAL, parked)] == 1
+    assert metric_key(METRIC_DEAD_LETTERED_TOTAL, dead) not in metrics.counts
+    # And the delivery is counted once, as parked and as nothing else.
+    assert metrics.counts[metric_key(METRIC_CONSUME_TOTAL, parked)] == 1
+    rejected = {**labels, "outcome": "rejected"}
+    assert metric_key(METRIC_CONSUME_TOTAL, rejected) not in metrics.counts
 
 
 async def test_a_parked_message_says_parked_on_its_settlement() -> None:

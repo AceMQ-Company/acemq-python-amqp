@@ -35,7 +35,8 @@ The parked queue is reached two ways and they mean the same thing. The engine
 parks a body its codec refuses, before any handler runs; a handler that gets
 one layer further in and finds a schema it was never taught returns
 [`park(error)`](consuming.md#reject-or-park) and lands in the same place. Both
-count on `acemq.messages.parked`, and neither is filed with the dead letters —
+count on `acemq.messages.dead.lettered.total{outcome="parked"}`, and neither is
+filed with the dead letters themselves —
 which is the entire reason there are two queues.
 
 `Topology().queue(name, dead_letter=True)` declares both, and **so does the

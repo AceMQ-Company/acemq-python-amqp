@@ -25,9 +25,9 @@ import pytest
 from fake_transport import FakeTransport
 
 from acemq_amqp import (
-    METRIC_HANDLER_DURATION,
-    METRIC_IN_FLIGHT,
-    METRIC_PUBLISHED,
+    METRIC_CONSUME_DURATION,
+    METRIC_CONSUME_IN_FLIGHT,
+    METRIC_PUBLISH_TOTAL,
     AceMQError,
     Connection,
     Observer,
@@ -61,22 +61,25 @@ def test_it_is_an_observer(registry: object) -> None:
 def test_a_counter_reaches_the_registry_with_its_labels(registry: object) -> None:
     observer = PrometheusObserver(registry)
 
-    observer.count(METRIC_PUBLISHED, 2, {"exchange": "events", "key": "order.placed"})
+    observer.count(METRIC_PUBLISH_TOTAL, 2, {"exchange": "events", "key": "order.placed"})
 
     body = rendered(registry)
-    assert 'acemq_messages_published_total{exchange="events",key="order.placed"} 2.0' in body
+    # ``acemq.publish.total`` and not ``acemq_publish_total_total``: the client
+    # strips the suffix it is about to add back, so the name a dashboard queries
+    # is the AceMQ one with the dots swapped.
+    assert 'acemq_publish_total{exchange="events",key="order.placed"} 2.0' in body
 
 
 def test_a_gauge_and_a_histogram_reach_it_too(registry: object) -> None:
     observer = PrometheusObserver(registry)
 
-    observer.gauge(METRIC_IN_FLIGHT, 3, {"queue": QUEUE})
-    observer.observe(METRIC_HANDLER_DURATION, 0.25, {"queue": QUEUE})
+    observer.gauge(METRIC_CONSUME_IN_FLIGHT, 3, {"queue": QUEUE})
+    observer.observe(METRIC_CONSUME_DURATION, 0.25, {"queue": QUEUE})
 
     body = rendered(registry)
-    assert 'acemq_messages_in_flight{queue="orders.new"} 3.0' in body
-    assert 'acemq_handler_duration_count{queue="orders.new"} 1.0' in body
-    assert 'acemq_handler_duration_sum{queue="orders.new"} 0.25' in body
+    assert 'acemq_consume_in_flight{queue="orders.new"} 3.0' in body
+    assert 'acemq_consume_duration_count{queue="orders.new"} 1.0' in body
+    assert 'acemq_consume_duration_sum{queue="orders.new"} 0.25' in body
 
 
 def test_the_collector_is_made_once_however_many_messages_go_through(
@@ -87,9 +90,9 @@ def test_the_collector_is_made_once_however_many_messages_go_through(
     observer = PrometheusObserver(registry)
 
     for _ in range(3):
-        observer.count(METRIC_PUBLISHED, 1, {"exchange": "", "key": QUEUE})
+        observer.count(METRIC_PUBLISH_TOTAL, 1, {"exchange": "", "key": QUEUE})
 
-    assert 'acemq_messages_published_total{exchange="",key="orders.new"} 3.0' in rendered(
+    assert 'acemq_publish_total{exchange="",key="orders.new"} 3.0' in rendered(
         registry
     )
 
@@ -97,9 +100,9 @@ def test_the_collector_is_made_once_however_many_messages_go_through(
 def test_a_namespace_prefixes_everything(registry: object) -> None:
     observer = PrometheusObserver(registry, namespace="shipping")
 
-    observer.count(METRIC_PUBLISHED, 1, {"exchange": "", "key": QUEUE})
+    observer.count(METRIC_PUBLISH_TOTAL, 1, {"exchange": "", "key": QUEUE})
 
-    assert "shipping_acemq_messages_published_total" in rendered(registry)
+    assert "shipping_acemq_publish_total" in rendered(registry)
 
 
 def test_the_same_metric_with_different_labels_is_refused_loudly(registry: object) -> None:
@@ -107,10 +110,10 @@ def test_the_same_metric_with_different_labels_is_refused_loudly(registry: objec
     # worse than an exception naming the metric. It would be a bug in this
     # library rather than in the caller, which is what the message says.
     observer = PrometheusObserver(registry)
-    observer.count(METRIC_PUBLISHED, 1, {"exchange": "", "key": QUEUE})
+    observer.count(METRIC_PUBLISH_TOTAL, 1, {"exchange": "", "key": QUEUE})
 
     with pytest.raises(AceMQError, match="bug in acemq-amqp"):
-        observer.count(METRIC_PUBLISHED, 1, {"queue": QUEUE})
+        observer.count(METRIC_PUBLISH_TOTAL, 1, {"queue": QUEUE})
 
 
 async def test_a_connection_reports_through_it(registry: object) -> None:
@@ -122,8 +125,10 @@ async def test_a_connection_reports_through_it(registry: object) -> None:
 
     # The tag is ``routing.key``, which Prometheus spells ``routing_key`` — the
     # same label Java and .NET already export, so one dashboard reads across all
-    # five.
+    # five. Rewritten by this library rather than left to the client: a
+    # prometheus-client old enough to validate label names refuses the collector
+    # outright, which would take the publisher down at the first message.
     assert (
-        'acemq_messages_published_total{exchange="",routing_key="orders.new"} 1.0'
+        'acemq_publish_total{exchange="",outcome="confirmed",routing_key="orders.new"} 1.0'
         in rendered(registry)
     )

@@ -216,7 +216,7 @@ consumer = await mq.consume("orders.new", handle, declare=False)
 ```
 
 Everything such a consumer publishes to must then be declared by somebody else.
-`acemq.consumer.rung_missing` and `acemq.messages.set.aside.failed` are what say
+`acemq.retry.rung.missing` and `acemq.messages.set.aside.failed` are what say
 it was not.
 
 ## Reading it before applying it

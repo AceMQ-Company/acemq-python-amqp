@@ -174,13 +174,13 @@ A fake that quietly accepts everything tests that your code compiles.
 ## Testing the numbers
 
 ```python
-from acemq_amqp import METRIC_DEAD_LETTERED, Metrics
+from acemq_amqp import METRIC_DEAD_LETTERED_TOTAL, Metrics
 from acemq_amqp.telemetry import metric_key
 
 metrics = Metrics()
 mq = Connection(transport, observer=metrics)
 ...
-assert metrics.counts[metric_key(METRIC_DEAD_LETTERED, {"queue": "orders"})] == 1
+assert metrics.counts[metric_key(METRIC_DEAD_LETTERED_TOTAL, {"queue": "orders"})] == 1
 ```
 
 `metric_key` builds the same key the library does, with the labels sorted, so a

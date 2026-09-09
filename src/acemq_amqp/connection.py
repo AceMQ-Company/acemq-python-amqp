@@ -62,18 +62,22 @@ from .interceptors import (
 from .retry import ZERO, RetryPolicy, Wait, no_retry
 from .security import Security
 from .telemetry import (
-    METRIC_ACCEPTED,
-    METRIC_CONSUMED,
-    METRIC_DEAD_LETTERED,
-    METRIC_HANDLER_DURATION,
-    METRIC_IN_FLIGHT,
-    METRIC_PARKED,
-    METRIC_PUBLISH_FAILED,
-    METRIC_PUBLISHED,
-    METRIC_REJECTED,
-    METRIC_RETRIED,
+    METRIC_CONSUME_DURATION,
+    METRIC_CONSUME_IN_FLIGHT,
+    METRIC_CONSUME_TOTAL,
+    METRIC_DEAD_LETTERED_TOTAL,
+    METRIC_PUBLISH_TOTAL,
+    METRIC_RETRIED_TOTAL,
     METRIC_RUNG_MISSING,
     METRIC_SET_ASIDE_FAILED,
+    OUTCOME_CONFIRMED,
+    OUTCOME_FAILED,
+    OUTCOME_UNROUTABLE,
+    TAG_EXCHANGE,
+    TAG_OUTCOME,
+    TAG_QUEUE,
+    TAG_ROUTING_KEY,
+    TAG_TARGET,
     HealthReport,
     HealthStatus,
     NullObserver,
@@ -228,7 +232,7 @@ class Publisher:
         # ``routing.key`` and not ``key``: Java and .NET both tag a publish with
         # the fully-qualified name, and a dashboard that groups by it should
         # read the same in all five languages.
-        labels = {"exchange": context.exchange, "routing.key": context.routing_key}
+        labels = {TAG_EXCHANGE: context.exchange, TAG_ROUTING_KEY: context.routing_key}
 
         try:
             result = await self._connection.publish_raw(
@@ -245,7 +249,7 @@ class Publisher:
                 ),
             )
         except Exception:
-            observer.count(METRIC_PUBLISH_FAILED, 1, labels)
+            observer.count(METRIC_PUBLISH_TOTAL, 1, {**labels, TAG_OUTCOME: OUTCOME_FAILED})
             raise
 
         # Raised rather than left in the result, because a caller who does not
@@ -253,7 +257,9 @@ class Publisher:
         # somewhere. Unroutable is the quietest failure AMQP has: the publish
         # succeeds, the consumer waits, and nothing anywhere says why.
         if context.mandatory and not result.routed:
-            observer.count(METRIC_PUBLISH_FAILED, 1, labels)
+            observer.count(
+                METRIC_PUBLISH_TOTAL, 1, {**labels, TAG_OUTCOME: OUTCOME_UNROUTABLE}
+            )
             raise PublishError(
                 context.envelope.id,
                 context.exchange,
@@ -262,7 +268,7 @@ class Publisher:
                 unroutable=True,
             )
 
-        observer.count(METRIC_PUBLISHED, 1, labels)
+        observer.count(METRIC_PUBLISH_TOTAL, 1, {**labels, TAG_OUTCOME: OUTCOME_CONFIRMED})
         return result
 
 
@@ -337,7 +343,7 @@ class Consumer:
 
     @property
     def _labels(self) -> dict[str, str]:
-        return {"queue": self._queue}
+        return {TAG_QUEUE: self._queue}
 
     @property
     def _observer(self) -> Observer:
@@ -399,14 +405,18 @@ class Consumer:
 
     async def _handle(self, delivery: Delivery) -> None:
         envelope = Envelope.from_headers(delivery.headers, delivery.routing_key)
-        self._observer.count(METRIC_CONSUMED, 1, self._labels)
+        # No counter for "a message arrived": every delivery is counted once
+        # when it is settled, on ``acemq.consume.total`` with the outcome, and
+        # the sum across the outcomes is how many arrived. One counter that
+        # leads the others by however many messages are in flight is a counter
+        # that makes an operator wonder which one is lying.
         self._in_flight += 1
-        self._observer.gauge(METRIC_IN_FLIGHT, self._in_flight, self._labels)
+        self._observer.gauge(METRIC_CONSUME_IN_FLIGHT, self._in_flight, self._labels)
         try:
             await self._handle_one(delivery, envelope)
         finally:
             self._in_flight -= 1
-            self._observer.gauge(METRIC_IN_FLIGHT, self._in_flight, self._labels)
+            self._observer.gauge(METRIC_CONSUME_IN_FLIGHT, self._in_flight, self._labels)
 
     async def _handle_one(self, delivery: Delivery, envelope: Envelope) -> None:
         try:
@@ -420,6 +430,14 @@ class Consumer:
             # different answers — one is usually the world, the other is usually
             # a producer — and whoever drains the dead letters should not have
             # to sort them by hand.
+            #
+            # Counted as a settled delivery here rather than in ``_carry_out``,
+            # which this path never reaches: no handler ran, so there is no
+            # duration to record, but the message did arrive and was dealt with
+            # and a total that missed it would not add up.
+            self._observer.count(
+                METRIC_CONSUME_TOTAL, 1, {**self._labels, TAG_OUTCOME: OUTCOME_PARKED}
+            )
             await self._park(
                 delivery, envelope, f"could not be decoded: {_describe(failure)}"
             )
@@ -456,14 +474,17 @@ class Consumer:
             # refused message is retried and then dead-lettered rather than
             # acknowledged as though something had processed it.
             decision = Ack(Action.RETRY, failure)
-        finally:
-            # Timed around the interceptors as well as the handler, because
-            # what an operator wants to know is how long a message takes to
-            # deal with, and an interceptor that opens a transaction is part of
-            # dealing with it.
-            self._observer.observe(
-                METRIC_HANDLER_DURATION, time.monotonic() - started, self._labels
-            )
+
+        # Timed around the interceptors as well as the handler, because what an
+        # operator wants to know is how long a message takes to deal with, and
+        # an interceptor that opens a transaction is part of dealing with it.
+        # Stopped here and recorded a few lines below rather than in a
+        # ``finally``, because the duration is tagged with the outcome and the
+        # outcome is not known until ``_decide`` has run: how long a message
+        # took and what happened to it are one question, and a p99 that mixes
+        # the messages that worked with the ones that timed out answers neither
+        # half of it.
+        elapsed = time.monotonic() - started
 
         # Whatever the interceptors left, rather than what arrived: one that
         # rewrote the envelope on the way in meant that rewrite for the retry
@@ -482,6 +503,12 @@ class Consumer:
                 ),
                 None,
             )
+
+        self._observer.observe(
+            METRIC_CONSUME_DURATION,
+            elapsed,
+            {**self._labels, TAG_OUTCOME: settlement.outcome},
+        )
 
         # Announced before it is carried out, and so before a consumer-side
         # retry sleeps out its backoff. A listener told afterwards would be
@@ -602,9 +629,20 @@ class Consumer:
         request rather than the answer would report a retry for a message
         nothing will ever try again — so the dead letters would be undercounted
         by exactly the messages an operator most wants to find.
+
+        One ``acemq.consume.total`` per delivery, carrying the outcome, and then
+        whichever of the standalone counters applies. ``retried`` and
+        ``dead_lettered`` are both an outcome here and a counter of their own,
+        which is what Java does and is not a redundancy: the outcome says what
+        was decided about a delivery, and the counter says how many messages are
+        going round again or have been set aside, which is the number an alert
+        is written against.
         """
+        self._observer.count(
+            METRIC_CONSUME_TOTAL, 1, {**self._labels, TAG_OUTCOME: settlement.outcome}
+        )
+
         if settlement.outcome == OUTCOME_ACKED:
-            self._observer.count(METRIC_ACCEPTED, 1, self._labels)
             await delivery.ack()
             return
 
@@ -616,8 +654,6 @@ class Consumer:
             return
 
         if wait is None:
-            if settlement.outcome == OUTCOME_REJECTED:
-                self._observer.count(METRIC_REJECTED, 1, self._labels)
             await self._dead_letter(delivery, envelope, settlement.reason or "")
             return
 
@@ -697,7 +733,7 @@ class Consumer:
             )
             return False
 
-        self._observer.count(METRIC_RETRIED, 1, {**self._labels, "where": "broker"})
+        self._observer.count(METRIC_RETRIED_TOTAL, 1, {**self._labels, "where": "broker"})
         log.info(
             "acemq: retrying %s from %s, attempt %d of %d, after %s in %s",
             envelope.id,
@@ -738,7 +774,7 @@ class Consumer:
             # place where the counters and the span disagreed about the same
             # delivery. The label says which path it took, because a requeue
             # keeps the attempt header it arrived with and the other two do not.
-            self._observer.count(METRIC_RETRIED, 1, {**self._labels, "where": "requeued"})
+            self._observer.count(METRIC_RETRIED_TOTAL, 1, {**self._labels, "where": "requeued"})
             log.error(
                 "acemq: cannot republish %s onto %s for attempt %d; returning it to the broker",
                 envelope.id,
@@ -748,7 +784,7 @@ class Consumer:
             await delivery.nack(True)
             return
 
-        self._observer.count(METRIC_RETRIED, 1, {**self._labels, "where": "consumer"})
+        self._observer.count(METRIC_RETRIED_TOTAL, 1, {**self._labels, "where": "consumer"})
         log.info(
             "acemq: retrying %s from %s, attempt %d of %d, after %s",
             envelope.id,
@@ -766,7 +802,13 @@ class Consumer:
         has to look at it, and what they need to know first is that it was
         unreadable rather than unlucky.
         """
-        self._observer.count(METRIC_PARKED, 1, self._labels)
+        # The same counter a dead-lettering moves, separated by the outcome
+        # rather than by a metric of its own — which is what Java settled on, and
+        # what makes "how much is this queue giving up on" one number that can
+        # then be split into the two problems it is made of.
+        self._observer.count(
+            METRIC_DEAD_LETTERED_TOTAL, 1, {**self._labels, TAG_OUTCOME: OUTCOME_PARKED}
+        )
         await self._set_aside(delivery, envelope, naming.parked_queue(self._queue), reason)
 
     async def _dead_letter(self, delivery: Delivery, envelope: Envelope, reason: str) -> None:
@@ -784,7 +826,11 @@ class Consumer:
         dead-letter queue reads it back through the API rather than having to
         know the wire header name.
         """
-        self._observer.count(METRIC_DEAD_LETTERED, 1, self._labels)
+        self._observer.count(
+            METRIC_DEAD_LETTERED_TOTAL,
+            1,
+            {**self._labels, TAG_OUTCOME: OUTCOME_DEAD_LETTERED},
+        )
         await self._set_aside(
             delivery, envelope, naming.dead_letter_queue(self._queue), reason
         )
@@ -800,7 +846,7 @@ class Consumer:
             # put it in, the broker's own dead-lettering is the last thing left
             # between this message and nothing.
             self._observer.count(
-                METRIC_SET_ASIDE_FAILED, 1, {**self._labels, "target": target}
+                METRIC_SET_ASIDE_FAILED, 1, {**self._labels, TAG_TARGET: target}
             )
             log.error(
                 "acemq: cannot move %s to %s (%s); rejecting it to the broker instead",
