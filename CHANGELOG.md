@@ -298,9 +298,9 @@ While the version is `0.x` the public API may change in any release.
   consumer-side choice: a service that consumes a type it does not publish should
   build its codec with `AvroCodec.reading(my_schema)` instead of inventing a
   schema identifier for itself, and a service that does both can pass
-  `reader_schema=` to `AvroCodec.from_registry(...)` and keep one codec. Java
-  spells this `AvroCodec.registered(registry, readerSchema)` and .NET reads it
-  off `ReaderSchema`; Go and Ruby have no equivalent yet.
+  `reader_schema=` to `AvroCodec.from_registry(...)` and keep one codec. The
+  argument is `reader_schema` in every one of those places, which is the spelling
+  the whole family has converged on — see the note under **Changed**.
 
 - **`AvroCodec.reader_schema_text`**, the schema every message is resolved onto,
   as text. The same as `schema_text` unless a reader schema was given, which is
@@ -392,6 +392,41 @@ While the version is `0.x` the public API may change in any release.
   called out, because a dashboard is where a wrong panel does the damage.
 
 ### Changed
+
+- **"Reader schema" is the name of the idea, everywhere, and
+  `AvroCodec.reading(...)` stays.** No API changes: `reader_schema=` keeps its
+  spelling, `reading(...)` keeps its name, and nothing on the wire moves. What
+  changed is that the docstrings and `docs/serialization.md` now use one name for
+  one thing.
+
+  The family has converged on this word — Java's `readerSchema`, Ruby's
+  `reader_schema:`, Go renaming to `ReaderSchema`, .NET gaining it — and Python
+  already had the spelling. What Python did not have was the *name*: the prose
+  called it "the schema this consumer was written against", "the schema every
+  message is resolved onto" and "the consumer's own schema" in three different
+  places, and the codec's `repr` said `reader=`. Each of those is a correct
+  description and none of them is a term, so nothing in the docs could be looked
+  up and the paragraph explaining it had to be re-read in every language's page
+  rather than recognised. It is now "the reader schema" throughout, with a
+  section of that name in `docs/serialization.md` and a `reader_schema=` in the
+  `repr`.
+
+  **`AvroCodec.reading(...)` survives, and it is not merely sugar** — which is
+  the argument for keeping it. `AvroCodec(my_schema)` is a *fixed-schema* codec
+  that writes `avro/binary`; `AvroCodec.reading(my_schema)` is a *registered*
+  codec with a reader schema and no identifier to frame, and no combination of
+  constructor arguments expresses that, because `schema_id` is what puts a codec
+  in registered mode and a read-only codec has none. Removing it would leave the
+  consumer-only case with no way to be said at all. It is documented as exactly
+  that: `reader_schema` for a service that does not publish, reading precisely
+  what `from_registry(..., reader_schema=...)` reads, which a test now pins.
+
+  Java and .NET need no equivalent, and the docs say why rather than listing it
+  as a divergence: their registries are synchronous, so one object can hold
+  `readerSchema` and still look an identifier up from inside `encode`. The
+  registry here is a set of coroutines and a codec is not awaitable, which is why
+  this library has two objects where they have one — and `reading(...)` is the
+  shorter of the two.
 
 - **A stream handler may no longer ask for a retry, and a stream consumer no
   longer inherits one.** `read_stream` refuses `retry(...)` with a new

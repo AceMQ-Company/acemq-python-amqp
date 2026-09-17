@@ -181,6 +181,9 @@ from acemq_amqp.codecs.avro import AvroCodec
 
 codec = AvroCodec(schema)                                        # avro/binary
 codec = await AvroCodec.from_registry(registry, "order.placed", schema)
+codec = await AvroCodec.from_registry(                           # and reads onto
+    registry, "order.placed", schema, reader_schema=my_schema
+)
 codec = AvroCodec.reading(my_schema)                             # consume only
 ```
 
@@ -197,33 +200,24 @@ the mode to use unless there is a reason not to. The framing is **one zero byte,
 four bytes of identifier big-endian, then the Avro body** — Confluent's layout,
 and byte-for-byte the one Java and Go write.
 
-`AvroCodec.reading(my_schema)` is the consumer's half of that, and the call that
-makes evolution mean something on the read side. It registers nothing, because a
-service that only consumes writes no schema and has no identifier to frame:
-`encode` says so rather than inventing one. What it does is hand Avro **both**
-schemas on every message — the writer's, looked up by the identifier on the
-front, and the one this consumer was written against:
+#### The reader schema
 
-```python
-codec = AvroCodec.reading(my_schema)
-await codec.learn_from(registry, 1)   # the version still in production
-await codec.learn_from(registry, 2)   # and the one being rolled out
-```
+**The reader schema is the schema a consumer was written against**, and it is
+what makes evolution mean anything on the read side. With the writer's schema
+alone a consumer receives whatever the producer sent: a field it has never heard
+of turns up, and a field it expects is simply missing until the producer starts
+sending it. Given *both* schemas, Avro resolves them — the unknown field is read
+past and discarded, the missing one is filled in from the reader schema's
+default — so the consumer always sees the shape it was written against, whichever
+version of the producer wrote the message.
 
-With the writer's schema alone a consumer receives whatever the producer sent: a
-field it has never heard of turns up, and a field it expects is simply missing
-until the producer starts sending it. Given both, Avro resolves them — the
-unknown field is read past and discarded, the missing one is filled in from this
-schema's default — so the consumer always sees the shape it was written against,
-whichever version of the producer wrote the message.
+`reader_schema` is what it is called here, and it is the same word in the rest of
+the family: Java's `readerSchema`, Ruby's `reader_schema:`, Go's `ReaderSchema`
+and .NET's `ReaderSchema`. **One idea, one spelling**, so a paragraph about it in
+any of the five reads in all of them.
 
-A change Avro will not resolve — a field whose type changed, a field added
-without a default — raises `FatalError` naming the identifier the message
-arrived with, the schema it was being read onto, and Avro's own account of what
-diverged. The alternative is a record of silent nonsense, which is the failure
-this whole mode exists to prevent.
-
-A service that both publishes and consumes keeps one codec and passes both:
+A service that both publishes and consumes passes it alongside the schema it
+writes:
 
 ```python
 codec = await AvroCodec.from_registry(
@@ -233,16 +227,39 @@ codec = await AvroCodec.from_registry(
 
 **The reader schema is a decoding instruction and nothing else.** Only `schema`
 is registered and only `schema` is written, byte for byte, so the wire stays
-what the Java, Go, Ruby and .NET libraries read. Java spells the same thing
-`AvroCodec.registered(registry, readerSchema)` and .NET reads it off
-`ReaderSchema`; both can look an identifier up from inside `encode`, which is why
-they keep one object for both directions where this library has two.
+what the Java, Go, Ruby and .NET libraries read.
+
+`AvroCodec.reading(my_schema)` is that same reader schema for a service that
+does **not** publish:
+
+```python
+codec = AvroCodec.reading(my_schema)
+await codec.learn_from(registry, 1)   # the version still in production
+await codec.learn_from(registry, 2)   # and the one being rolled out
+```
+
+It registers nothing, because a service that only consumes writes no schema and
+has no identifier to frame; `encode` says so rather than inventing one. **It is
+kept rather than folded into the constructor because it is the only way to say
+what it says:** `AvroCodec(my_schema)` is a fixed-schema codec that writes
+`avro/binary`, and this is a *registered* codec with no identifier — a
+combination no constructor argument expresses, since `schema_id` is what puts a
+codec in registered mode and a read-only one has none. Java and .NET need no
+equivalent: their registries are synchronous, so one object holds `readerSchema`
+and still looks an identifier up from inside `encode`, which is why they keep one
+object for both directions where this library has two.
+
+A change Avro will not resolve — a field whose type changed, a field added
+without a default — raises `FatalError` naming the identifier the message
+arrived with, the reader schema it was being read onto, and Avro's own account of
+what diverged. The alternative is a record of silent nonsense, which is the
+failure this whole mode exists to prevent.
 
 | Mode | Writes | Reads |
 |---|---|---|
 | fixed schema | `avro/binary` | `avro/binary`, any `avro/*`, `application/avro`, any type containing `avro` that is not the registered one |
 | registered | `application/vnd.acemq.avro` | that, `application/avro`, any type containing `avro` that is not `avro/…` |
-| reading | nothing — `encode` refuses | the same as registered; it is that mode with no identifier to write |
+| `reading(...)` | nothing — `encode` refuses | the same as registered; it is that mode with a reader schema and no identifier to write |
 
 **Each mode claims only its own framing type.** The two are not interchangeable
 and the difference is invisible in the bytes: a framed message begins with five
@@ -550,6 +567,6 @@ store, and puts the key on the wire instead. See
 
 Schema *evolution* is mostly a different problem from serialization and has its
 own answer: see [the schema registry](patterns.md#schema-registry). The half of
-it that is a codec's problem does ship — `AvroCodec.reading(...)` and the
-`reader_schema` argument resolve a writer's schema onto the one a consumer was
-written against, which is [above](#avro).
+it that is a codec's problem does ship — the `reader_schema` argument, and
+`AvroCodec.reading(...)` for a service that only consumes, resolve a writer's
+schema onto the reader schema. See [the reader schema](#the-reader-schema).

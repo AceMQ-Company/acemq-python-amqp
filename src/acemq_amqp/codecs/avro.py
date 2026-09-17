@@ -42,15 +42,24 @@ resolve it against its own. This is what makes a field addition safe, and it is
 the mode to use unless there is a reason not to. It writes
 ``application/vnd.acemq.avro``.
 
-**A consumer says which schema it was written against, and Avro resolves the
-writer's onto it.** That is what schema evolution actually needs, and it is the
-second half of the registered mode: with the writer's schema alone a consumer
-receives whatever the producer sent, so a field it has never heard of arrives and
-a field it expects is simply missing until the producer starts sending it. Given
-both schemas, Avro resolves them — a field the reader does not know is skipped,
-and one the writer never wrote is filled in from the reader's default — so the
-consumer always sees the shape it was compiled against, whichever version of the
-producer wrote the message:
+**The reader schema is the schema a consumer was written against, and Avro
+resolves the writer's onto it.** That is what schema evolution actually needs,
+and it is the second half of the registered mode: with the writer's schema alone
+a consumer receives whatever the producer sent, so a field it has never heard of
+arrives and a field it expects is simply missing until the producer starts
+sending it. Given both schemas, Avro resolves them — a field the reader schema
+does not know is skipped, and one the writer never wrote is filled in from the
+reader schema's default — so the consumer always sees the shape it was written
+against, whichever version of the producer wrote the message.
+
+``reader_schema`` is what it is called everywhere in this library, and the same
+word in the rest of the family: Java's ``readerSchema``, Ruby's
+``reader_schema:``, Go's ``ReaderSchema`` and .NET's ``ReaderSchema``. There is
+one spelling of one idea, so a paragraph about it in any of the five reads in all
+of them.
+
+:meth:`AvroCodec.reading` is the consumer-only case written out — it is
+``reader_schema`` with nothing to publish:
 
 .. code-block:: python
 
@@ -60,8 +69,7 @@ producer wrote the message:
 
 A change Avro does not call compatible — a field whose type changed, a field
 added without a default — raises :class:`~acemq_amqp.ack.FatalError` naming both
-schemas, rather than a record of silent nonsense. This is Java's
-``registered(registry, readerSchema)`` and .NET's ``ReaderSchema``.
+schemas, rather than a record of silent nonsense.
 
 The framing is **one zero byte, then four bytes of identifier, big-endian, then
 the Avro body** — the layout Confluent's clients use, and byte-for-byte the one
@@ -183,13 +191,14 @@ class AvroCodec:
         ``application/vnd.acemq.avro``; without it the codec has a fixed schema
         and writes ``avro/binary``. Prefer :meth:`from_registry`, which fetches
         the identifier for you
-    :param reader_schema: the schema this consumer was written against. Every
-        message is resolved onto it, so a field the writer added is skipped and
-        one the writer never wrote is filled in from this schema's default. It
-        belongs with the registered mode, where the writer's schema varies from
-        message to message; in fixed mode both ends are pinned and giving one
-        only means reading a known writer onto a different reader. Prefer
-        :meth:`reading`, which is the consumer's whole story in one call
+    :param reader_schema: the **reader schema** — the schema this consumer was
+        written against. Every message is resolved onto it, so a field the writer
+        added is skipped and one the writer never wrote is filled in from the
+        reader schema's default. It belongs with the registered mode, where the
+        writer's schema varies from message to message; in fixed mode both ends
+        are pinned and giving one only means reading a known writer onto a
+        different reader schema. For a service that only consumes,
+        :meth:`reading` says the same thing in one argument
     :raises AceMQError: when fastavro is not installed, or either schema is not
         usable Avro
     """
@@ -240,27 +249,39 @@ class AvroCodec:
 
     @classmethod
     def reading(cls, reader_schema: str | dict[str, Any]) -> AvroCodec:
-        """Returns a codec that only reads, resolving every message onto a schema.
+        """Returns a codec that only reads, resolving every message onto a
+        reader schema.
 
-        This is the consumer's half of the registered mode, and the one place
-        schema evolution is actually paid for. The codec reads framed messages —
-        it claims ``application/vnd.acemq.avro`` like any registered codec — looks
-        the writer's schema up among the ones it has been taught, and hands Avro
-        both, so a field the producer added is skipped and a field the producer
-        has not started sending yet arrives as this schema's default.
+        **The consumer-only case of ``reader_schema``, and nothing more.** The
+        codec reads framed messages — it claims ``application/vnd.acemq.avro``
+        like any registered codec — looks the writer's schema up among the ones
+        it has been taught, and hands Avro both, so a field the producer added is
+        skipped and a field the producer has not started sending yet arrives as
+        the reader schema's default. A service that publishes as well as consumes
+        wants one codec and :meth:`from_registry` with ``reader_schema=``; this
+        is for the one that does not publish.
 
-        Nothing is registered, because nothing is written: a consumer that never
-        publishes has no schema to put in a registry and no identifier to frame,
-        and :meth:`encode` says so rather than inventing one. Teach it the writer
-        versions it will meet with :meth:`learn_from` or :meth:`learn`.
+        It is kept rather than folded into the constructor because it is the only
+        way to say the thing it says. ``AvroCodec(my_schema)`` is a fixed-schema
+        codec that writes ``avro/binary``; this is a *registered* codec with no
+        identifier to frame, which no combination of constructor arguments
+        expresses — ``schema_id`` is what puts a codec in registered mode, and a
+        read-only codec has none. Naming it also puts the refusal somewhere
+        sensible: nothing is registered, because nothing is written, and a
+        consumer that never publishes has no schema to put in a registry.
+        :meth:`encode` says so rather than inventing an identifier.
 
-        Java spells this ``AvroCodec.registered(registry, readerSchema)`` and
-        .NET reads it off ``ReaderSchema``; both can look an identifier up from
-        inside ``encode`` and so keep one codec for both directions. The registry
-        here is async and a codec is not, which is why the two directions are two
-        objects.
+        Teach it the writer versions it will meet with :meth:`learn_from` or
+        :meth:`learn`.
 
-        :param reader_schema: the schema this consumer was written against
+        Java and .NET need no equivalent: their registries are synchronous, so
+        one object holds ``readerSchema`` and still looks an identifier up from
+        inside ``encode``. The registry here is async and a codec is not, which
+        is why the two directions are two objects — and this is the shorter of
+        the two.
+
+        :param reader_schema: the reader schema, which is the schema this
+            consumer was written against
         :returns: a read-only codec in registered mode
         :raises AceMQError: when fastavro is not installed, or the schema is not
             usable Avro
@@ -284,10 +305,11 @@ class AvroCodec:
         :param subject: groups the versions of one message type, conventionally
             the message type itself — ``order.placed``
         :param schema: the schema to write with, and — unless ``reader_schema``
-            says otherwise — to resolve messages onto
-        :param reader_schema: the schema to resolve every message onto, for a
-            service that publishes one version and consumes another. Only
-            ``schema`` is registered; this one is never written
+            says otherwise — the reader schema as well
+        :param reader_schema: the reader schema: what every message is resolved
+            onto, for a service that publishes one version and consumes another.
+            Only ``schema`` is registered, and only ``schema`` is written; the
+            reader schema is a decoding instruction and never reaches the wire
         :returns: a codec in registered mode
         """
         codec = cls(schema)
@@ -311,7 +333,7 @@ class AvroCodec:
 
     @property
     def reader_schema_text(self) -> str:
-        """The schema every message is resolved onto, as text.
+        """The reader schema, as text: what every message is resolved onto.
 
         The same as :attr:`schema_text` unless a reader schema was given, which
         is the only case where the two differ.
@@ -382,9 +404,10 @@ class AvroCodec:
         try:
             # Writer schema and reader schema both given to Avro, which is the
             # whole point of the registered mode: it resolves the difference, so
-            # a field the writer added and this reader does not know is skipped
-            # rather than shifting every field after it, and a field this reader
-            # expects and the writer never sent arrives as the reader's default.
+            # a field the writer added and the reader schema does not know is
+            # skipped rather than shifting every field after it, and a field the
+            # reader schema expects and the writer never sent arrives as that
+            # schema's default.
             return self._avro.schemaless_reader(
                 io.BytesIO(body[offset:]), writer_schema, self._reader
             )
@@ -404,7 +427,7 @@ class AvroCodec:
         default value for field x`` — and says nothing about whose schemas they
         were. On a queue carrying several producer versions at once that is the
         first thing anybody needs, so the identifier the message arrived with and
-        the name of the schema this codec reads onto are put in front of it.
+        the name of this codec's reader schema are put in front of it.
         """
         writer = _name_of(writer_schema)
         if self._registered and len(body) >= _FRAME_BYTES:
@@ -502,5 +525,5 @@ class AvroCodec:
         else:
             where = f"schema_id={self._schema_id}"
         if self._reader_text != self._text:
-            where += f", reader={_name_of(self._reader)}"
+            where += f", reader_schema={_name_of(self._reader)}"
         return f"AvroCodec({where})"

@@ -680,3 +680,48 @@ def test_yaml_does_not_swallow_a_message_that_said_nothing() -> None:
     codec = CompositeCodec(JsonCodec(), YamlCodec())
     assert codec.decode(b'{"a": 1}', None) == {"a": 1}
     assert YamlCodec().can_decode(None) is False
+
+
+async def test_reading_is_the_consumer_only_spelling_of_the_same_reader_schema() -> None:
+    """The decision behind keeping ``reading(...)``, pinned.
+
+    It is ``reader_schema`` for a service that does not publish, and it reads
+    exactly what a codec built with ``reader_schema=`` reads. What it adds is the
+    one thing no combination of constructor arguments says: a *registered* codec
+    with no identifier to frame.
+    """
+    registry = InMemorySchemaRegistry()
+    producer = await AvroCodec.from_registry(registry, "order.placed", AVRO_SCHEMA)
+    body = producer.encode(ORDER)
+    identifier = int.from_bytes(body[1:5], "big")
+
+    sugared = AvroCodec.reading(AVRO_SCHEMA_V2)
+    await sugared.learn_from(registry, identifier)
+    spelled_out = await AvroCodec.from_registry(
+        registry, "order.placed", AVRO_SCHEMA, reader_schema=AVRO_SCHEMA_V2
+    )
+
+    # The same reader schema, named the same way, decoding to the same thing.
+    assert sugared.reader_schema_text == spelled_out.reader_schema_text == AVRO_SCHEMA_V2
+    assert sugared.decode(body, "application/vnd.acemq.avro") == spelled_out.decode(
+        body, "application/vnd.acemq.avro"
+    )
+
+    # And the difference: one publishes and one has nothing to publish with.
+    assert sugared.is_registered is True
+    assert sugared.schema_id is None
+    assert spelled_out.schema_id == identifier
+    # Which the constructor cannot express: without an identifier it is a
+    # fixed-schema codec that writes avro/binary, not a read-only registered one.
+    assert AvroCodec(AVRO_SCHEMA_V2).is_registered is False
+
+
+def test_a_codec_says_which_reader_schema_it_reads_onto() -> None:
+    # The word in the repr is the word in the argument, which is the word the
+    # other four libraries use.
+    assert repr(AvroCodec(AVRO_SCHEMA)) == "AvroCodec(fixed)"
+    assert repr(AvroCodec.reading(AVRO_SCHEMA_V2)) == "AvroCodec(reading)"
+    resolving = AvroCodec(AVRO_SCHEMA, schema_id=1, reader_schema=AVRO_SCHEMA_V2)
+    assert repr(resolving) == (
+        "AvroCodec(schema_id=1, reader_schema=org.acemq.test.OrderPlaced)"
+    )

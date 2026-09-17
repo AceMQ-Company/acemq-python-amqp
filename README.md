@@ -498,18 +498,29 @@ themselves and a reader has to hold the schema the writer used:
 # the producer: registers its schema and frames the identifier into every message
 codec = await AvroCodec.from_registry(registry, "order.placed", schema)
 
-# the consumer: says which schema it was written against, and every message is
-# resolved onto it — whichever version of the producer wrote it
+# the consumer: names its reader schema, and every message is resolved onto it —
+# whichever version of the producer wrote it
 codec = AvroCodec.reading(my_schema)
 await codec.learn_from(registry, 7)
+
+# a service that does both keeps one codec
+codec = await AvroCodec.from_registry(
+    registry, "order.placed", schema, reader_schema=my_schema
+)
 ```
 
-That second line is what lets a producer add a field without a synchronised
+The **reader schema** is what lets a producer add a field without a synchronised
 deployment: Avro is given both schemas, so a field this consumer has never heard
 of is skipped and a field it expects but the producer has not started sending
-arrives as its own default. A change Avro will not resolve — a field whose type
-changed, or one added without a default — is a `FatalError` naming both schemas
-rather than a record of silent nonsense.
+arrives as the reader schema's own default. A change Avro will not resolve — a
+field whose type changed, or one added without a default — is a `FatalError`
+naming both schemas rather than a record of silent nonsense.
+
+`reader_schema` is the spelling everywhere here, and the same word in the rest of
+the family: Java's `readerSchema`, Ruby's `reader_schema:`, Go's `ReaderSchema`
+and .NET's `ReaderSchema`. `AvroCodec.reading(...)` is that argument for a
+service that only consumes — it is the one thing no constructor argument says, a
+registered codec with no identifier to write.
 
 ### Encrypted bodies
 
