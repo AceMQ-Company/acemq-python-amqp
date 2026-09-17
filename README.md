@@ -927,7 +927,7 @@ empty.
 ### Releasing
 
 ```bash
-git tag v0.1.1 && git push origin v0.1.1
+git tag v0.6.0 && git push origin v0.6.0
 ```
 
 `release.yml` runs the whole suite including the integration tests, builds the
@@ -943,8 +943,11 @@ installation in the world resolves from, and a published version is permanent.
 
 Two guards, both copied from the Go, Java and .NET release workflows. The
 version must be a version — an allow-list, because it reaches a file name and a
-package version — and it must be `0.1.x`, so a mistyped tag cannot ship a `1.0.0`
-that nobody can withdraw.
+package version — and it must be `0.6.x`, so a mistyped tag cannot ship a `1.0.0`
+that nobody can withdraw. The tag is what names the release, and `release.yml`
+refuses to publish unless `pyproject.toml` and `acemq_amqp.__version__` both
+already say the same thing, so the version in the tree is bumped before the tag
+is cut rather than after.
 
 Before the first tag, PyPI needs a pending publisher for `acemq-amqp` naming
 this repository, `release.yml` and the `pypi` environment, and this repository

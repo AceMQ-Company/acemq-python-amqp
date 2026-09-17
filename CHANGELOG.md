@@ -8,6 +8,8 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-17
+
 ### Added
 
 - **The docs build now checks the links in `docs/*.md` as well as the ones in
@@ -95,7 +97,7 @@ While the version is `0.x` the public API may change in any release.
   compatibility that is not there and worse than being compatible. **A dashboard
   built against a Java, Go or .NET estate now reads against this library panel
   for panel.** The request pair came with the requester and responder counters
-  above; these are the other four.
+  below; these are the other four.
 
   `acemq.publish.duration` is the timing that was missing beside
   `acemq.publish.total`, and it carries exactly the same labels, deliberately: a
@@ -324,7 +326,7 @@ While the version is `0.x` the public API may change in any release.
   would be lying; for a message and the database row it describes to happen
   together, the outbox is still the pattern. How wide a batch gets on the wire is
   capped by the connection's `max_outstanding_publishes` rather than by the list
-  it was given — see the entry below — so a list of a million is a million tasks
+  it was given — see the entry above — so a list of a million is a million tasks
   and a thousand messages in flight. A million tasks is still a million tasks, so
   chunk what comes out of a database rather than handing a cursor's worth of rows
   to one call.
@@ -505,6 +507,16 @@ While the version is `0.x` the public API may change in any release.
   this library has two objects where they have one — and `reading(...)` is the
   shorter of the two.
 
+- **`serve(...)` returns a `ResponderHandle` rather than a bare `Consumer`, which
+  is source-breaking.** The handle is what carries the responder's counters, so
+  it arrived with them — the reasoning, the name and what the handle forwards are
+  in the **Added** entry above. Recorded here as well because this is the section
+  a reader scans for what a release will not let them compile: code that
+  annotated `serve`'s result as `Consumer` needs its annotation changed, and code
+  reaching a `Consumer` method the handle does not forward needs
+  `responder.consumer`. Nothing on the wire moves, nothing needs to be closed
+  differently, and `async with await serve(...)` is unchanged.
+
 - **A stream handler may no longer ask for a retry, and a stream consumer no
   longer inherits one.** `read_stream` refuses `retry(...)` with a new
   `StreamRetryError`, and runs its consumer on `no_retry()` whatever the
@@ -613,6 +625,13 @@ Documentation, all of it a claim the code stopped supporting.
   A body that does not begin `0xAE` is still refused here as what it is — an
   error naming the framing rather than a decryption failure.
 
+  These pages were corrected once already in this round, from naming Java
+  alone to naming Ruby beside it, which writes Java's framing byte for byte.
+  That pass was right about Ruby and still two libraries short: what it left
+  behind was a table saying five libraries write three framings, and the answer
+  is that five libraries write one. This entry is the whole correction; the
+  earlier half of it is only worth knowing as how the table got here.
+
 - **The metric-name compatibility claim was wider than the truth.** The README
   and `docs/observability.md` both said the names here are Java's `MetricNames`
   and that a dashboard built against one library reads against another, without
@@ -622,12 +641,6 @@ Documentation, all of it a claim the code stopped supporting.
   `acemq.pipeline.run.total`. Listing them with a reason each was the fix at the
   time; writing them was the better one, and all six are now written — see
   **Added**. The claim is true as it stands.
-
-- **The encrypted-body divergence table was missing Ruby**, which writes Java's
-  framing byte for byte. `docs/serialization.md` and
-  `acemq_amqp.codecs.encrypted` said "all four AceMQ libraries write four
-  different things"; it is five libraries writing three, and Python interoperates
-  with Java *and Ruby* rather than with Java alone.
 
 - **A relayed message produces no publish span and no `acemq.publish.total`**,
   which nothing said. `publish_raw` puts the committed bytes on the wire
