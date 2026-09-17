@@ -46,10 +46,8 @@ identifier makes the message fail to open rather than quietly opening as
 something else. :func:`key_id_of` reads it back without needing any key, which
 is what an operator staring at an unreadable dead-letter queue actually wants.
 
-This is the Java framing, byte for byte, and Java and Ruby are the libraries it
-interoperates with. **The five AceMQ libraries write three different things
-under this one content type**, which is recorded here rather than smoothed over
-because a consumer cannot tell which it is about to be handed:
+This is the family framing, byte for byte, and **all four of the other AceMQ
+libraries write and read it too**:
 
 ===========  ======  =======  ==========  ==========  ================  ==========
 library      magic   version  id length   iv          cipher            tag
@@ -57,20 +55,24 @@ library      magic   version  id length   iv          cipher            tag
 Java         0xAE    0x01     1 byte      12-byte     AES-GCM           16 bytes
 **Python**   0xAE    0x01     1 byte      12-byte     AES-GCM           16 bytes
 Ruby         0xAE    0x01     1 byte      12-byte     AES-GCM           16 bytes
-Go           none    0x01     2, big-end  12-byte     AES-GCM           16 bytes
-.NET         none    0x01     1 byte      16-byte     AES-256-CBC       HMAC-SHA-256,
-                                                      then HMAC         32 bytes
+Go           0xAE    0x01     1 byte      12-byte     AES-GCM           16 bytes
+.NET         0xAE    0x01     1 byte      12-byte     AES-GCM           16 bytes
 ===========  ======  =======  ==========  ==========  ================  ==========
 
-Java's is the one implemented here, and it is the right one to converge on: it
-is the only framing whose first byte identifies the format at all, which is what
-lets a body that was never encrypted be refused rather than misparsed. Go needs
-the magic byte and a one-byte length; .NET needs both of those and AES-GCM in
-place of encrypt-then-MAC. Until then, a message from Go or .NET is refused here
-— visibly, naming the framing — rather than being decrypted into something else.
+A body written by any of the five opens in any of the other four, given the key.
+.NET used to be the exception and no longer is: it wrote AES-256-CBC with a
+separate HMAC-SHA-256 up to its own 0.3.0 and moved here in the same round Go
+dropped the magic-less variant of its own. .NET still reads the bodies it wrote
+before that change, so a queue filled before it can be drained; nothing writes
+that framing now, and nothing else has ever read it.
+
+The first byte is what makes the refusal honest. A body that does not begin
+``0xAE`` is not this framing, and it is refused as that — visibly, naming the
+framing — rather than being decrypted into something else or reported as a key
+problem.
 
 ``tests/test_encrypted.py`` holds a complete test vector for a known key, nonce
-and plaintext. That is the string to converge against.
+and plaintext. All five test suites pin the same one.
 
 What this does not do
 ---------------------

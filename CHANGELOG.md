@@ -578,6 +578,30 @@ While the version is `0.x` the public API may change in any release.
 
 Documentation, all of it a claim the code stopped supporting.
 
+- **The encrypted-body table said this library interoperates with Java and Ruby
+  and with nothing else. It interoperates with all four.** The framing table in
+  `docs/serialization.md`, the copy of it in `acemq_amqp.codecs.encrypted` and
+  the summary in the README all still described the family as it stood before the
+  0.5.0 round: Go writing no magic byte and a two-byte key id length, .NET
+  writing AES-256-CBC with a 32-byte HMAC-SHA-256. Both moved to this framing in
+  that round — `0xAE 0x01 len keyid`, a 12-byte nonce and AES-GCM with a 16-byte
+  tag — and all five libraries have written the same bytes since. Nothing here
+  changed; the pages describing it did not keep up.
+
+  **This is the kind of error a reader acts on**, which is why it is in the
+  changelog rather than quietly corrected. As written, the table told somebody
+  deciding whether a .NET producer could feed a Python consumer that it could
+  not, and this is the page they would have checked. It could have bought a
+  bridging service, or a second content type, or a decision not to encrypt, none
+  of which were ever needed.
+
+  What remains true is smaller and is now said as history rather than as the
+  present: .NET still *reads* the AES-256-CBC bodies it wrote up to its own
+  0.3.0, so a queue filled before the change can be drained by the library that
+  filled it. Nothing writes that framing, and no other library has ever read it.
+  A body that does not begin `0xAE` is still refused here as what it is — an
+  error naming the framing rather than a decryption failure.
+
 - **The metric-name compatibility claim was wider than the truth.** The README
   and `docs/observability.md` both said the names here are Java's `MetricNames`
   and that a dashboard built against one library reads against another, without

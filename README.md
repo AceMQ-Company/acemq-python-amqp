@@ -546,10 +546,12 @@ No failure message, log line or exception ever contains the plaintext or the key
 and a wrong key and a tampered body fail identically — GCM authenticates before
 it returns anything, and nothing here adds a check that would tell them apart.
 
-**It interoperates with the Java and Ruby libraries and with nothing else.** The
-five libraries write three different framings under one content type; a body from
-Go or .NET is refused here, visibly, rather than misread. The table and the test
-vector to converge on are in
+**It interoperates with all four of the other AceMQ libraries.** Since the 0.5.0
+round the five write one framing under that content type, byte for byte, pinned
+by the same test vector in all five suites — .NET used to be the exception and no
+longer is, though it alone still reads the bodies it wrote before the change. A
+body framed any other way is refused here, visibly, rather than misread. The
+table and the vector are in
 [Codecs → Encryption](docs/serialization.md#encryption).
 
 ## Interceptors

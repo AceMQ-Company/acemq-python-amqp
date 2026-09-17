@@ -597,32 +597,39 @@ keyring.use("2026-02")                                  # then one publisher
 
 That order, always. A keyring holding one key cannot rotate without an outage.
 
-### Interoperability, and a divergence worth knowing about
+### Interoperability
 
-All five AceMQ libraries write `application/vnd.acemq.encrypted` and **three
-different things underneath it**. This is a real bug in the family, recorded here
-rather than smoothed over, because a consumer cannot tell which it is about to be
-handed:
+All five AceMQ libraries write `application/vnd.acemq.encrypted`, and since the
+0.5.0 round they all write **the same bytes underneath it**:
 
 | | magic | version | id length | iv | cipher | tag |
 |---|---|---|---|---|---|---|
 | Java | `0xAE` | `0x01` | 1 byte | 12-byte nonce | AES-GCM | 16 bytes |
 | **Python** | `0xAE` | `0x01` | 1 byte | 12-byte nonce | AES-GCM | 16 bytes |
 | Ruby | `0xAE` | `0x01` | 1 byte | 12-byte nonce | AES-GCM | 16 bytes |
-| Go | none | `0x01` | 2 bytes, big-endian | 12-byte nonce | AES-GCM | 16 bytes |
-| .NET | none | `0x01` | 1 byte | 16-byte IV | AES-256-CBC | HMAC-SHA-256, 32 bytes |
+| Go | `0xAE` | `0x01` | 1 byte | 12-byte nonce | AES-GCM | 16 bytes |
+| .NET | `0xAE` | `0x01` | 1 byte | 12-byte nonce | AES-GCM | 16 bytes |
 
-**Python interoperates with Java and Ruby, and with nothing else.** A body
-written by Go or .NET is refused here — visibly, saying it was not written by
-this codec — rather than being decrypted into something wrong.
+**A body written by any of the five opens in any of the other four**, given the
+key — a .NET producer and a Python consumer share a queue without either of them
+knowing about the other. `tests/test_encrypted.py` holds the vector that pins it,
+a known key and a known nonce and a known plaintext with the exact bytes written
+out, and the same vector is in all five test suites, so a library that drifts off
+the framing fails its own tests rather than somebody's dead-letter queue.
 
-Java's is the framing to converge on. It is the only one whose first byte
-identifies the format at all, which is what lets a body that was never encrypted
-be refused rather than misparsed; Go needs the magic byte and a one-byte length,
-and .NET needs both of those plus AES-GCM in place of encrypt-then-MAC.
-`tests/test_encrypted.py` holds a complete test vector — a known key, a known
-nonce and a known plaintext, with the exact bytes written out — for whoever does
-that work.
+**.NET used to be the exception and no longer is.** Up to its own 0.3.0 it wrote
+AES-256-CBC with a separate HMAC-SHA-256 — sound cryptography under a content
+type that promised the family framing — and it moved to AES-GCM in this framing
+in the same round Go dropped the magic-less variant of its own. .NET still
+*reads* its old bodies, so a queue filled before that change can be drained by
+the library that filled it; nothing writes that framing any more, and no other
+library has ever read it.
+
+This library reads one framing and writes the same one. A body that does not
+begin `0xAE` is refused as what it is — an error naming the framing, not a
+decryption failure — so a consumer pointed at a plaintext queue, or at bodies one
+of those retired framings left behind, is told what has actually happened rather
+than being left to suspect its keys.
 
 ### What it does not do
 
