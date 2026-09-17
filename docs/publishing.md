@@ -169,10 +169,12 @@ except PublishError as failure:
     log.error("%s", failure.__cause__)  # what went wrong first
 ```
 
-Nothing caps how wide a batch may be, here or anywhere else in this library, so
-a batch holds as many unconfirmed publishes as the list it was given has
-entries. Hand it thousands rather than a million-row cursor, and chunk what
-comes out of a database.
+How wide the batch gets *on the wire* is capped by the connection rather than by
+this method — see [back pressure](#back-pressure) below. A list of a million is
+a million tasks and a thousand messages in flight, which is the difference
+between backpressure and a memory leak; a million tasks is still a million
+tasks, so chunk what comes out of a database rather than handing a cursor's
+worth of rows to one call.
 
 The blocking API has the same method: `sync.connect(...)` gives a publisher
 whose `send_all` runs the batch on the loop thread and returns when every
@@ -181,6 +183,48 @@ confirm is in.
 Java spells this `sendAll` and .NET `SendAllAsync`, with the same ordering, the
 same partial-batch counts and the same wording in the failure. Go and Ruby have
 no equivalent yet.
+
+## Back pressure
+
+`max_outstanding_publishes` — a thousand by default — caps how many publishes may
+be waiting for the broker at once, across the whole connection:
+
+```python
+mq = await connect(
+    "amqp://broker",
+    max_outstanding_publishes=1000,          # the default
+    confirm_timeout=timedelta(seconds=10),   # the default
+)
+```
+
+The permit is taken **before** the message is written, which is the whole point:
+a bound applied after the write has already let the message into memory. Without
+one, a caller publishing faster than the broker confirms accumulates unconfirmed
+messages until the process dies — and that looks like throughput right up to the
+moment it does not.
+
+It is the connection's bound and not a publisher's, so it counts everything:
+`send`, `send_all`, the retry rungs, the dead letters and a replay all come
+through one place. `mq.outstanding_publishes` is how many are waiting right now,
+and a number pinned at the ceiling is a broker that has stopped answering.
+
+When every permit is taken and none comes free within `confirm_timeout`, the
+publish raises rather than waiting on:
+
+```
+acemq: cannot publish message 0f9c… to exchange '' with key 'orders.new':
+1000 publishes are already waiting for a confirm and none completed within
+0:00:10. The broker is not keeping up; publish more slowly rather than
+buffering more.
+```
+
+That sentence is Java's word for word, so one runbook covers both. A publisher
+parked for ever behind a broker that has stopped answering is indistinguishable
+from a quiet service, which is the failure the deadline exists to prevent.
+
+Java spells the setting `maxOutstandingPublishes` and .NET
+`MaxOutstandingPublishes`, both with the same default of a thousand. Java bounds
+its wait with `confirmTimeout`; .NET waits without one.
 
 ## Durability
 

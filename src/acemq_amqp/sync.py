@@ -38,11 +38,20 @@ import asyncio
 import threading
 from collections.abc import Callable, Coroutine, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 from typing import Any, TypeAlias, TypeVar
 
 from .ack import Ack
 from .codec import Codec
-from .connection import DEFAULT_PREFETCH, Connection, Consumer, Message, Publisher
+from .connection import (
+    DEFAULT_CONFIRM_TIMEOUT,
+    DEFAULT_MAX_OUTSTANDING_PUBLISHES,
+    DEFAULT_PREFETCH,
+    Connection,
+    Consumer,
+    Message,
+    Publisher,
+)
 from .connection import connect as _connect_async
 from .envelope import Envelope
 from .retry import RetryPolicy
@@ -294,6 +303,8 @@ def connect(
     origin: str | None = None,
     retry: RetryPolicy | None = None,
     prefetch: int = DEFAULT_PREFETCH,
+    max_outstanding_publishes: int = DEFAULT_MAX_OUTSTANDING_PUBLISHES,
+    confirm_timeout: timedelta = DEFAULT_CONFIRM_TIMEOUT,
     security: Security | None = None,
     **transport_options: Any,
 ) -> SyncConnection:
@@ -317,6 +328,10 @@ def connect(
     :param origin: what to stamp on published messages
     :param retry: what consumers use unless they say otherwise
     :param prefetch: how many unacknowledged messages a consumer holds
+    :param max_outstanding_publishes: how many publishes may be waiting for the
+        broker at once, a thousand by default. See
+        :class:`acemq_amqp.Connection`
+    :param confirm_timeout: how long a publish waits for room before raising
     :param security: how to verify the broker and who to log in as
     :param transport_options: passed to the transport
     :returns: the connection
@@ -330,6 +345,8 @@ def connect(
                 origin=origin,
                 retry=retry,
                 prefetch=prefetch,
+                max_outstanding_publishes=max_outstanding_publishes,
+                confirm_timeout=confirm_timeout,
                 security=security,
                 **transport_options,
             )

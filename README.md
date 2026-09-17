@@ -85,7 +85,11 @@ message and the next; this does not, and the results still come back in the
 order the payloads did. It is not atomic — AMQP has no such thing — so a partial
 failure raises `PublishError` naming how many messages were not confirmed and
 how many were, because a caller told only "it failed" resends messages that
-already arrived. See [publishing](docs/publishing.md#several-at-once).
+already arrived. How many are unconfirmed at once is bounded by the connection's
+`max_outstanding_publishes`, a thousand by default and the same number Java and
+.NET default to, so a wide batch becomes backpressure rather than memory growth.
+See [publishing](docs/publishing.md#several-at-once) and
+[back pressure](docs/publishing.md#back-pressure).
 
 ### Not running an event loop?
 

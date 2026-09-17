@@ -10,6 +10,62 @@ While the version is `0.x` the public API may change in any release.
 
 ### Added
 
+- **`max_outstanding_publishes` bounds how many publishes may be waiting for the
+  broker at once, and nothing bounded it before.** A thousand by default, which
+  is what Java's `maxOutstandingPublishes` and .NET's `MaxOutstandingPublishes`
+  have always defaulted to, and the number is the same for the same reason:
+  enough to keep a broker busy, small enough that the memory it can cost is
+  bounded and obvious.
+
+  What was there instead was a sentence in a docstring. `send_all` created a task
+  per payload and let every one of them reach the transport, so a batch held as
+  many unconfirmed publishes as the list had entries, and the documentation said
+  as much and asked the caller to chunk. That is a defect documented rather than
+  fixed. **A caller publishing faster than the broker confirms accumulates
+  unconfirmed messages in memory until the process dies, and up to that moment it
+  looks like throughput** — the fastest this library has ever appeared to run is
+  the hour before it falls over.
+
+  The permit is an `asyncio.Semaphore` on the connection, and it is taken
+  **before the message is written** rather than after. A bound applied afterwards
+  has already let the message into memory, which is the only thing it was meant
+  to prevent. It lives on `Connection.publish_raw`, which is the one place every
+  publish in the library passes through — `send`, `send_all`, a retry rung, a
+  dead letter, a replay — so one counter covers all of them and no path can quietly
+  get round it.
+
+  **Exhausting it is an error rather than a stall.** `confirm_timeout` — ten
+  seconds by default, the same as Java's `confirmTimeout` — bounds the wait for a
+  permit, and reaching it raises `PublishError` saying which situation this is:
+
+  ```
+  1000 publishes are already waiting for a confirm and none completed within
+  0:00:10. The broker is not keeping up; publish more slowly rather than
+  buffering more.
+  ```
+
+  Word for word Java's sentence, so one runbook covers both. A publisher parked
+  for ever behind a broker that has stopped answering is indistinguishable from a
+  quiet service, and that silence is worse than the failure.
+
+  **The permit is given back on every path out**, including the two that are easy
+  to miss: a publish that raises, and a publish whose task is cancelled while the
+  broker is still thinking. A permit lost on either of those is a connection that
+  publishes a thousand more messages and then deadlocks with nothing anywhere
+  saying why, which is a worse failure than the one this fixes.
+
+  `mq.outstanding_publishes` says how many are waiting right now. A number pinned
+  at the ceiling is a broker that has stopped answering, and it says so before
+  the first `PublishError` does.
+
+  **What to do about it.** Nothing, in almost every case: a service that was not
+  already outrunning its broker never reaches the bound and never waits. A
+  publisher that deliberately wants a wider window says so —
+  `connect(url, max_outstanding_publishes=5000)` — and one that would rather fail
+  sooner lowers `confirm_timeout`. `sync.connect` takes both. A batch that used
+  to be chunked by hand to keep memory down no longer has to be, though chunking
+  a database cursor is still worth doing for the task count.
+
 - **`Publisher.send_all(payloads)` publishes a whole batch before it waits for
   any confirm, and then waits for all of them.** Publisher confirms are on and
   cannot be turned off here, so `send` does not return until the broker has
@@ -46,10 +102,12 @@ While the version is `0.x` the public API may change in any release.
   **This is not atomic and the docstring says so.** AMQP has no way to publish a
   hundred messages such that all or none arrive, and a library that offered one
   would be lying; for a message and the database row it describes to happen
-  together, the outbox is still the pattern. Nothing caps how wide a batch may
-  be, here or anywhere else in this library, so a batch holds as many unconfirmed
-  publishes as the list it was given has entries: hand it thousands rather than a
-  million-row cursor, and chunk what comes out of a database.
+  together, the outbox is still the pattern. How wide a batch gets on the wire is
+  capped by the connection's `max_outstanding_publishes` rather than by the list
+  it was given — see the entry below — so a list of a million is a million tasks
+  and a thousand messages in flight. A million tasks is still a million tasks, so
+  chunk what comes out of a database rather than handing a cursor's worth of rows
+  to one call.
 
   **Nothing existing changes.** `send` is untouched, on the wire nothing is
   different from publishing the same messages one at a time, and the blocking API

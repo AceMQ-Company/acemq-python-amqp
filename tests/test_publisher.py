@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import timedelta
 
 import pytest
 from fake_transport import FakeTransport, Sent
@@ -228,6 +229,16 @@ class HoldingTransport(FakeTransport):
         self.confirms[index].set_exception(RuntimeError(reason))
 
 
+@dataclass
+class RefusingTransport(FakeTransport):
+    """A broker that will not take anything at all."""
+
+    async def publish(
+        self, exchange: str, routing_key: str, message: Outbound
+    ) -> PublishResult:
+        raise RuntimeError("the broker said no")
+
+
 async def test_a_batch_puts_every_message_on_the_wire_before_it_waits_for_a_confirm() -> None:
     # The whole point of the method. A loop awaiting each send in turn cannot
     # reach the second message until the broker has answered the first, so a
@@ -324,3 +335,119 @@ async def test_when_two_messages_fail_the_one_reported_is_the_first_in_payload_o
         "2 of 4 messages were not confirmed; 2 were. The first failure was: answered second"
     )
     assert str(failure.value.__cause__) == "answered second"
+
+
+async def test_a_batch_puts_no_more_on_the_wire_than_the_connection_allows() -> None:
+    # The bound is the difference between backpressure and a memory leak that
+    # looks like throughput. A list of five with room for two means two messages
+    # on the wire, not five, however fast the loop gets through the list.
+    transport = HoldingTransport()
+    connection = Connection(transport, max_outstanding_publishes=2)
+    publisher = connection.publisher(routing_key="orders.new")
+
+    batch = asyncio.create_task(publisher.send_all([{"id": str(n)} for n in range(5)]))
+    await transport.wait_until_sent(2)
+    # Long enough for every one of the five tasks to have been scheduled. Without
+    # the bound all five would be on the wire by now.
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert len(transport.sent) == 2
+    assert connection.outstanding_publishes == 2
+
+    # One answered releases exactly one permit, so exactly one more goes out.
+    transport.confirm(0)
+    await transport.wait_until_sent(3)
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert len(transport.sent) == 3
+
+    for index in range(1, 5):
+        transport.confirm(index)
+        await transport.wait_until_sent(min(index + 3, 5))
+    assert len(await batch) == 5
+    assert connection.outstanding_publishes == 0
+
+
+async def test_a_publish_with_no_room_and_nothing_completing_says_which_it_is() -> None:
+    transport = HoldingTransport()
+    connection = Connection(
+        transport,
+        max_outstanding_publishes=1,
+        confirm_timeout=timedelta(milliseconds=50),
+    )
+    publisher = connection.publisher(routing_key="orders.new")
+
+    held = asyncio.create_task(publisher.send({"id": "1"}))
+    await transport.wait_until_sent(1)
+
+    # Not a stall. A publisher parked behind a broker that has stopped answering
+    # is indistinguishable from a quiet service, and the sentence is Java's word
+    # for word so that one runbook covers both.
+    with pytest.raises(PublishError) as refused:
+        await publisher.send({"id": "2"})
+    assert refused.value.reason == (
+        "1 publishes are already waiting for a confirm and none completed within "
+        "0:00:00.050000. The broker is not keeping up; publish more slowly rather "
+        "than buffering more."
+    )
+    # And it says where the message was going, which is what every other
+    # PublishError on this connection carries.
+    assert refused.value.routing_key == "orders.new"
+    assert not refused.value.unroutable
+
+    transport.confirm(0)
+    await held
+
+
+async def test_a_refused_publish_gives_its_permit_back() -> None:
+    # The deadlock this could have been. A permit lost by a publish that raised
+    # is a connection that publishes max_outstanding_publishes more messages and
+    # then stops for ever, and nothing anywhere says why.
+    transport = RefusingTransport()
+    connection = Connection(transport, max_outstanding_publishes=1)
+    publisher = connection.publisher(routing_key="orders.new")
+
+    for _ in range(3):
+        with pytest.raises(RuntimeError, match="the broker said no"):
+            await publisher.send({"id": "1"})
+        assert connection.outstanding_publishes == 0
+
+
+async def test_a_cancelled_publish_gives_its_permit_back() -> None:
+    transport = HoldingTransport()
+    connection = Connection(
+        transport,
+        max_outstanding_publishes=1,
+        confirm_timeout=timedelta(milliseconds=50),
+    )
+    publisher = connection.publisher(routing_key="orders.new")
+
+    abandoned = asyncio.create_task(publisher.send({"id": "1"}))
+    await transport.wait_until_sent(1)
+    abandoned.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await abandoned
+
+    assert connection.outstanding_publishes == 0
+    # And the proof that the permit really came back: the next publish reaches
+    # the broker rather than waiting out the confirm timeout to be refused.
+    following = asyncio.create_task(publisher.send({"id": "2"}))
+    await transport.wait_until_sent(2)
+    transport.confirm(1)
+    await following
+
+
+async def test_the_bound_is_a_thousand_unless_a_connection_says_otherwise() -> None:
+    connection = Connection(FakeTransport())
+    assert connection.max_outstanding_publishes == 1000
+    assert connection.confirm_timeout == timedelta(seconds=10)
+    assert connection.outstanding_publishes == 0
+
+
+async def test_a_bound_below_one_is_refused_at_construction() -> None:
+    # A bound of zero is a connection that can never publish, which is worth
+    # hearing about at start-up rather than at the first message.
+    with pytest.raises(ValueError, match="max_outstanding_publishes must be at least 1"):
+        Connection(FakeTransport(), max_outstanding_publishes=0)
+    with pytest.raises(ValueError, match="confirm_timeout must be positive"):
+        Connection(FakeTransport(), confirm_timeout=timedelta(0))

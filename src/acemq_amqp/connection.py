@@ -103,6 +103,20 @@ log = logging.getLogger("acemq")
 #: consumer that stalls does not take a queue's worth of work down with it.
 DEFAULT_PREFETCH = 20
 
+#: How many publishes may be waiting for the broker at once, unless a connection
+#: says otherwise.
+#:
+#: Java's ``maxOutstandingPublishes`` and .NET's ``MaxOutstandingPublishes``
+#: default to the same thousand, and the number is the same one for the same
+#: reason: enough to keep a broker busy, small enough that the memory it can cost
+#: is bounded and obvious. A publisher that wants more should say so rather than
+#: inherit it.
+DEFAULT_MAX_OUTSTANDING_PUBLISHES = 1000
+
+#: How long a publish waits for room when every permit is taken, unless a
+#: connection says otherwise. Java's ``confirmTimeout``, and the same ten seconds.
+DEFAULT_CONFIRM_TIMEOUT = timedelta(seconds=10)
+
 
 @dataclass(frozen=True, slots=True)
 class Message:
@@ -243,10 +257,15 @@ class Publisher:
         a caller told only "it failed" resends the messages the broker already
         has.
 
-        Nothing caps how wide a batch may be, here or anywhere else in this
-        library, so a batch holds as many unconfirmed publishes as the list it
-        was given has entries. Hand it thousands rather than a million-row
-        cursor, and chunk what comes out of a database.
+        How wide the batch gets on the wire is capped, and by the connection
+        rather than by this method:
+        :attr:`Connection.max_outstanding_publishes` is a thousand by default,
+        and the thousand-and-first task waits for one of the first thousand to
+        be answered before its message is written. A list of a million is
+        therefore a million tasks and a thousand messages in flight rather than
+        a million, which is backpressure instead of a memory leak — but a
+        million tasks is still a million tasks, so chunk what comes out of a
+        database rather than handing a cursor's worth of rows to one call.
 
         :param payloads: what to send, in order, each encoded by this
             publisher's codec
@@ -255,7 +274,9 @@ class Publisher:
         :raises PublishError: when any message was not confirmed. Its message
             names how many failed and how many did not, and ``__cause__``
             carries the first failure in payload order — which is not
-            necessarily the first one the broker answered
+            necessarily the first one the broker answered. A batch wide enough
+            that the broker stops keeping up fails this way too, with the first
+            failure saying so
         """
         batch = list(payloads)
         # Everything is started before anything is awaited. A task per payload,
@@ -1027,6 +1048,18 @@ class Connection:
         immediate requeue, which is a hot loop against a broker that nobody
         asked for
     :param prefetch: how many unacknowledged messages a consumer holds
+    :param max_outstanding_publishes: how many publishes may be waiting for the
+        broker at once. The ceiling that turns a memory leak into backpressure:
+        without one, a caller publishing faster than the broker answers
+        accumulates unconfirmed messages until the process dies, which looks
+        like throughput right up to the moment it does not. A thousand by
+        default, which is what Java's ``maxOutstandingPublishes`` and .NET's
+        ``MaxOutstandingPublishes`` default to
+    :param confirm_timeout: how long a publish waits for one of those permits
+        before giving up. Ten seconds by default, the same as Java's
+        ``confirmTimeout``. Reaching it raises rather than waiting on, because a
+        publisher stalled for ever behind a broker that has stopped answering is
+        the failure this bound exists to make visible
     :param on_publish: cross-cutting behaviour to wrap every publish on this
         connection in, outermost first. See :mod:`acemq_amqp.interceptors`
     :param on_consume: the same around every handler.
@@ -1043,18 +1076,37 @@ class Connection:
         origin: str | None = None,
         retry: RetryPolicy | None = None,
         prefetch: int = DEFAULT_PREFETCH,
+        max_outstanding_publishes: int = DEFAULT_MAX_OUTSTANDING_PUBLISHES,
+        confirm_timeout: timedelta = DEFAULT_CONFIRM_TIMEOUT,
         on_publish: Sequence[PublishInterceptor] = (),
         on_consume: Sequence[ConsumeInterceptor] = (),
         observer: Observer | None = None,
     ) -> None:
         if prefetch < 0:
             raise ValueError(f"acemq: prefetch must not be negative, got {prefetch}")
+        if max_outstanding_publishes < 1:
+            raise ValueError(
+                "acemq: max_outstanding_publishes must be at least 1, got "
+                f"{max_outstanding_publishes}"
+            )
+        if confirm_timeout <= timedelta(0):
+            raise ValueError(
+                f"acemq: confirm_timeout must be positive, got {confirm_timeout}"
+            )
         self._transport = transport
         self._observer: Observer = observer or NullObserver()
         self._codec = codec or JsonCodec()
         self._origin = origin or default_origin()
         self._retry = retry or no_retry()
         self._prefetch = prefetch
+        self._max_outstanding = max_outstanding_publishes
+        self._confirm_timeout = confirm_timeout
+        # Built here rather than on first use. An asyncio.Semaphore has bound no
+        # loop at construction since 3.10, so it is safe to make one outside a
+        # running loop, and making it here means every publish on this connection
+        # shares the one counter however many tasks are publishing.
+        self._outstanding = asyncio.Semaphore(max_outstanding_publishes)
+        self._in_flight_publishes = 0
         self._consumers: list[Consumer] = []
         self._publishing: list[PublishInterceptor] = list(on_publish)
         self._consuming: list[ConsumeInterceptor] = list(on_consume)
@@ -1084,6 +1136,29 @@ class Connection:
     def observer(self) -> Observer:
         """Where this connection's numbers go."""
         return self._observer
+
+    @property
+    def max_outstanding_publishes(self) -> int:
+        """How many publishes may be waiting for the broker at once."""
+        return self._max_outstanding
+
+    @property
+    def confirm_timeout(self) -> timedelta:
+        """How long a publish waits for room before giving up."""
+        return self._confirm_timeout
+
+    @property
+    def outstanding_publishes(self) -> int:
+        """How many publishes are waiting for the broker right now.
+
+        What a stalled publisher looks like from outside: a number pinned at
+        :attr:`max_outstanding_publishes` is a broker that has stopped answering,
+        and it says so before the first :class:`~acemq_amqp.PublishError` does.
+        """
+        # Counted here rather than read off the semaphore, which keeps its count
+        # private. Raised after the permit is taken and lowered before it is
+        # given back, both inside publish_raw, so it never reads high.
+        return self._in_flight_publishes
 
     @property
     def consumers(self) -> tuple[Consumer, ...]:
@@ -1342,12 +1417,54 @@ class Connection:
         and re-encoding it would produce different bytes from the ones that were
         committed. Ordinary publishing goes through :class:`Publisher`.
 
+        **This is the one place the outstanding-publish bound is taken.** Every
+        publish in the library comes through here — a :class:`Publisher`, a
+        retry rung, a dead letter, a replay — so one permit counts them all, and
+        :meth:`Publisher.send_all` cannot put more messages on the wire at once
+        than :attr:`max_outstanding_publishes` allows however long the list it
+        was given is.
+
         :param exchange: where to publish, empty for the default exchange
         :param routing_key: what to publish under
         :param message: the message, encoded
         :returns: what the broker said
+        :raises PublishError: when every permit is taken and none came free
+            within :attr:`confirm_timeout`
         """
-        return await self._transport.publish(exchange, routing_key, message)
+        # Taken before the message is written and not after, which is the whole
+        # point: a bound applied afterwards has already let the message into
+        # memory. The permit is given back in the ``finally`` below on every
+        # path there is — the publish returning, the publish raising, and this
+        # task being cancelled while the broker is still thinking — because a
+        # permit lost on any one of those is a connection that publishes a
+        # thousand more messages and then stops for ever.
+        try:
+            await asyncio.wait_for(
+                self._outstanding.acquire(), self._confirm_timeout.total_seconds()
+            )
+        except asyncio.TimeoutError as stalled:
+            # Said rather than waited out. A publisher parked behind a broker
+            # that has stopped answering is indistinguishable from a quiet
+            # service, and this sentence is the one Java raises word for word so
+            # that an operator reading a log has one thing to recognise.
+            raise PublishError(
+                message.message_id,
+                exchange,
+                routing_key,
+                (
+                    f"{self._max_outstanding} publishes are already waiting for a "
+                    f"confirm and none completed within {self._confirm_timeout}. "
+                    "The broker is not keeping up; publish more slowly rather than "
+                    "buffering more."
+                ),
+            ) from stalled
+
+        self._in_flight_publishes += 1
+        try:
+            return await self._transport.publish(exchange, routing_key, message)
+        finally:
+            self._in_flight_publishes -= 1
+            self._outstanding.release()
 
     async def pull(self, queue: str) -> Delivery | None:
         """Takes one message off a queue, or ``None`` when there is none waiting.
@@ -1448,6 +1565,8 @@ async def connect(
     origin: str | None = None,
     retry: RetryPolicy | None = None,
     prefetch: int = DEFAULT_PREFETCH,
+    max_outstanding_publishes: int = DEFAULT_MAX_OUTSTANDING_PUBLISHES,
+    confirm_timeout: timedelta = DEFAULT_CONFIRM_TIMEOUT,
     security: Security | None = None,
     on_publish: Sequence[PublishInterceptor] = (),
     on_consume: Sequence[ConsumeInterceptor] = (),
@@ -1473,6 +1592,9 @@ async def connect(
     :param origin: what to stamp on published messages
     :param retry: what consumers use unless they say otherwise
     :param prefetch: how many unacknowledged messages a consumer holds
+    :param max_outstanding_publishes: how many publishes may be waiting for the
+        broker at once, a thousand by default. See :class:`Connection`
+    :param confirm_timeout: how long a publish waits for room before raising
     :param security: how to verify the broker and who to log in as. See
         :class:`~acemq_amqp.Security`
     :param on_publish: what to wrap every publish in, outermost first. See
@@ -1518,6 +1640,8 @@ async def connect(
         origin=origin,
         retry=retry,
         prefetch=prefetch,
+        max_outstanding_publishes=max_outstanding_publishes,
+        confirm_timeout=confirm_timeout,
         on_publish=on_publish,
         on_consume=on_consume,
         observer=observer,
