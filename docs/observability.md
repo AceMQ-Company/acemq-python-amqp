@@ -128,14 +128,15 @@ another. Java publishes them through Micrometer and .NET through
 | `acemq.messages.set.aside.failed` | Could not be moved to a dead-letter or parking queue, so was rejected to the broker instead |
 | `acemq.outbox.total` | Outbox records the relay handled. Labelled `exchange`, `routing.key` and `outcome`: `published` or `failed` |
 | `acemq.outbox.lag` | **Worth an alert.** How long a record waited between being committed and being published, in seconds. See [the outbox](#the-outbox-lag-and-the-half-of-it-this-library-can-write) |
+| `acemq.request.total` | Request and reply round trips, as the caller experienced them. Labelled `routing.key` and `outcome`: `answered`, `timed_out` or `failed`. See [request and reply](request-reply.md#the-two-metrics) |
+| `acemq.request.duration` | Seconds, the same labels. The timer starts before the request is published and a call that times out is recorded at its deadline |
 
 ### And the names this library does not write
 
 Worth stating, because a dashboard panel that is empty looks the same as a
 service that has stopped. `MetricNames` also names `acemq.publish.duration`,
-`acemq.consume.attempts`, `acemq.request.duration`, `acemq.request.total`,
-`acemq.pipeline.run.duration` and `acemq.pipeline.run.total`. Nothing here emits
-any of them.
+`acemq.consume.attempts`, `acemq.pipeline.run.duration` and
+`acemq.pipeline.run.total`. Nothing here emits any of them.
 
 `Observer` has counters, gauges and durations and no general distribution, so
 `acemq.consume.attempts` has nowhere to go — and the number is on every message
@@ -143,12 +144,21 @@ as `Envelope.attempt`, which a handler that wants it records in one line.
 `acemq.publish.duration` is the timing beside `acemq.publish.total`, and only
 the total is written here.
 
-The request and routing-slip names have a different reason. `Requester` and
-`follow_slip` are built over a connection rather than being something the
-connection knows it is doing, so nothing on that path is holding an observer.
-Both are answered on the trace instead — a `request` span that ends `answered`
-or `timed_out`, and a `pipeline.run_finished` event — which is where the shape
-of one particular call belongs anyway.
+The routing-slip names have a different reason. `follow_slip` is built over a
+connection rather than being something the connection knows it is doing, so
+nothing on that path is holding an observer. It is answered on the trace
+instead — a `pipeline.run_finished` event — which is where the shape of one
+particular run belongs anyway.
+
+### The tags Java carries and this library does not
+
+Java tags every metric with `message.type` and `transport` as well. Nothing here
+does, on any metric, and that is a deliberate narrowing rather than an
+oversight: `message.type` is producer-controlled and unbounded unless somebody
+is disciplined about it, and `transport` has exactly one value in a library with
+one transport. The consequence worth knowing is that a Grafana panel written
+against a Java estate and filtered on either label will match nothing here.
+Everything it does *not* filter on reads identically.
 
 Parking is not a metric of its own. It is `acemq.messages.dead.lettered.total`
 with `outcome="parked"`, which is what Java settled on: both are a message

@@ -37,8 +37,10 @@ async def price(message: Message) -> dict[str, Any]:
     return {"pence": look_up(message.payload["sku"])}
 
 
-async with await serve(mq, "price-requests", price):
+async with await serve(mq, "price-requests", price) as responder:
     ...
+    responder.answered       # counted before each reply left
+    responder.unanswerable   # requests that named nowhere to reply
 ```
 
 Messaging is asynchronous and request-reply is a synchronous shape drawn on top
@@ -89,8 +91,13 @@ blocked on a reply should learn that it failed in milliseconds rather than wait
 out its whole timeout to learn nothing. The default timeout is 30 seconds, and
 `ask(..., timeout=...)` overrides it for one call.
 
-`serve` returns an ordinary `Consumer`, which already knows how to be closed and
-how to be an `async with`.
+`serve` returns a `ResponderHandle`: the consumer, closed the same way and the
+same `async with`, plus `answered` and `unanswerable`. `answered` is incremented
+**before** each reply is published and handed back when a publish fails, so a
+caller holding its answer can rely on the count already including it. The
+caller's side keeps `timed_out` and `unmatched`, and its round trip is timed on
+`acemq.request.duration`. See
+[request and reply](request-reply.md#the-numbers).
 
 ## Idempotency
 

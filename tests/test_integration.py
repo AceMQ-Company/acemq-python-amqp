@@ -126,7 +126,14 @@ from acemq_amqp.patterns import (
     then,
 )
 from acemq_amqp.rabbitmq import RabbitMQTransport
-from acemq_amqp.telemetry import metric_key
+from acemq_amqp.telemetry import (
+    METRIC_REQUEST_DURATION,
+    METRIC_REQUEST_TOTAL,
+    OUTCOME_ANSWERED,
+    TAG_OUTCOME,
+    TAG_ROUTING_KEY,
+    metric_key,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -1233,10 +1240,13 @@ async def test_a_question_over_a_queue_comes_back_answered(
             raise LookupError("no such sku")
         return {"sku": message.payload["sku"], "pence": 250}
 
+    metrics = Metrics()
+    counting = Connection(mq.transport, observer=metrics)
+
     async with (
-        await serve(mq, requests, price),
+        await serve(mq, requests, price) as responder,
         await Requester.open(
-            mq, "", requests, reply_queue=replies, timeout=timedelta(seconds=15)
+            counting, "", requests, reply_queue=replies, timeout=timedelta(seconds=15)
         ) as caller,
     ):
         assert await caller.ask({"sku": "A-1"}) == {"sku": "A-1", "pence": 250}
@@ -1245,6 +1255,21 @@ async def test_a_question_over_a_queue_comes_back_answered(
         # caller waiting out its whole timeout to learn nothing.
         with pytest.raises(ResponderError, match="no such sku"):
             await caller.ask({"sku": "gone"})
+
+        # Both round trips are answered: a responder saying "I could not do it"
+        # answered, and the failure belongs in the reply rather than in the
+        # round trip.
+        answered = {TAG_ROUTING_KEY: requests, TAG_OUTCOME: OUTCOME_ANSWERED}
+        assert metrics.counts[metric_key(METRIC_REQUEST_TOTAL, answered)] == 2
+        assert metrics.durations[metric_key(METRIC_REQUEST_DURATION, answered)].count == 2
+
+        # One answer went out; the failed one was replied to but not counted as
+        # an answer, because a service failing every request must not report a
+        # healthy answered rate.
+        assert responder.answered == 1
+        assert responder.unanswerable == 0
+        assert caller.timed_out == 0
+        assert caller.unmatched == 0
 
 
 async def test_a_caller_that_sets_only_the_native_reply_to_is_answered(

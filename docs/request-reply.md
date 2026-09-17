@@ -44,7 +44,7 @@ identifier, a consumer to read the replies and a timeout somebody always forgets
 
 ```python
 requester = await Requester.open(mq, exchange, routing_key)   # an object
-consumer  = await serve(mq, queue, respond)                   # a Consumer
+responder = await serve(mq, queue, respond)                   # also an object
 ```
 
 A `Requester` is a class because it owns state: a reply queue, a consumer of its
@@ -54,14 +54,16 @@ consumer have to exist before it is any use**, and neither can be created
 without awaiting something. A half-built requester that looked finished is a
 thing somebody would hold on to.
 
-A responder owns nothing, so it is not a class. `serve` returns an ordinary
-[`Consumer`](consuming.md) — the same object `mq.consume` returns, which already
-knows how to be closed and how to be an `async with`. A second class that only
-forwarded to it would be one more thing to learn for no capability.
+`serve` returns a `ResponderHandle`, which is the consumer plus the two counters
+Java and .NET have always reported. It is closed the same way, is the same
+`async with`, and reports the same `queue`, `running` and `in_flight`;
+`responder.consumer` reaches the [`Consumer`](consuming.md) underneath for
+anything not forwarded. It used to return the bare consumer, on the argument
+that a responder owns nothing — which stopped being true the moment it had
+counters to own.
 
-That is the first place this library diverges from Java and .NET, where
-`Responder` is an object with counters on it. Here `Responder` is a **type
-alias**:
+The name is `ResponderHandle` rather than Java's `Responder` because that name
+is taken here, by the **type alias** for what a responder *does*:
 
 ```python
 Responder = Callable[[Message], Any]
@@ -70,7 +72,9 @@ Responder = Callable[[Message], Any]
 A message in, an answer out, an exception for a failure. Both a coroutine
 function and a plain one are accepted, and `serve` awaits the result only if it
 is awaitable — a responder that does arithmetic should not have to pretend to be
-async.
+async. Renaming that alias to free the word up would break every signature
+written against it for a cosmetic gain, so the running object takes the longer
+name and the callable keeps the short one.
 
 ## Where the reply address lives
 
@@ -220,7 +224,7 @@ raises.
 ## Answering
 
 ```python
-consumer = await serve(mq, "price-requests", price, concurrency=4, prefetch=10)
+responder = await serve(mq, "price-requests", price, concurrency=4, prefetch=10)
 ```
 
 `serve` passes anything else through to
@@ -258,29 +262,90 @@ with a fresh envelope carrying:
 - this connection's `origin`;
 - `acemq-error` when the responder failed, carrying `TypeName: message`.
 
-## Numbers, and the ones this library does not report
+## The numbers
 
-This is the second place Python diverges, and it is a gap rather than a design
-choice. **A `Requester` and a `serve` consumer report no counters of their own.**
-Java exposes `requester.timedOut()`, `requester.unmatched()`,
-`responder.answered()` and `responder.unanswerable()`, and .NET the same four
-under .NET names; both pages say all five libraries promise them identically.
-Python does not promise them, because there is nothing there to read them from —
-neither `Requester` nor `serve` is holding an
-[`Observer`](observability.md#what-is-reported).
+Four counters and two metrics, and all of them mean what they mean in Java and
+.NET.
 
-For the same reason nothing here writes `acemq.request.duration` or
-`acemq.request.total`. `Requester` is built *over* a connection rather than being
-something the connection knows it is doing, so the publish and the reply
-consumption are counted as an ordinary publish and an ordinary delivery and
-nothing counts the round trip. See
-[the names this library does not write](observability.md#and-the-names-this-library-does-not-write).
+```python
+async with await serve(mq, "price-requests", price) as responder:
+    async with await Requester.open(mq, "", "price-requests") as ask:
+        quote = await ask.ask({"sku": "A-1"})
 
-What you can have instead, today:
+        responder.answered        # requests answered, counted before the reply left
+        responder.unanswerable    # requests that named nowhere to reply
+        ask.timed_out             # callers that gave up
+        ask.unmatched             # replies that arrived with nobody waiting
+```
 
-**The round trip, on the trace.** `OpenTelemetryTracing.request_span` is a CLIENT
-span around a call that waits, and it ends with an outcome either way —
-`answered`, `timed_out`, or `failed`:
+| | |
+|---|---|
+| `responder.answered` | Requests answered, counted **before** the reply left |
+| `responder.unanswerable` | Requests that arrived with no reply address. Anything above zero means a caller is using `send` where it means to `ask` |
+| `ask.timed_out` | Callers that gave up |
+| `ask.unmatched` | Replies that arrived with nobody waiting — almost always the timeout being too short |
+
+`unmatched` rising while `timed_out` rises is the signature of a responder that
+is slower than callers expect. Nothing is broken; the timeout is wrong.
+
+### What the counters promise
+
+`answered` is incremented **before** the reply is published, so a caller holding
+its answer can rely on the count already including it. The other order looks
+more natural and is wrong: it leaves a window where the reply is in the caller's
+hands and the responder still says nothing has been answered, which is a
+monitoring dashboard reporting an idle service that is demonstrably working. **A
+publish that fails takes its increment back**, so this counts replies that were
+sent rather than replies that were attempted.
+
+A responder that *failed* counts no answer. The caller is still told — in
+milliseconds rather than at its deadline — but the reply is the thing carrying
+the failure, and counting it would let a service that fails every request report
+a perfectly healthy answered rate.
+
+**The counters exist before the responder subscribes**, so a request the broker
+hands over during start-up — what a queue with a backlog looks like from in here
+— is counted like any other. Neither number needs a wait before it can be
+trusted, and code that sleeps before reading one is working around a defect that
+is not here. Java says the same thing about field initialisation order and .NET
+had to lift its counters out of the responder to get it; here the
+`ResponderHandle` is built before `connection.consume` is called, and the
+handler closes over it.
+
+### The two metrics
+
+| Metric | |
+|---|---|
+| `acemq.request.total` | Round trips. Labelled `routing.key` and `outcome`: `answered`, `timed_out` or `failed` |
+| `acemq.request.duration` | Seconds, the same labels |
+
+Both are written by the **caller**, and only by the caller. A responder's side is
+an ordinary queue and is counted on
+[`acemq.consume.total`](observability.md#what-is-reported) like any other; what
+nothing else can see is how long *asking* took, because the publish and the
+reply's delivery are two unrelated hops and neither of them is the round trip.
+
+The timer starts before the request is published, so the publish is inside the
+number — the caller's wait begins there. A call that times out is recorded too,
+at its deadline, because a p99 that quietly drops the slowest calls says a
+service is fast right up to the point where nothing answers at all. `answered`
+covers a reply that came back whatever it said: a responder answering "I could
+not do it" answered, and that failure belongs in the reply rather than in the
+round trip. `failed` is for the publish itself not getting out, which is the one
+case where there was never a question to be slow about.
+
+They go wherever the connection's [`Observer`](observability.md) goes, so a
+connection with no observer pays for none of this.
+
+Java tags the same two with `message.type` and `transport` as well. Python tags
+no metric with either — `acemq.publish.total` has never carried them — and a
+duration labelled differently from the total beside it cannot be divided into
+it, so the narrower set is kept and stated rather than widened here alone.
+
+### The round trip on the trace, as well
+
+`OpenTelemetryTracing.request_span` is a CLIENT span around a call that waits,
+and it ends with an outcome either way — `answered`, `timed_out`, or `failed`:
 
 ```python
 with tracing.request_span("pricing", envelope):
@@ -289,17 +354,9 @@ with tracing.request_span("pricing", envelope):
 
 CLIENT rather than PRODUCER because this one waits: its duration is a round trip
 and not a handover, and a backend that knows the difference shows it against the
-responder's latency rather than the broker's.
+responder's latency rather than the broker's. The span is the shape of one
+particular call; the metrics are the shape of all of them.
 
-**The responder's side, from the ordinary consumer metrics.**
-`acemq.consume.total{queue="price-requests"}` split by outcome is what
-`answered` and `unanswerable` would have told you: `acked` is a request answered,
-and `rejected` is one that named nowhere to reply or whose responder failed.
-
-**Your own count, from an interceptor.** A
-[consume interceptor](interceptors.md) on the connection sees every request the
-responder handles and every settlement it produces, which is where a count that
-needs to be exactly Java's shape belongs.
 
 ## From a program with no event loop
 

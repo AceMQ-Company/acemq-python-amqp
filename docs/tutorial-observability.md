@@ -106,21 +106,22 @@ library reads against another.
 | `acemq.messages.set.aside.failed` | could not be moved to a dead-letter or parking queue, so was rejected to the broker instead |
 | `acemq.outbox.total` | outbox records the relay handled, labelled `outcome`: `published` or `failed` |
 | `acemq.outbox.lag` | how long a record waited between commit and publish, in seconds |
+| `acemq.request.total` | request and reply round trips, labelled `routing.key` and `outcome`: `answered`, `timed_out` or `failed` |
+| `acemq.request.duration` | how long a round trip took, in seconds, with the same labels |
 
 **Build your dashboard from that list and nothing else.** Java's `MetricNames`
 also spells `acemq.publish.duration`, `acemq.consume.attempts`,
-`acemq.request.duration`, `acemq.request.total`, `acemq.pipeline.run.duration`
-and `acemq.pipeline.run.total`. **Nothing here emits any of them**, and a panel
-that is empty looks exactly like a service that has stopped — which is the worst
-possible thing for a panel to look like at 3am.
+`acemq.pipeline.run.duration` and `acemq.pipeline.run.total`. **Nothing here
+emits any of them**, and a panel that is empty looks exactly like a service that
+has stopped — which is the worst possible thing for a panel to look like at 3am.
 
 Two reasons, and neither is an oversight waiting to be fixed. `Observer` has
 counters, gauges and durations and no general distribution, so
 `acemq.consume.attempts` has nowhere to go — and the number is on every message
 as `envelope.attempt`, which a handler that wants it records in one line. And
-`Requester` and the pipeline runner are built *over* a connection rather than
-being something the connection knows it is doing, so nothing on those paths is
-holding an observer; both are answered on the trace instead. See
+the pipeline runner is built *over* a connection rather than being something the
+connection knows it is doing, so nothing on that path is holding an observer; it
+is answered on the trace instead. See
 [the names this library does not write](observability.md#and-the-names-this-library-does-not-write).
 
 There is also no counter for "a message arrived". Every delivery is counted once

@@ -41,6 +41,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
+import time
 import uuid
 from collections.abc import Callable, Mapping
 from datetime import timedelta
@@ -51,7 +53,19 @@ from ..codec import Codec
 from ..connection import Connection, Consumer, Message
 from ..envelope import Envelope
 from ..errors import AceMQError
+from ..telemetry import (
+    METRIC_REQUEST_DURATION,
+    METRIC_REQUEST_TOTAL,
+    OUTCOME_ANSWERED,
+    OUTCOME_FAILED,
+    OUTCOME_TIMED_OUT,
+    TAG_OUTCOME,
+    TAG_ROUTING_KEY,
+    Observer,
+)
 from ..topology import Topology
+
+log = logging.getLogger("acemq")
 
 #: Where a responder should send its answer.
 #:
@@ -128,6 +142,12 @@ class Requester:
         self._publisher = connection.publisher(exchange, routing_key, codec=codec)
         self._waiting: dict[str, asyncio.Future[Message]] = {}
         self._consumer: Consumer | None = None
+        self._observer: Observer = connection.observer
+        # The destination as one word, which is what Java tags the round trip
+        # with: the routing key, or the exchange when publishing without one.
+        self._destination = routing_key or exchange
+        self._timed_out = 0
+        self._unmatched = 0
 
     @classmethod
     async def open(
@@ -194,6 +214,27 @@ class Requester:
         """The queue replies arrive on."""
         return self._reply_queue
 
+    @property
+    def timed_out(self) -> int:
+        """How many calls reached their deadline with no reply.
+
+        Java's ``requester.timedOut()`` and .NET's ``TimedOut``, and the same
+        number: a caller that gave up, counted whether or not the responder
+        eventually answered.
+        """
+        return self._timed_out
+
+    @property
+    def unmatched(self) -> int:
+        """How many replies arrived with nobody waiting for them.
+
+        Java's ``requester.unmatched()``. Almost always the timeout being too
+        short rather than anything broken: this rising alongside
+        :attr:`timed_out` is the signature of a responder slower than its
+        callers expect.
+        """
+        return self._unmatched
+
     async def ask(
         self,
         request: Any,
@@ -224,6 +265,12 @@ class Requester:
         # Registered before the request goes out, because a fast responder can
         # reply before send() has returned.
         self._waiting[correlation] = waiter
+        # Started before the publish, because the round trip is what the *caller*
+        # experienced and the caller's wait begins here. A timer started after
+        # the send would leave the publish out of the one number whose whole job
+        # is to include it.
+        started = time.monotonic()
+        outcome = OUTCOME_FAILED
         try:
             # Both addresses, the same value. The header is what a Python, Go or
             # Ruby responder reads first; the native property is what a Java or
@@ -238,13 +285,24 @@ class Requester:
             # too, and the clause below would otherwise re-describe "the
             # requester was closed" as "nothing came back in time" — the same
             # exception type carrying the wrong reason.
+            self._timed_out += 1
+            outcome = OUTCOME_TIMED_OUT
             raise
         except asyncio.TimeoutError as expired:
+            self._timed_out += 1
+            outcome = OUTCOME_TIMED_OUT
             raise RequestTimeoutError(
                 f"acemq: no reply to {correlation} arrived within {deadline}"
             ) from expired
+        else:
+            outcome = OUTCOME_ANSWERED
         finally:
             self._waiting.pop(correlation, None)
+            # Recorded on every path out, including the ones that raise. A
+            # duration that only covers the calls that worked is a duration that
+            # hides exactly the calls somebody is looking for, and a timed-out
+            # request is the slowest data point there is.
+            self._record(time.monotonic() - started, outcome)
 
         failure = answer.envelope.headers.get(HEADER_ERROR)
         if failure:
@@ -253,15 +311,33 @@ class Requester:
             )
         return answer.payload
 
+    def _record(self, elapsed: float, outcome: str) -> None:
+        """One round trip, on the two metrics Java writes for the same thing.
+
+        ``answered`` counts a reply that came back, whatever it said: a
+        responder that answered "I could not do it" answered, and the failure is
+        in the reply rather than in the round trip. ``failed`` is for the publish
+        itself not getting out, which is the one case where there was never a
+        question to be slow about.
+        """
+        labels = {TAG_ROUTING_KEY: self._destination, TAG_OUTCOME: outcome}
+        self._observer.observe(METRIC_REQUEST_DURATION, elapsed, labels)
+        self._observer.count(METRIC_REQUEST_TOTAL, 1, labels)
+
     async def _receive(self, reply: Message) -> Ack:
         """Hands a reply to whoever is waiting for it.
 
         A reply nobody is waiting for is accepted and dropped, which is what a
         reply to a request that already timed out is. It is not an error and it
-        is not worth dead-lettering: the caller has gone.
+        is not worth dead-lettering: the caller has gone. It is counted, though,
+        because :attr:`unmatched` rising alongside :attr:`timed_out` is the one
+        signature that separates "the responder is broken" from "the timeout is
+        too short", and from outside they look the same.
         """
         waiter = self._waiting.pop(reply.envelope.correlation_id, None)
-        if waiter is not None and not waiter.done():
+        if waiter is None or waiter.done():
+            self._unmatched += 1
+        else:
             waiter.set_result(reply)
         return accept()
 
@@ -291,6 +367,101 @@ class Requester:
         await self.close()
 
 
+class ResponderHandle:
+    """A running responder, and the two numbers it keeps.
+
+    Built by :func:`serve`. It is a :class:`~acemq_amqp.Consumer` in every way
+    that matters — closed the same way, usable as an ``async with``, reporting
+    the same ``queue``, ``running`` and ``in_flight`` — with
+    :attr:`answered` and :attr:`unanswerable` added, which is what Java's
+    ``Responder`` and .NET's ``Responder`` report and what nothing here reported
+    before.
+
+    The counters are built before the subscription is, and that ordering is the
+    guarantee rather than an implementation detail: a broker may hand the first
+    request over from inside the subscribe — which is what a queue with a backlog
+    looks like from in here — and the handler reads these on that very delivery.
+    Java had to say the same thing about field initialisation and .NET had to
+    lift its counters out of the responder to get it. Neither number needs a wait
+    before it can be trusted, and code that sleeps before reading one is working
+    around a defect that is not here.
+    """
+
+    def __init__(self, queue: str) -> None:
+        self._queue = queue
+        self._answered = 0
+        self._unanswerable = 0
+        self._consumer: Consumer | None = None
+
+    @property
+    def answered(self) -> int:
+        """How many requests were answered, counted before each reply left.
+
+        A caller holding a reply can rely on this having counted it: the
+        increment happens before the publish, so there is no interleaving in
+        which the answer is visible and the number is not. The other order looks
+        more natural and is wrong — it leaves a window where the reply is in the
+        caller's hands and the responder still says nothing has been answered,
+        which is a dashboard reporting an idle service that is demonstrably
+        working.
+
+        **A publish that fails hands the increment back**, so this counts replies
+        that were sent rather than replies that were attempted.
+        """
+        return self._answered
+
+    @property
+    def unanswerable(self) -> int:
+        """How many requests arrived naming nowhere to reply.
+
+        Anything above zero means a caller is publishing where it means to
+        request. Counted before the delivery is settled.
+        """
+        return self._unanswerable
+
+    @property
+    def consumer(self) -> Consumer:
+        """The consumer underneath, for anything this class does not forward."""
+        if self._consumer is None:  # pragma: no cover - serve always sets it
+            raise AceMQError("acemq: this responder has not been started")
+        return self._consumer
+
+    @property
+    def queue(self) -> str:
+        """The queue requests arrive on."""
+        return self._queue
+
+    @property
+    def running(self) -> bool:
+        """Whether this responder is still serving."""
+        return self._consumer is not None and self._consumer.running
+
+    @property
+    def closed(self) -> bool:
+        """Whether this responder has been stopped."""
+        return self._consumer is None or self._consumer.closed
+
+    @property
+    def in_flight(self) -> int:
+        """How many requests are being answered right now."""
+        return 0 if self._consumer is None else self._consumer.in_flight
+
+    async def close(self) -> None:
+        """Stops serving, letting the request being answered finish.
+
+        A request being answered right now has a caller blocked on the other
+        side, and dropping it turns their call into a timeout.
+        """
+        if self._consumer is not None:
+            await self._consumer.close()
+
+    async def __aenter__(self) -> ResponderHandle:
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        await self.close()
+
+
 async def serve(
     connection: Connection,
     queue: str,
@@ -298,31 +469,39 @@ async def serve(
     *,
     codec: Codec | None = None,
     **consume_options: Any,
-) -> Consumer:
-    """Answers requests arriving on a queue, until the consumer is closed::
+) -> ResponderHandle:
+    """Answers requests arriving on a queue, until the responder is closed::
 
         async def price(message: Message) -> dict[str, Any]:
             return {"pence": look_up(message.payload["sku"])}
 
-        async with await serve(mq, "price-requests", price):
+        async with await serve(mq, "price-requests", price) as responder:
             ...
+            responder.answered       # requests answered
+            responder.unanswerable   # requests that named nowhere to reply
 
     The responder returns the answer and raises to fail. A failure is sent back
     to the caller rather than swallowed, because a caller blocked on a reply
     should learn that it failed in milliseconds rather than wait out its whole
     timeout to learn nothing.
 
-    An ordinary :class:`~acemq_amqp.Consumer` comes back rather than a wrapper of
-    its own: it already knows how to be closed and how to be an ``async with``,
-    and a second class that only forwards to it would be one more thing to learn.
+    A :class:`ResponderHandle` comes back rather than the bare
+    :class:`~acemq_amqp.Consumer` this used to return. It is closed the same way
+    and is the same ``async with``; what it adds is the two counters Java and
+    .NET have always reported and this library reported nowhere. ``consumer``
+    reaches the consumer underneath for anything not forwarded.
 
     :param connection: where requests arrive and replies go
     :param queue: what to consume
     :param respond: what to answer with
     :param codec: a codec other than the connection's
     :param consume_options: passed to :meth:`~acemq_amqp.Connection.consume`
-    :returns: the running consumer
+    :returns: the running responder
     """
+    # Before the subscribe, and that is the guarantee rather than tidiness: a
+    # broker may deliver the first request from inside connection.consume, and
+    # the handler below reads these fields on that delivery.
+    responder = ResponderHandle(queue)
 
     async def handle(request: Message) -> Ack:
         # Header first, native property second — the same order in all five
@@ -333,7 +512,15 @@ async def serve(
         reply_to = str(request.envelope.headers.get(HEADER_REPLY_TO) or "") or request.reply_to
         if not reply_to:
             # Retrying cannot make a return address appear, so this is
-            # dead-lettered rather than looped.
+            # dead-lettered rather than looped. Counted first: the sender is the
+            # thing that is broken, and this number is what says so.
+            responder._unanswerable += 1
+            log.warning(
+                "acemq: a message on %s asked for no reply, so none was sent. It was "
+                "published without a reply-to, which usually means the sender used "
+                "publish where it meant to use request.",
+                queue,
+            )
             return reject(
                 FatalError(
                     f"acemq: request {request.envelope.id} carries neither a "
@@ -347,6 +534,10 @@ async def serve(
             answer = await answered if inspect.isawaitable(answered) else answered
         except Exception as failure:
             try:
+                # Not counted as answered. The caller gets a reply, and it is the
+                # reply that says the responder could not do it — counting it
+                # would make a service that fails every request report a
+                # perfectly healthy answered rate.
                 await _reply(connection, reply_to, request, None, codec, failure)
             except Exception as undeliverable:
                 # The caller has not been told, so it is still waiting. Retrying
@@ -356,15 +547,28 @@ async def serve(
             # retry would answer the same question twice.
             return reject(failure)
 
+        # Counted before the reply goes out, and that order is the contract. The
+        # reply and the counter are two things one caller can see, and publishing
+        # first leaves a window in which a caller already holding its answer
+        # reads answered as zero. Incrementing first puts the counter ahead of
+        # the reply in every interleaving there is, which is the only ordering a
+        # reader can rely on — and the increment is handed back below when the
+        # publish fails, so the failure incrementing early would otherwise
+        # introduce does not exist either.
+        responder._answered += 1
         try:
             await _reply(connection, reply_to, request, answer, codec, None)
         except Exception as undeliverable:
+            responder._answered -= 1
             # The work is done but the answer did not get out. Retrying repeats
             # the work, which is why a responder should be idempotent.
             return retry(undeliverable)
         return accept()
 
-    return await connection.consume(queue, handle, codec=codec, **consume_options)
+    responder._consumer = await connection.consume(
+        queue, handle, codec=codec, **consume_options
+    )
+    return responder
 
 
 async def _reply(

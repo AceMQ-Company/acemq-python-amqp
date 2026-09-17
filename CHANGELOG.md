@@ -10,6 +10,76 @@ While the version is `0.x` the public API may change in any release.
 
 ### Added
 
+- **A requester and a responder now count what they did, and the caller's round
+  trip is a metric.** `responder.answered`, `responder.unanswerable`,
+  `requester.timed_out` and `requester.unmatched` are the four numbers Java and
+  .NET have always reported and this library reported nowhere;
+  `acemq.request.duration` and `acemq.request.total` are the two metric names
+  that were documented as absent.
+
+  The gap was real and the documentation was honest about it: `Requester` and
+  `serve` are built *over* a connection rather than being something the
+  connection knows it is doing, so neither was holding an `Observer` and neither
+  had anywhere to put a count. What that left was a page telling an operator to
+  read the responder's ordinary consume metrics instead and to write their own
+  interceptor if the shape had to match Java's. Both of those work. Neither is a
+  round trip: the publish and the reply's delivery are two unrelated hops, and
+  **how long asking took has no answer in a picture made of two unrelated hops**.
+
+  **The ordering on `answered` is the contract, not an implementation detail.**
+  It is incremented *before* the reply is published, so a caller holding its
+  answer can rely on the count already including it. The other order looks more
+  natural and is wrong: it leaves a window in which the reply is in the caller's
+  hands and the responder still says nothing has been answered, which is a
+  dashboard reporting an idle service that is demonstrably working. A publish
+  that fails hands the increment back, so this counts replies that were sent
+  rather than replies that were attempted — which is the failure incrementing
+  early would otherwise introduce, closed in the same place. .NET fixed this
+  first, Java followed, and this is Python catching up; all five now promise the
+  same thing.
+
+  **The counters exist before the responder subscribes.** A broker may hand the
+  first request over from inside the subscribe — which is what a queue with a
+  backlog looks like from in here — and the handler reads the counters on that
+  very delivery. Java had to say this about field initialisation order and .NET
+  had to lift its counters out of the responder to get it; here the handle is
+  built before `connection.consume` is called and the handler closes over it. A
+  test drives it with a transport that delivers from inside the subscribe.
+  Neither number needs a wait before it can be trusted, and code that sleeps
+  before reading one is working around a defect that is not here.
+
+  A responder that *failed* counts no answer. The caller is still told, in
+  milliseconds rather than at its deadline, but the reply is the thing carrying
+  the failure and counting it would let a service that fails every request report
+  a perfectly healthy answered rate.
+
+  The two metrics are the **caller's**, and only the caller's.
+  `acemq.request.duration` is timed from before the request is published — the caller's wait
+  begins there, so the publish is inside the number — to after the reply is in
+  hand, and a call that times out is recorded at its deadline, because a p99 that
+  quietly drops the slowest calls says a service is fast right up to the point
+  where nothing answers at all. Both carry `routing.key` and `outcome`, where the
+  outcome is `answered`, `timed_out` or `failed`; `answered` covers a reply that
+  came back whatever it said, and `failed` is the publish itself not getting out.
+  Java tags the same two with `message.type` and `transport` as well, and this
+  does not: no metric here has ever carried either, and a duration labelled
+  differently from the total beside it cannot be divided into it.
+
+  **`serve` now returns a `ResponderHandle` rather than a bare `Consumer`.** It
+  is closed the same way, is the same `async with`, and reports the same
+  `queue`, `running`, `closed` and `in_flight`; `responder.consumer` reaches the
+  consumer underneath. The old argument for returning the consumer — that a
+  responder owns nothing, so a second class would be one more thing to learn for
+  no capability — stopped being true the moment it had counters to own. The name
+  is `ResponderHandle` and not Java's `Responder` because that word is taken
+  here, by the type alias for what a responder *does*; renaming the alias would
+  break every signature written against it for a cosmetic gain.
+
+  **What breaks.** Code that annotated `serve`'s result as `Consumer`, and code
+  that reached a `Consumer` method the handle does not forward — `consumer` is
+  there for exactly that. `async with await serve(...)` and `await
+  (await serve(...)).close()` are unchanged.
+
 - **`max_outstanding_publishes` bounds how many publishes may be waiting for the
   broker at once, and nothing bounded it before.** A thousand by default, which
   is what Java's `maxOutstandingPublishes` and .NET's `MaxOutstandingPublishes`
@@ -205,16 +275,15 @@ While the version is `0.x` the public API may change in any release.
   against a real broker before it shipped, and doing that turned up four claims
   that a transliteration would have carried across intact:
 
-  - **Java and .NET both document request/reply counters that do not exist
+  - **Java and .NET both document request/reply counters that did not exist
     here.** `requester.timedOut()`, `requester.unmatched()`,
     `responder.answered()` and `responder.unanswerable()` are on both of their
-    pages under a heading saying all five libraries promise them identically.
-    Python promises none of them: `Requester` and `serve` are built over a
-    connection rather than being something the connection knows it is doing, so
-    neither is holding an `Observer`. `docs/request-reply.md` says so, names the
-    reason, and points at the three things that *are* available — the ordinary
-    consumer counters on the responder's queue, `request_span` for the round
-    trip, and an interceptor for a count that has to be exactly Java's shape.
+    pages under a heading saying all five libraries promise them identically,
+    and Python promised none of them. Writing that down is what made it obvious
+    they should simply be written; all four are now here, with the ordering
+    guarantee Java and .NET make about `answered` — see **Added** above.
+    `docs/request-reply.md` documents what they promise rather than why they are
+    missing.
   - **Java's streams page says a stream has no dead-letter queue and that a
     failed message stays where it is.** Here it half does. `read_stream` returns
     an ordinary `Consumer`, so `reject()` republishes a copy to `{stream}.dlq`

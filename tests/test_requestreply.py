@@ -18,13 +18,25 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 
 import pytest
-from fake_transport import FakeTransport, Sent
+from fake_transport import FakeSubscription, FakeTransport, Sent
 
-from acemq_amqp import Connection, Envelope, Message, Outbound, PublishResult, headers
+from acemq_amqp import (
+    Connection,
+    ConsumeSpec,
+    Delivery,
+    Envelope,
+    Message,
+    Metrics,
+    Outbound,
+    PublishResult,
+    headers,
+)
 from acemq_amqp.patterns import (
     HEADER_ERROR,
     HEADER_REPLY_TO,
@@ -32,6 +44,15 @@ from acemq_amqp.patterns import (
     RequestTimeoutError,
     ResponderError,
     serve,
+)
+from acemq_amqp.telemetry import (
+    METRIC_REQUEST_DURATION,
+    METRIC_REQUEST_TOTAL,
+    OUTCOME_ANSWERED,
+    OUTCOME_TIMED_OUT,
+    TAG_OUTCOME,
+    TAG_ROUTING_KEY,
+    metric_key,
 )
 from acemq_amqp.topology import QUEUE_TYPE_ARG, QUORUM_QUEUE_TYPE, Topology
 
@@ -53,6 +74,50 @@ def request(reply_to: str | None = REPLIES, **fields: Any) -> dict[str, Any]:
     """The headers a request arrives with."""
     application = {} if reply_to is None else {HEADER_REPLY_TO: reply_to}
     return Envelope(headers=application, **fields).to_headers(routing_key=REQUESTS)
+
+
+@dataclass
+class EagerTransport(FakeTransport):
+    """A broker that hands a message over from inside the subscribe.
+
+    Which is what a queue with a backlog really looks like from in here, and the
+    one case where a counter built after ``connection.consume`` returns is a
+    counter the first delivery reads as missing.
+    """
+
+    backlog: tuple[str, bytes, Mapping[str, Any]] | None = None
+    _settled: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def consume(
+        self,
+        queue: str,
+        spec: ConsumeSpec,
+        deliver: Callable[[Delivery], Awaitable[None]],
+    ) -> FakeSubscription:
+        subscription = await super().consume(queue, spec, deliver)
+        if self.backlog is not None:
+            name, body, headers_ = self.backlog
+            self.backlog = None
+
+            async def settle(*_: Any) -> None:
+                self._settled.set()
+
+            await deliver(
+                Delivery(
+                    body=body,
+                    content_type="application/json",
+                    routing_key=name,
+                    message_id="",
+                    headers=dict(headers_),
+                    redelivered=False,
+                    ack=settle,
+                    nack=settle,
+                )
+            )
+        return subscription
+
+    async def settled(self, timeout: float = 5.0) -> None:
+        await asyncio.wait_for(self._settled.wait(), timeout)
 
 
 async def serving(transport: FakeTransport, respond: Any) -> Connection:
@@ -345,4 +410,221 @@ async def test_a_named_reply_queue_is_declared_to_survive_a_restart() -> None:
     # A named reply queue is an ordinary durable queue that a responder in
     # another language may declare too, so it is quorum like any other.
     assert spec.args[QUEUE_TYPE_ARG] == QUORUM_QUEUE_TYPE
+    await mq.close()
+
+
+async def test_a_round_trip_is_timed_and_counted_as_answered() -> None:
+    transport = FakeTransport()
+    metrics = Metrics()
+    mq = Connection(transport, observer=metrics)
+
+    async with await Requester.open(
+        mq, "", REQUESTS, timeout=timedelta(seconds=5)
+    ) as caller:
+        asking = asyncio.create_task(caller.ask({"sku": "A-1"}))
+        went_out = await sent_to(transport, REQUESTS)
+        correlation = str(went_out.headers[headers.CORRELATION])
+        await transport.deliver(
+            caller.reply_queue,
+            b'{"pence": 250}',
+            headers=Envelope(correlation_id=correlation).to_headers(),
+        )
+        assert await asking == {"pence": 250}
+
+    labels = {TAG_ROUTING_KEY: REQUESTS, TAG_OUTCOME: OUTCOME_ANSWERED}
+    assert metrics.counts[metric_key(METRIC_REQUEST_TOTAL, labels)] == 1
+    # The duration is the round trip as the caller experienced it, so the
+    # publish is inside it and the number is real rather than zero.
+    timing = metrics.durations[metric_key(METRIC_REQUEST_DURATION, labels)]
+    assert timing.count == 1
+    assert timing.total > 0
+
+    await mq.close()
+
+
+async def test_a_call_that_times_out_is_still_timed_and_counted() -> None:
+    # A p99 that quietly drops the slowest calls says a service is fast right up
+    # to the point where nothing answers at all.
+    transport = FakeTransport()
+    metrics = Metrics()
+    mq = Connection(transport, observer=metrics)
+
+    async with await Requester.open(
+        mq, "", REQUESTS, timeout=timedelta(milliseconds=30)
+    ) as caller:
+        with pytest.raises(RequestTimeoutError):
+            await caller.ask({"sku": "A-1"})
+        assert caller.timed_out == 1
+
+    labels = {TAG_ROUTING_KEY: REQUESTS, TAG_OUTCOME: OUTCOME_TIMED_OUT}
+    assert metrics.counts[metric_key(METRIC_REQUEST_TOTAL, labels)] == 1
+    assert metrics.durations[metric_key(METRIC_REQUEST_DURATION, labels)].count == 1
+
+    await mq.close()
+
+
+async def test_a_reply_that_nobody_is_waiting_for_is_counted_as_unmatched() -> None:
+    # unmatched rising alongside timed_out is what separates "the responder is
+    # broken" from "the timeout is too short", and from outside they look alike.
+    transport = FakeTransport()
+    mq = Connection(transport)
+
+    async with await Requester.open(
+        mq, "", REQUESTS, timeout=timedelta(milliseconds=30)
+    ) as caller:
+        with pytest.raises(RequestTimeoutError):
+            await caller.ask({"sku": "A-1"})
+
+        await transport.deliver(
+            caller.reply_queue,
+            b'{"pence": 250}',
+            headers=Envelope(correlation_id="nobody-is-waiting").to_headers(),
+        )
+        assert caller.unmatched == 1
+        assert caller.timed_out == 1
+
+    await mq.close()
+
+
+async def test_a_responder_counts_an_answer_before_the_reply_leaves() -> None:
+    # The ordering is the contract. Publishing first leaves a window in which a
+    # caller already holding its answer reads answered as zero, which is a
+    # dashboard reporting an idle service that is demonstrably working.
+    transport = FakeTransport()
+    mq = Connection(transport)
+    await mq.declare(Topology().queue(REQUESTS, dead_letter=True))
+    seen: list[int] = []
+
+    async def price(message: Message) -> dict[str, Any]:
+        return {"pence": 250}
+
+    responder = await serve(mq, REQUESTS, price)
+
+    # The reply publish records what the counter said at the moment it ran.
+    original = transport.publish
+
+    async def watching(exchange: str, routing_key: str, message: Outbound) -> PublishResult:
+        if routing_key == REPLIES:
+            seen.append(responder.answered)
+        return await original(exchange, routing_key, message)
+
+    transport.publish = watching  # type: ignore[method-assign]
+    try:
+        await transport.deliver(REQUESTS, b'{"sku": "A-1"}', headers=request())
+    finally:
+        await mq.close()
+
+    # Counted before the reply was written, not after.
+    assert seen == [1]
+    assert responder.answered == 1
+    assert responder.unanswerable == 0
+
+
+async def test_a_reply_that_cannot_be_published_hands_its_increment_back() -> None:
+    # So the number counts replies that were sent rather than replies that were
+    # attempted, which is what Java and .NET promise about the same counter.
+    transport = FakeTransport()
+    mq = Connection(transport)
+    await mq.declare(Topology().queue(REQUESTS, dead_letter=True))
+
+    async def price(message: Message) -> dict[str, Any]:
+        return {"pence": 250}
+
+    responder = await serve(mq, REQUESTS, price)
+
+    original = transport.publish
+
+    async def refusing(exchange: str, routing_key: str, message: Outbound) -> PublishResult:
+        if routing_key == REPLIES:
+            raise RuntimeError("the reply queue has gone")
+        return await original(exchange, routing_key, message)
+
+    transport.publish = refusing  # type: ignore[method-assign]
+    try:
+        await transport.deliver(REQUESTS, b'{"sku": "A-1"}', headers=request())
+    finally:
+        await mq.close()
+
+    assert responder.answered == 0
+
+
+async def test_a_responder_that_fails_counts_no_answer() -> None:
+    # The caller gets a reply, and the reply is what says the responder could
+    # not do it. Counting it would make a service failing every request report a
+    # perfectly healthy answered rate.
+    transport = FakeTransport()
+
+    async def price(message: Message) -> dict[str, Any]:
+        raise LookupError("no such sku")
+
+    mq = Connection(transport)
+    await mq.declare(Topology().queue(REQUESTS, dead_letter=True))
+    responder = await serve(mq, REQUESTS, price)
+    try:
+        await transport.deliver(REQUESTS, b'{"sku": "A-1"}', headers=request())
+    finally:
+        await mq.close()
+
+    assert responder.answered == 0
+    # The caller was still told, in milliseconds rather than at its deadline.
+    assert HEADER_ERROR in transport.sent_to(REPLIES)[0].headers
+
+
+async def test_a_request_naming_nowhere_to_reply_is_counted_as_unanswerable() -> None:
+    transport = FakeTransport()
+
+    async def price(message: Message) -> dict[str, Any]:
+        return {"pence": 250}
+
+    mq = Connection(transport)
+    await mq.declare(Topology().queue(REQUESTS, dead_letter=True))
+    responder = await serve(mq, REQUESTS, price)
+    try:
+        await transport.deliver(REQUESTS, b'{"sku": "A-1"}', headers=request(reply_to=None))
+    finally:
+        await mq.close()
+
+    # Anything above zero means a caller is publishing where it means to request.
+    assert responder.unanswerable == 1
+    assert responder.answered == 0
+
+
+async def test_the_counters_exist_before_the_responder_subscribes() -> None:
+    # A broker may hand the first request over from inside the subscribe, which
+    # is what a queue with a backlog looks like from in here. The handler reads
+    # the counters on that very delivery, so they have to be there already.
+    transport = EagerTransport()
+
+    async def price(message: Message) -> dict[str, Any]:
+        return {"pence": 250}
+
+    mq = Connection(transport)
+    await mq.declare(Topology().queue(REQUESTS, dead_letter=True))
+    transport.backlog = (REQUESTS, b'{"sku": "A-1"}', request())
+    responder = await serve(mq, REQUESTS, price)
+    try:
+        await transport.settled()
+    finally:
+        await mq.close()
+
+    # Counted like any other, with no wait before it could be read.
+    assert responder.answered == 1
+    assert responder.running or responder.closed
+
+
+async def test_a_responder_is_closed_and_entered_like_the_consumer_it_wraps() -> None:
+    transport = FakeTransport()
+
+    async def price(message: Message) -> dict[str, Any]:
+        return {"pence": 250}
+
+    mq = Connection(transport)
+    await mq.declare(Topology().queue(REQUESTS, dead_letter=True))
+
+    async with await serve(mq, REQUESTS, price) as responder:
+        assert responder.queue == REQUESTS
+        assert responder.running
+        assert responder.in_flight == 0
+        assert responder.consumer.queue == REQUESTS
+    assert responder.closed
     await mq.close()

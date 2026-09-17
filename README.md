@@ -656,13 +656,14 @@ dashboard built against one library reads against another:
 | `acemq.messages.set.aside.failed` | Could not be moved to a dead-letter or parking queue, so was rejected to the broker instead |
 | `acemq.outbox.total` | Outbox records the relay handled. Labelled `exchange`, `routing.key` and `outcome`: `published` or `failed` |
 | `acemq.outbox.lag` | **Worth an alert.** Seconds a record waited between being committed and being published — the one number that reveals a stopped relay. Java, Go and .NET write the same two |
+| `acemq.request.total` | Request and reply round trips, as the caller experienced them. Labelled `routing.key` and `outcome`: `answered`, `timed_out` or `failed` |
+| `acemq.request.duration` | Seconds, the same labels. A call that times out is recorded at its deadline |
 
 What this library does *not* write is worth saying, because the alternative is a
 dashboard panel that is empty and looks broken. Java's `MetricNames` also names
-`acemq.publish.duration`, `acemq.consume.attempts`, `acemq.request.duration`,
-`acemq.request.total`, `acemq.pipeline.run.duration` and
-`acemq.pipeline.run.total`; nothing here emits those, and the request and
-pipeline halves of that list are answered by the tracing adapter instead.
+`acemq.publish.duration`, `acemq.consume.attempts`, `acemq.pipeline.run.duration`
+and `acemq.pipeline.run.total`; nothing here emits those, and the pipeline half
+of that list is answered by the tracing adapter instead.
 
 `routing.key` and the other dotted tag names are exported to Prometheus with
 underscores, because a Prometheus label name allows nothing else.
@@ -775,7 +776,7 @@ from acemq_amqp.patterns import InMemoryIdempotencyStore, chain, idempotent, wit
 |---|---|
 | `idempotent(store, handler)` | Handle a message once however many times it arrives. A duplicate is **accepted**, not rejected: the work was done |
 | `record(...)` / `OutboxRelay` | Write the message into the same transaction as the work, and let a relay publish what was committed |
-| `Requester` / `serve(...)` | Ask a question and wait for the answer. A responder's failure comes back as a failure, not as a timeout. The return address is written to both the `acemq-reply-to` header and AMQP's own `reply-to` property, and read header-first, so any of the five can call any other |
+| `Requester` / `serve(...)` | Ask a question and wait for the answer. A responder's failure comes back as a failure, not as a timeout. The return address is written to both the `acemq-reply-to` header and AMQP's own `reply-to` property, and read header-first, so any of the five can call any other. Both halves count what they did — `answered`, `unanswerable`, `timed_out`, `unmatched` — and the caller's round trip is timed on `acemq.request.duration` |
 | `replay(...)` | Put dead letters back, with a filter, a limit and a deadline, and a report of what it did and why it stopped |
 | `ordered(key, handler)` | Keep one entity's messages in sequence while everything else runs at once |
 | `ConsumerGroup` | Several consumers over one queue, started and stopped as one thing |

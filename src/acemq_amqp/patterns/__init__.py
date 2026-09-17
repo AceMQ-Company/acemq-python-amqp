@@ -93,6 +93,7 @@ from .requestreply import (
     RequestTimeoutError,
     Responder,
     ResponderError,
+    ResponderHandle,
     serve,
 )
 from .routingslip import (
@@ -211,6 +212,7 @@ __all__ = [
     "Requester",
     "Responder",
     "ResponderError",
+    "ResponderHandle",
     "RoutingSlip",
     "Saga",
     "SagaAction",

@@ -50,6 +50,8 @@ from .telemetry import (
     METRIC_OUTBOX_LAG,
     METRIC_OUTBOX_TOTAL,
     METRIC_PUBLISH_TOTAL,
+    METRIC_REQUEST_DURATION,
+    METRIC_REQUEST_TOTAL,
     METRIC_RETRIED_TOTAL,
     METRIC_RUNG_MISSING,
     METRIC_SET_ASIDE_FAILED,
@@ -202,6 +204,8 @@ _HELP = {
     METRIC_SET_ASIDE_FAILED: "Messages that could not be moved out of the way",
     METRIC_OUTBOX_TOTAL: "Outbox records the relay has handled, by outcome",
     METRIC_OUTBOX_LAG: "How long an outbox record waited to be published, in seconds",
+    METRIC_REQUEST_TOTAL: "Request and reply round trips, by outcome",
+    METRIC_REQUEST_DURATION: "How long a round trip took, in seconds",
 }
 
 

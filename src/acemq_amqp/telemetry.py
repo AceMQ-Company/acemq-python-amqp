@@ -112,6 +112,26 @@ METRIC_RUNG_MISSING = "acemq.retry.rung.missing"
 #: :data:`TAG_TARGET`.
 METRIC_SET_ASIDE_FAILED = "acemq.messages.set.aside.failed"
 
+#: Request and reply round trips, tagged with :data:`TAG_ROUTING_KEY` and
+#: :data:`TAG_OUTCOME`: :data:`OUTCOME_ANSWERED`, :data:`OUTCOME_TIMED_OUT` or
+#: :data:`OUTCOME_FAILED`.
+#:
+#: The caller's number, and only the caller's. A responder's side is an ordinary
+#: queue and is counted on :data:`METRIC_CONSUME_TOTAL` like any other; what
+#: nothing else can see is how long *asking* took, because the publish and the
+#: reply's delivery are two unrelated hops and neither of them is the round trip.
+METRIC_REQUEST_TOTAL = "acemq.request.total"
+
+#: How long a round trip took, in seconds, carrying the same labels as
+#: :data:`METRIC_REQUEST_TOTAL`.
+#:
+#: Measured as the caller experienced it: from before the request is published to
+#: after the reply is in hand, so the publish, the responder's work and the reply
+#: coming back are all inside it. A request that times out is recorded too, at
+#: its deadline, because a p99 that quietly drops the slowest calls is a p99 that
+#: says a service is fast right up to the point where nothing answers at all.
+METRIC_REQUEST_DURATION = "acemq.request.duration"
+
 #: Outbox records the relay has handled, tagged with :data:`TAG_OUTCOME`:
 #: :data:`OUTCOME_PUBLISHED` or :data:`OUTCOME_FAILED`. Labelled
 #: :data:`TAG_EXCHANGE` and :data:`TAG_ROUTING_KEY` as well, because a relay
