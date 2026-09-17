@@ -413,7 +413,7 @@ therefore how often there is one. Nothing about the bytes differs.
 |---|---|---|
 | Go | When asked | A Go struct carries no schema, so there is nothing to resolve onto until the caller passes `avro.ReaderSchema(...)` |
 | Java | Sometimes | A generated `SpecificRecord` class carries a schema of its own, and `AvroCodec.registered(registry, readerSchema)` is handed one. A `GenericRecord` through a plain registry codec asks for nothing in particular, so the reader schema is the writer's and nothing resolves |
-| .NET | Always | The codec is constructed with a schema |
+| .NET | By default | The codec is constructed with a schema, so there is always one to resolve onto unless the caller declines it: `Registered(registry, schema, readerSchema)` reads against a different schema than it writes, and `WithoutReaderSchema()` leaves the codec none at all |
 | Python | Always | The codec is constructed with a schema |
 | Ruby | Always | The codec is constructed with a schema |
 
