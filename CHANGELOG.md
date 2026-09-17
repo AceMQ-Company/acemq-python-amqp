@@ -10,6 +10,54 @@ While the version is `0.x` the public API may change in any release.
 
 ### Added
 
+- **`Publisher.send_all(payloads)` publishes a whole batch before it waits for
+  any confirm, and then waits for all of them.** Publisher confirms are on and
+  cannot be turned off here, so `send` does not return until the broker has
+  answered — which is a round trip per message and exactly what you want for one
+  message. For a thousand it is a thousand round trips in a row: on a link with
+  5 ms of latency, five seconds of waiting that nothing needed. The batch hands
+  every payload to the transport first and awaits the confirms afterwards, so the
+  broker is working through the first message while the last is already on the
+  wire. **The results come back in the order the payloads were given**, whatever
+  order the broker answered in, so a caller can line them up against the list
+  they passed.
+
+  Until now the only way to get that in Python was to build the tasks yourself
+  and `asyncio.gather` them, which is easy to get subtly wrong: a gather without
+  `return_exceptions=True` raises out of the first failure while the rest of the
+  batch is still in flight, which throws away the results already collected and
+  leaves the other tasks' exceptions unretrieved for asyncio to complain about
+  afterwards. That lost count is the expensive part. **A partial batch is the
+  ordinary outcome of a broker problem partway through**, and a caller told only
+  "it failed" has no choice but to resend everything, duplicating every message
+  that had already arrived. `send_all` awaits every send whatever an earlier one
+  did, and the `PublishError` that follows names the counts, word for word the
+  sentence Java and .NET raise so that one runbook covers all three:
+
+  ```
+  2 of 100 messages were not confirmed; 98 were. The first failure was: ...
+  ```
+
+  `__cause__` carries the first underlying failure **in payload order** — not the
+  first one the broker answered — so a caller that has to tell a broker rejection
+  from a confirm timeout still can, and two callers reading the same batch get
+  the same answer.
+
+  **This is not atomic and the docstring says so.** AMQP has no way to publish a
+  hundred messages such that all or none arrive, and a library that offered one
+  would be lying; for a message and the database row it describes to happen
+  together, the outbox is still the pattern. Nothing caps how wide a batch may
+  be, here or anywhere else in this library, so a batch holds as many unconfirmed
+  publishes as the list it was given has entries: hand it thousands rather than a
+  million-row cursor, and chunk what comes out of a database.
+
+  **Nothing existing changes.** `send` is untouched, on the wire nothing is
+  different from publishing the same messages one at a time, and the blocking API
+  gets the same method — `sync` publishers have `send_all` too, running the batch
+  on the loop thread and returning when every confirm is in. Java has spelled
+  this `sendAll` from the start and .NET `SendAllAsync`; Go and Ruby have no
+  equivalent yet.
+
 - **`AvroCodec.reading(...)`, so a consumer can say which schema it was written
   against and have Avro resolve every message onto it.** This is the half of the
   registered mode that was missing, and without it the mode delivered rather

@@ -16,10 +16,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 
 import pytest
-from fake_transport import FakeTransport
+from fake_transport import FakeTransport, Sent
 
 from acemq_amqp import (
     AceMQError,
@@ -178,3 +180,147 @@ async def test_a_transport_that_cannot_manage_queues_says_so() -> None:
 
     with pytest.raises(AceMQError, match="cannot manage queues"):
         await connection.queue_exists("orders.new")
+
+
+@dataclass
+class HoldingTransport(FakeTransport):
+    """A broker that takes a message and answers for it only when told to.
+
+    The recording transport confirms a publish without ever yielding to the
+    loop, which leaves a pipelined batch and a loop awaiting one confirm at a
+    time looking exactly alike: the same messages in ``sent``, in the same
+    order. Holding each confirm in a future the test resolves by hand is what
+    tells them apart, because a sequential loop cannot reach the second message
+    until the first has been answered.
+    """
+
+    confirms: list[asyncio.Future[PublishResult]] = field(default_factory=list)
+
+    async def publish(
+        self, exchange: str, routing_key: str, message: Outbound
+    ) -> PublishResult:
+        self.sent.append(Sent(exchange, routing_key, message))
+        confirm: asyncio.Future[PublishResult] = asyncio.get_running_loop().create_future()
+        self.confirms.append(confirm)
+        return await confirm
+
+    async def wait_until_sent(self, count: int, timeout: float = 2.0) -> None:
+        """Waits for ``count`` messages to have reached the broker unanswered."""
+
+        async def enough() -> None:
+            while len(self.sent) < count:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(enough(), timeout)
+
+    def confirm(self, index: int) -> None:
+        """Answers one message, numbered by the order it was published in."""
+        self.confirms[index].set_result(
+            PublishResult(
+                message_id=self.sent[index].message.message_id,
+                confirmed=True,
+                routed=True,
+            )
+        )
+
+    def refuse(self, index: int, reason: str) -> None:
+        """Fails one message's confirm."""
+        self.confirms[index].set_exception(RuntimeError(reason))
+
+
+async def test_a_batch_puts_every_message_on_the_wire_before_it_waits_for_a_confirm() -> None:
+    # The whole point of the method. A loop awaiting each send in turn cannot
+    # reach the second message until the broker has answered the first, so a
+    # broker holding every confirm is what tells the two apart.
+    transport = HoldingTransport()
+    connection = Connection(transport)
+    publisher = connection.publisher(routing_key="orders.new")
+
+    batch = asyncio.create_task(publisher.send_all([{"id": "1"}, {"id": "2"}, {"id": "3"}]))
+    await transport.wait_until_sent(3)
+
+    assert [sent.message.body for sent in transport.sent] == [
+        b'{"id": "1"}',
+        b'{"id": "2"}',
+        b'{"id": "3"}',
+    ]
+    # Nothing has been answered yet, so the safety half of the bargain holds
+    # too: the call has not returned with messages still unconfirmed.
+    assert batch.done() is False
+
+    for index in (0, 1, 2):
+        transport.confirm(index)
+
+    results = await batch
+    assert [result.confirmed for result in results] == [True, True, True]
+
+
+async def test_a_batchs_results_are_in_payload_order_whatever_the_broker_answers() -> None:
+    transport = HoldingTransport()
+    connection = Connection(transport)
+    publisher = connection.publisher(routing_key="orders.new")
+
+    batch = asyncio.create_task(publisher.send_all([{"id": "1"}, {"id": "2"}, {"id": "3"}]))
+    await transport.wait_until_sent(3)
+
+    # The broker answers the last one first, which is ordinary: confirms come
+    # back when each message was written, not in the order they were sent.
+    for index in (2, 0, 1):
+        transport.confirm(index)
+
+    results = await batch
+    assert [result.message_id for result in results] == [
+        sent.message.message_id for sent in transport.sent
+    ]
+
+
+async def test_a_batch_that_fails_partway_still_waits_for_the_rest_and_counts_them() -> None:
+    transport = HoldingTransport()
+    connection = Connection(transport)
+    publisher = connection.publisher(routing_key="orders.new")
+
+    batch = asyncio.create_task(publisher.send_all([{"id": str(n)} for n in range(4)]))
+    await transport.wait_until_sent(4)
+
+    # The failure is answered before the three good confirms. Abandoning the
+    # batch there is exactly what loses the count a caller needs: three of
+    # these messages are on the broker and resending them duplicates them.
+    transport.refuse(1, "the broker refused it")
+    for index in (0, 2, 3):
+        transport.confirm(index)
+
+    with pytest.raises(PublishError) as failure:
+        await batch
+
+    # Word for word what Java and .NET raise, so one runbook covers all three.
+    assert str(failure.value) == (
+        "1 of 4 messages were not confirmed; 3 were."
+        " The first failure was: the broker refused it"
+    )
+    assert isinstance(failure.value.__cause__, RuntimeError)
+    assert failure.value.routing_key == "orders.new"
+
+
+async def test_when_two_messages_fail_the_one_reported_is_the_first_in_payload_order() -> None:
+    transport = HoldingTransport()
+    connection = Connection(transport)
+    publisher = connection.publisher(routing_key="orders.new")
+
+    batch = asyncio.create_task(publisher.send_all([{"id": str(n)} for n in range(4)]))
+    await transport.wait_until_sent(4)
+
+    # The fourth message fails first and the second fails after it. The one
+    # named is the second, because payload order is what a caller can line up
+    # against the list they passed; the order the broker answered in is not.
+    transport.refuse(3, "answered first")
+    transport.refuse(1, "answered second")
+    for index in (0, 2):
+        transport.confirm(index)
+
+    with pytest.raises(PublishError) as failure:
+        await batch
+
+    assert str(failure.value) == (
+        "2 of 4 messages were not confirmed; 2 were. The first failure was: answered second"
+    )
+    assert str(failure.value.__cause__) == "answered second"

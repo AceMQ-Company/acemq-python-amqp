@@ -30,7 +30,7 @@ import logging
 import socket
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, TypeAlias
@@ -221,6 +221,82 @@ class Publisher:
         # during start-up applies to the publishers that already exist. Building
         # the chain per message costs a few closures and buys that.
         return await publish_chain(self._connection.publish_interceptors, self._send)(context)
+
+    async def send_all(self, payloads: Iterable[Any]) -> list[PublishResult]:
+        """Publishes a batch and waits for every confirm.
+
+        What most bulk publishing actually wants: the throughput of pipelining
+        with the safety of having waited. Every message goes out before any
+        confirm is awaited, and only then are all of them checked together.
+        Awaiting each send in turn is a broker round trip per message — the
+        loop a caller could have written for themselves, and none of the
+        throughput a batch exists for.
+
+        The results come back in the order the payloads were given, whatever
+        order the broker answers in.
+
+        **This is not atomic.** AMQP has no such thing: there is no way to
+        publish a hundred messages such that all or none arrive, and a library
+        that offered one would be lying. A failure does not abandon the rest
+        either — every send is awaited whatever an earlier one did, so a batch
+        that half succeeded can say how many arrived. That count is the point:
+        a caller told only "it failed" resends the messages the broker already
+        has.
+
+        Nothing caps how wide a batch may be, here or anywhere else in this
+        library, so a batch holds as many unconfirmed publishes as the list it
+        was given has entries. Hand it thousands rather than a million-row
+        cursor, and chunk what comes out of a database.
+
+        :param payloads: what to send, in order, each encoded by this
+            publisher's codec
+        :returns: what the broker said about each, in the order the payloads
+            were given
+        :raises PublishError: when any message was not confirmed. Its message
+            names how many failed and how many did not, and ``__cause__``
+            carries the first failure in payload order — which is not
+            necessarily the first one the broker answered
+        """
+        batch = list(payloads)
+        # Everything is started before anything is awaited. A task per payload,
+        # all of them created before the gather below, is what puts the whole
+        # batch on the wire while the broker is still working through the
+        # first confirm.
+        sends = [asyncio.create_task(self.send(payload)) for payload in batch]
+        # return_exceptions, and not for tidiness: without it the first failure
+        # comes out of the gather while the rest of the batch is still in
+        # flight, which loses the count this method exists to report and leaves
+        # the others' exceptions unretrieved for asyncio to complain about
+        # later.
+        settled = await asyncio.gather(*sends, return_exceptions=True)
+
+        results: list[PublishResult] = []
+        first_failure: BaseException | None = None
+        failed = 0
+        for outcome in settled:
+            if isinstance(outcome, BaseException):
+                failed += 1
+                if first_failure is None:
+                    first_failure = outcome
+            else:
+                results.append(outcome)
+
+        if first_failure is not None:
+            # The counts matter. A batch that half succeeded is the ordinary
+            # outcome of a broker problem partway through, and this sentence is
+            # word for word the one Java and .NET raise, so that an operator
+            # reading a log has one thing to recognise rather than three.
+            raise PublishError(
+                "",
+                self._exchange,
+                self._routing_key,
+                str(first_failure),
+                summary=(
+                    f"{failed} of {len(batch)} messages were not confirmed;"
+                    f" {len(results)} were. The first failure was: {first_failure}"
+                ),
+            ) from first_failure
+        return results
 
     async def _send(self, context: PublishContext) -> PublishResult:
         """The innermost work: encode what the interceptors left, and send it."""

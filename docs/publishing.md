@@ -132,6 +132,56 @@ async def stamped(context: PublishContext, send: PublishNext):
 mq.intercept_publish(stamped)
 ```
 
+## Several at once
+
+```python
+results = await orders.send_all([first, second, third])
+```
+
+Every message goes out before any confirm is awaited, and only then are all of
+them checked together — the throughput of pipelining with the safety of having
+waited. A loop calling `send` waits for the broker between one message and the
+next, so a thousand messages on a link with 5 ms of latency cost five seconds of
+waiting that nothing needed. The results come back in the order the payloads
+did, whatever order the broker answers in.
+
+**This is not atomic.** AMQP has no such thing: there is no way to publish a
+hundred messages such that all or none arrive, and a library that offered one
+would be lying. If any message fails, the rest of the batch is still awaited and
+then `PublishError` is raised naming how many were not confirmed and how many
+were:
+
+```
+2 of 100 messages were not confirmed; 98 were. The first failure was: ...
+```
+
+The counts are the point. A batch that half succeeded is the ordinary outcome of
+a broker problem partway through, and a caller told only "it failed" resends
+messages that already arrived. `__cause__` carries the first underlying failure
+*in payload order* — not the first one the broker answered — for callers that
+need to tell a rejection from a timeout:
+
+```python
+try:
+    results = await orders.send_all(batch)
+except PublishError as failure:
+    log.error("%s", failure)            # the counts
+    log.error("%s", failure.__cause__)  # what went wrong first
+```
+
+Nothing caps how wide a batch may be, here or anywhere else in this library, so
+a batch holds as many unconfirmed publishes as the list it was given has
+entries. Hand it thousands rather than a million-row cursor, and chunk what
+comes out of a database.
+
+The blocking API has the same method: `sync.connect(...)` gives a publisher
+whose `send_all` runs the batch on the loop thread and returns when every
+confirm is in.
+
+Java spells this `sendAll` and .NET `SendAllAsync`, with the same ordering, the
+same partial-batch counts and the same wording in the failure. Go and Ruby have
+no equivalent yet.
+
 ## Durability
 
 ```python
@@ -207,8 +257,8 @@ than about the library.
 Publisher confirms are on. `send` does not return until the broker has
 acknowledged the message, and `result.confirmed` says so. That is a round trip
 per message, which is the cost of knowing; a service that publishes in bulk
-should publish concurrently — `asyncio.gather` over several `send` calls —
-rather than turning confirms off, because there is no way to turn them off here.
+should pipeline — [`send_all`](#several-at-once) — rather than turning confirms
+off, because there is no way to turn them off here.
 
 For the stronger guarantee — that a message and the database row it describes
 either both happen or neither does — see

@@ -54,6 +54,13 @@ class PublishError(AceMQError):
     :param reason: the broker's explanation
     :param unroutable: true when the message reached no queue rather than being
         refused. The broker was working; nothing was listening
+    :param summary: the whole message, in place of the sentence composed from
+        the arguments above. For a failure that is about a batch rather than
+        about one message — :meth:`acemq_amqp.Publisher.send_all` raises one of
+        these naming how many messages were not confirmed and how many were,
+        in the words Java and .NET use for the same failure, so that one
+        runbook covers all of them. A batch failure leaves ``message_id``
+        empty, because there is no single message it is about
     """
 
     def __init__(
@@ -64,6 +71,7 @@ class PublishError(AceMQError):
         reason: str,
         *,
         unroutable: bool = False,
+        summary: str = "",
     ) -> None:
         self.message_id = message_id
         self.exchange = exchange
@@ -72,7 +80,9 @@ class PublishError(AceMQError):
         self.unroutable = unroutable
 
         where = f"exchange {exchange!r} with key {routing_key!r}"
-        if unroutable:
+        if summary:
+            super().__init__(summary)
+        elif unroutable:
             super().__init__(
                 f"acemq: message {message_id} to {where} reached no queue: {reason}"
             )

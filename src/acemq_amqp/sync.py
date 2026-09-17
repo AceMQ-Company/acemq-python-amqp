@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from collections.abc import Callable, Coroutine, Mapping
+from collections.abc import Callable, Coroutine, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, TypeAlias, TypeVar
 
@@ -115,6 +115,21 @@ class SyncPublisher:
         return self._loop.run(
             self._publisher.send(payload, envelope=envelope, routing_key=routing_key)
         )
+
+    def send_all(self, payloads: Iterable[Any]) -> list[PublishResult]:
+        """Publishes a batch and waits for every confirm.
+
+        Every message goes out before any confirm is awaited, which is the
+        whole point of it: a loop calling :meth:`send` pays a broker round trip
+        per message. See :meth:`acemq_amqp.Publisher.send_all` for what a
+        partial failure reports and why it is not atomic.
+
+        :param payloads: what to send, in order
+        :returns: what the broker said about each, in the order the payloads
+            were given
+        :raises PublishError: when any message was not confirmed
+        """
+        return self._loop.run(self._publisher.send_all(payloads))
 
 
 class SyncConsumer:

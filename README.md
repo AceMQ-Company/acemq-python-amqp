@@ -73,6 +73,20 @@ The formats go the same way, one extra each — `[yaml]`, `[toml]`, `[protobuf]`
 `[avro]` — because a service that speaks YAML has no reason to install a
 protobuf runtime. XML has no extra: it is written against the standard library.
 
+### Publishing a batch
+
+```python
+results = await mq.publisher("orders-events", "order.placed").send_all(orders)
+```
+
+Every message goes out before any confirm is awaited, and only then are all of
+them checked together. A loop calling `send` waits for the broker between one
+message and the next; this does not, and the results still come back in the
+order the payloads did. It is not atomic — AMQP has no such thing — so a partial
+failure raises `PublishError` naming how many messages were not confirmed and
+how many were, because a caller told only "it failed" resends messages that
+already arrived. See [publishing](docs/publishing.md#several-at-once).
+
 ### Not running an event loop?
 
 ```python
