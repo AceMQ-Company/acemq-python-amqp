@@ -31,11 +31,19 @@ import pytest
 from fake_transport import FakeTransport
 
 from acemq_amqp import (
+    METRIC_CONSUME_ATTEMPTS,
     METRIC_CONSUME_DURATION,
     METRIC_CONSUME_IN_FLIGHT,
     METRIC_CONSUME_TOTAL,
     METRIC_DEAD_LETTERED_TOTAL,
+    METRIC_OUTBOX_LAG,
+    METRIC_OUTBOX_TOTAL,
+    METRIC_PIPELINE_RUN_DURATION,
+    METRIC_PIPELINE_RUN_TOTAL,
+    METRIC_PUBLISH_DURATION,
     METRIC_PUBLISH_TOTAL,
+    METRIC_REQUEST_DURATION,
+    METRIC_REQUEST_TOTAL,
     METRIC_RETRIED_TOTAL,
     METRIC_RUNG_MISSING,
     METRIC_SET_ASIDE_FAILED,
@@ -49,6 +57,7 @@ from acemq_amqp import (
     Metrics,
     NullObserver,
     Observer,
+    PublishError,
     accept,
     aggregate_health,
     fixed_retry,
@@ -71,8 +80,18 @@ from acemq_amqp.telemetry import (
     metric_key,
 )
 from acemq_amqp.topology import Topology
+from acemq_amqp.transport import Outbound, PublishResult
 
 QUEUE = "orders.new"
+
+
+class RefusingTransport(FakeTransport):
+    """A broker that will not take anything at all."""
+
+    async def publish(
+        self, exchange: str, routing_key: str, message: Outbound
+    ) -> PublishResult:
+        raise RuntimeError("the broker said no")
 
 
 @asynccontextmanager
@@ -126,6 +145,51 @@ def test_the_metric_names_are_the_ones_the_other_libraries_publish() -> None:
     assert METRIC_DEAD_LETTERED_TOTAL == "acemq.messages.dead.lettered.total"
     assert METRIC_SET_ASIDE_FAILED == "acemq.messages.set.aside.failed"
     assert METRIC_RUNG_MISSING == "acemq.retry.rung.missing"
+    assert METRIC_PUBLISH_DURATION == "acemq.publish.duration"
+    assert METRIC_CONSUME_ATTEMPTS == "acemq.consume.attempts"
+    assert METRIC_REQUEST_DURATION == "acemq.request.duration"
+    assert METRIC_REQUEST_TOTAL == "acemq.request.total"
+    assert METRIC_PIPELINE_RUN_DURATION == "acemq.pipeline.run.duration"
+    assert METRIC_PIPELINE_RUN_TOTAL == "acemq.pipeline.run.total"
+
+
+def test_every_name_java_publishes_is_written_somewhere_here() -> None:
+    # The list used to be six names short, and the six were documented as
+    # absent. They are all written now, so this pins the whole set rather than
+    # the part that happened to be implemented.
+    assert {
+        METRIC_PUBLISH_TOTAL,
+        METRIC_PUBLISH_DURATION,
+        METRIC_CONSUME_TOTAL,
+        METRIC_CONSUME_DURATION,
+        METRIC_CONSUME_ATTEMPTS,
+        METRIC_CONSUME_IN_FLIGHT,
+        METRIC_RETRIED_TOTAL,
+        METRIC_DEAD_LETTERED_TOTAL,
+        METRIC_SET_ASIDE_FAILED,
+        METRIC_REQUEST_TOTAL,
+        METRIC_REQUEST_DURATION,
+        METRIC_OUTBOX_TOTAL,
+        METRIC_OUTBOX_LAG,
+        METRIC_PIPELINE_RUN_TOTAL,
+        METRIC_PIPELINE_RUN_DURATION,
+    } == {
+        "acemq.publish.total",
+        "acemq.publish.duration",
+        "acemq.consume.total",
+        "acemq.consume.duration",
+        "acemq.consume.attempts",
+        "acemq.consume.in.flight",
+        "acemq.messages.retried.total",
+        "acemq.messages.dead.lettered.total",
+        "acemq.messages.set.aside.failed",
+        "acemq.request.total",
+        "acemq.request.duration",
+        "acemq.outbox.total",
+        "acemq.outbox.lag",
+        "acemq.pipeline.run.total",
+        "acemq.pipeline.run.duration",
+    }
 
 
 def test_the_outcome_values_are_the_ones_the_other_libraries_tag_with() -> None:
@@ -539,3 +603,80 @@ def test_the_observer_protocol_accepts_anything_with_the_three_methods() -> None
             self.seen.append(metric)
 
     assert isinstance(Counting(), Observer)
+
+
+async def test_a_publish_is_timed_as_well_as_counted() -> None:
+    transport = FakeTransport()
+    metrics = Metrics()
+    connection = Connection(transport, observer=metrics)
+
+    await connection.publisher("orders-events", "order.placed").send({"id": "7"})
+
+    labels = {
+        "exchange": "orders-events",
+        "routing.key": "order.placed",
+        "outcome": OUTCOME_CONFIRMED,
+    }
+    # The same labels as the total beside it, deliberately: a dashboard dividing
+    # one into the other needs both series cut the same way.
+    assert metrics.counts[metric_key(METRIC_PUBLISH_TOTAL, labels)] == 1
+    assert metrics.durations[metric_key(METRIC_PUBLISH_DURATION, labels)].count == 1
+
+
+async def test_a_publish_that_fails_is_timed_too() -> None:
+    # The slow publishes are the interesting ones, and a timing that covered
+    # only the successes would drop exactly those.
+    transport = RefusingTransport()
+    metrics = Metrics()
+    connection = Connection(transport, observer=metrics)
+
+    with pytest.raises(RuntimeError):
+        await connection.publisher(routing_key="orders.new").send({"id": "7"})
+
+    labels = {"exchange": "", "routing.key": "orders.new", "outcome": "failed"}
+    assert metrics.counts[metric_key(METRIC_PUBLISH_TOTAL, labels)] == 1
+    assert metrics.durations[metric_key(METRIC_PUBLISH_DURATION, labels)].count == 1
+
+
+async def test_an_unroutable_publish_is_timed_too() -> None:
+    transport = FakeTransport()
+    metrics = Metrics()
+    connection = Connection(transport, observer=metrics)
+
+    with pytest.raises(PublishError):
+        await connection.publisher(routing_key="nowhere", mandatory=True).send({"id": "7"})
+
+    labels = {"exchange": "", "routing.key": "nowhere", "outcome": OUTCOME_UNROUTABLE}
+    assert metrics.counts[metric_key(METRIC_PUBLISH_TOTAL, labels)] == 1
+    assert metrics.durations[metric_key(METRIC_PUBLISH_DURATION, labels)].count == 1
+
+
+async def test_which_attempt_a_delivery_was_on_is_recorded() -> None:
+    # A rising distribution is a dependency in trouble, and it says so before
+    # anything else does: the dead letters only move once the attempts run out.
+    async def handle(message: Message) -> Ack:
+        return accept()
+
+    async with running(handle) as (transport, metrics, _):
+        await transport.deliver(QUEUE, b"{}", headers=wire())
+        await transport.deliver(
+            QUEUE, b"{}", headers=Envelope(attempt=3).to_headers(routing_key=QUEUE)
+        )
+
+    summary = metrics.durations[metric_key(METRIC_CONSUME_ATTEMPTS, {"queue": QUEUE})]
+    assert summary.count == 2
+    assert (summary.fastest, summary.slowest) == (1.0, 3.0)
+    assert summary.total == 4.0
+
+
+async def test_the_attempt_is_recorded_even_when_the_body_will_not_decode() -> None:
+    # Recorded on arrival rather than at the settlement, because it is a fact
+    # about the delivery that is true before the handler runs — and this
+    # delivery never reaches one.
+    async def handle(message: Message) -> Ack:
+        raise AssertionError("nothing decodable arrived")
+
+    async with running(handle) as (transport, metrics, _):
+        await transport.deliver(QUEUE, b"not json at all", headers=wire())
+
+    assert metrics.durations[metric_key(METRIC_CONSUME_ATTEMPTS, {"queue": QUEUE})].count == 1

@@ -22,7 +22,16 @@ from typing import Any
 import pytest
 from fake_transport import FakeTransport
 
-from acemq_amqp import Connection, Envelope, FatalError, Message, headers
+from acemq_amqp import (
+    METRIC_PIPELINE_RUN_DURATION,
+    METRIC_PIPELINE_RUN_TOTAL,
+    Connection,
+    Envelope,
+    FatalError,
+    Message,
+    Metrics,
+    headers,
+)
 from acemq_amqp.patterns import (
     HEADER_ROUTING_SLIP,
     RoutingSlip,
@@ -31,6 +40,13 @@ from acemq_amqp.patterns import (
     route_of,
     slip_from,
     start,
+)
+from acemq_amqp.telemetry import (
+    OUTCOME_COMPLETED,
+    TAG_OUTCOME,
+    TAG_PIPELINE,
+    TAG_STEP,
+    metric_key,
 )
 
 ITINERARY = (
@@ -451,3 +467,73 @@ def test_advancing_keeps_the_form_and_the_run() -> None:
 
     assert advanced.form is SlipForm.STEP_NAMES
     assert advanced.run_id == "run-7"
+
+
+async def test_the_step_that_ends_a_run_counts_it_and_times_the_whole_route() -> None:
+    # Once per run rather than once per hop: the step that finds no next stop is
+    # the step that finished the run.
+    transport = FakeTransport()
+    metrics = Metrics()
+    mq = Connection(transport, observer=metrics)
+
+    async def ship(message: Message) -> Any:
+        return message.payload
+
+    finished = ITINERARY.advance().advance()
+    await follow_slip(mq, ship)(arriving(finished))
+
+    labels = {
+        TAG_PIPELINE: "orders-events",
+        TAG_STEP: "ship",
+        TAG_OUTCOME: OUTCOME_COMPLETED,
+    }
+    assert metrics.counts[metric_key(METRIC_PIPELINE_RUN_TOTAL, labels)] == 1
+    # The envelope's own age rather than a timer, so this covers the whole route
+    # including the time the message spent waiting on the queues between steps.
+    assert metrics.durations[metric_key(METRIC_PIPELINE_RUN_DURATION, labels)].count == 1
+
+
+async def test_a_hop_that_is_not_the_last_counts_no_run() -> None:
+    transport = FakeTransport()
+    metrics = Metrics()
+    mq = Connection(transport, observer=metrics)
+
+    async def charge(message: Message) -> dict[str, Any]:
+        return {"charged": True}
+
+    await follow_slip(mq, charge)(arriving(ITINERARY.advance()))
+
+    # The publish onwards is counted as the publish it is, and nothing says a
+    # run finished — because none did.
+    assert not [name for name in metrics.counts if name.startswith("acemq.pipeline.")]
+    assert not [name for name in metrics.durations if name.startswith("acemq.pipeline.")]
+
+
+async def test_a_declared_route_is_counted_under_the_pipeline_it_was_given() -> None:
+    # The declared form does not carry its pipeline, which is the one thing
+    # follow_slip has to be told — and it is the tag a Java dashboard groups by.
+    transport = FakeTransport()
+    metrics = Metrics()
+    mq = Connection(transport, observer=metrics)
+
+    async def dispatch(message: Message) -> Any:
+        return message.payload
+
+    finished = route_of("fulfilment", "enrich", "dispatch", run_id="run-7").advance()
+    await follow_slip(mq, dispatch, pipeline="fulfilment")(
+        Message(
+            payload={"order": "order-1"},
+            envelope=finished.onto(Envelope(id="order-1")),
+            routing_key="dispatch",
+            content_type="application/json",
+            redelivered=False,
+            body=b"{}",
+        )
+    )
+
+    labels = {
+        TAG_PIPELINE: "fulfilment",
+        TAG_STEP: "dispatch",
+        TAG_OUTCOME: OUTCOME_COMPLETED,
+    }
+    assert metrics.counts[metric_key(METRIC_PIPELINE_RUN_TOTAL, labels)] == 1

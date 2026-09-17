@@ -69,6 +69,14 @@ from ..ack import Ack, FatalError, accept, reject, retry
 from ..codec import Codec
 from ..connection import AsyncHandler, Connection, Message
 from ..envelope import Envelope
+from ..telemetry import (
+    METRIC_PIPELINE_RUN_DURATION,
+    METRIC_PIPELINE_RUN_TOTAL,
+    OUTCOME_COMPLETED,
+    TAG_OUTCOME,
+    TAG_PIPELINE,
+    TAG_STEP,
+)
 from ._support import decide
 
 #: The itinerary, as JSON. An application header, so anything may set it.
@@ -481,6 +489,14 @@ def follow_slip(
     publish retries this step — which is the reason a step that changes anything
     should be idempotent.
 
+    The step that finds no next stop writes ``acemq.pipeline.run.duration`` and
+    ``acemq.pipeline.run.total`` to the connection's
+    :class:`~acemq_amqp.telemetry.Observer`, tagged ``pipeline``, ``step`` and
+    ``outcome``. That is once per run rather than once per hop, and the duration
+    is the message's own age, so it covers the whole route including the time
+    spent waiting on the queues between steps. See
+    :data:`~acemq_amqp.telemetry.METRIC_PIPELINE_RUN_TOTAL`.
+
     :param connection: where the next message goes
     :param step: what this stop does, returning the payload to send on
     :param codec: a codec other than the connection's
@@ -515,6 +531,27 @@ def follow_slip(
         onwards = advanced.next
         if onwards is None:
             # The end of the itinerary. Nothing to publish, and the work is done.
+            #
+            # The run is counted here and only here: the step that finds no next
+            # stop is the step that finished the run, so the counter goes up once
+            # per run however many services it passed through. The duration is
+            # the envelope's own age rather than a timer, because the envelope
+            # was created when the message entered the pipeline and carried
+            # through every hop — it is the only number that spans services, and
+            # summing each step's consume duration would miss every second the
+            # message spent waiting on a queue between two of them.
+            labels = {
+                TAG_PIPELINE: pipeline or slip.steps[0].exchange,
+                TAG_STEP: str(slip.steps[0]),
+                TAG_OUTCOME: OUTCOME_COMPLETED,
+            }
+            observer = connection.observer
+            observer.observe(
+                METRIC_PIPELINE_RUN_DURATION,
+                message.envelope.age.total_seconds(),
+                labels,
+            )
+            observer.count(METRIC_PIPELINE_RUN_TOTAL, 1, labels)
             return accept()
 
         try:

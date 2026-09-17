@@ -57,6 +57,20 @@ from typing import Any, Protocol, runtime_checkable
 #: metric and not a division between two differently-named ones.
 METRIC_PUBLISH_TOTAL = "acemq.publish.total"
 
+#: How long a publish took, in seconds, tagged with :data:`TAG_OUTCOME` and
+#: carrying the same labels as :data:`METRIC_PUBLISH_TOTAL`.
+#:
+#: From calling ``send`` to the broker answering, so it includes the encode, the
+#: interceptor chain and the confirm round trip — everything a caller waits for.
+#: Recorded whatever the outcome, including a publish that failed and one that
+#: reached no queue, because the slow publishes are the interesting ones and a
+#: timing that covered only the successes would drop them.
+#:
+#: The same labels as the total beside it, deliberately: a dashboard dividing one
+#: into the other needs both series cut the same way, and a duration with a label
+#: the total does not have cannot be divided into it.
+METRIC_PUBLISH_DURATION = "acemq.publish.duration"
+
 #: Deliveries that were settled, tagged with :data:`TAG_OUTCOME`.
 #:
 #: Counted once per delivery, from the settlement rather than from what the
@@ -71,6 +85,21 @@ METRIC_CONSUME_TOTAL = "acemq.consume.total"
 #: operator wants to know is how long a message takes to deal with, and an
 #: interceptor that opens a transaction is part of dealing with it.
 METRIC_CONSUME_DURATION = "acemq.consume.duration"
+
+#: Which attempt a delivery was on when it was handled, as a distribution,
+#: labelled :data:`TAG_QUEUE`.
+#:
+#: Not a duration, and the only metric here that is not. A rising distribution is
+#: a dependency in trouble, and it says so earlier than anything else does: the
+#: dead letters only move once the attempts run out, so a queue whose messages
+#: have started needing three tries each looks entirely healthy on every other
+#: number until the first one gives up.
+#:
+#: Recorded through :meth:`Observer.observe` because that is the only
+#: distribution the interface has. Adding a method for it would break every
+#: observer an application has already written, for one metric — see the note on
+#: :meth:`Observer.observe` for what that means for an implementation.
+METRIC_CONSUME_ATTEMPTS = "acemq.consume.attempts"
 
 #: How many messages are in a handler right now, as a gauge. Bounded by prefetch
 #: times concurrency.
@@ -139,6 +168,30 @@ METRIC_REQUEST_DURATION = "acemq.request.duration"
 #: always "the relay is behind *on one exchange*".
 METRIC_OUTBOX_TOTAL = "acemq.outbox.total"
 
+#: Routing-slip runs that reached the end of their itinerary, labelled
+#: :data:`TAG_PIPELINE`, :data:`TAG_STEP` and :data:`TAG_OUTCOME`.
+#:
+#: Java's ``acemq.pipeline.run.total``, written from the same place: the step
+#: that found no next stop is the step that finished the run, so the counter goes
+#: up exactly once per run however many services it passed through.
+#:
+#: The outcome is always :data:`OUTCOME_COMPLETED` here. Java also writes
+#: ``ended_early`` for a step that returned nothing with stops still to go, and
+#: this library has no way for a routing-slip step to say that — see
+#: :data:`OUTCOME_ENDED_EARLY`.
+METRIC_PIPELINE_RUN_TOTAL = "acemq.pipeline.run.total"
+
+#: How old a message was when it left a pipeline, in seconds, carrying the same
+#: labels as :data:`METRIC_PIPELINE_RUN_TOTAL`.
+#:
+#: The *run's* duration and not the step's, which is why it is the envelope's age
+#: rather than a timer: the envelope was created when the message entered the
+#: pipeline and carried through every hop, so this is the only number that spans
+#: services. A per-step timing is :data:`METRIC_CONSUME_DURATION` on each step's
+#: own queue, and summing those misses every second a message spent waiting on a
+#: queue between two of them — which on a busy pipeline is most of the answer.
+METRIC_PIPELINE_RUN_DURATION = "acemq.pipeline.run.duration"
+
 #: How long an outbox record waited between being committed and being published,
 #: in seconds. Recorded only for a record that went out, and carrying the same
 #: labels as :data:`METRIC_OUTBOX_TOTAL`.
@@ -178,6 +231,14 @@ TAG_QUEUE = "queue"
 #: queue or the parking lot. Bounded by the topology, so it is safe as a tag.
 TAG_TARGET = "target"
 
+#: The pipeline a routing-slip run belongs to, which is its exchange. Empty when
+#: the run carried a JSON slip that names no pipeline.
+TAG_PIPELINE = "pipeline"
+
+#: The step a pipeline run was at when it finished. Bounded by the route, which
+#: names a fixed handful of steps, so it is safe as a tag.
+TAG_STEP = "step"
+
 #: What happened. The publish outcomes are below; the delivery outcomes are
 #: :data:`~acemq_amqp.ack.OUTCOME_ACKED` and its neighbours in
 #: :mod:`acemq_amqp.ack`, which are the same words the settlement and the span
@@ -204,6 +265,19 @@ OUTCOME_ANSWERED = "answered"
 #: A request that reached its deadline with no reply.
 OUTCOME_TIMED_OUT = "timed_out"
 
+#: A pipeline run that reached the end of its itinerary.
+OUTCOME_COMPLETED = "completed"
+
+#: A pipeline run that stopped before the end of its route because a step chose
+#: to stop it. **Nothing in this library writes it**, and the name is here so
+#: that a dashboard shared with Java can be read rather than guessed at: a
+#: :data:`~acemq_amqp.patterns.Stage` always returns the payload for the next
+#: stop, so there is no way for one to end a run early and no honest moment to
+#: emit this. :func:`~acemq_amqp.patterns.then` has :data:`NOTHING
+#: <acemq_amqp.patterns.NOTHING>` for that, and a ``then`` chain is not a routing
+#: slip — it has no pipeline name, no step name and no run to end.
+OUTCOME_ENDED_EARLY = "ended_early"
+
 
 @runtime_checkable
 class Observer(Protocol):
@@ -224,7 +298,22 @@ class Observer(Protocol):
         """Adds to a counter."""
 
     def observe(self, metric: str, seconds: float, labels: Mapping[str, str]) -> None:
-        """Records a duration, in seconds."""
+        """Records one sample of a distribution.
+
+        A duration in seconds for every metric but one. The exception is
+        :data:`METRIC_CONSUME_ATTEMPTS`, which is a count of attempts and is
+        recorded here because this is the only distribution the interface has —
+        Java uses a Micrometer ``DistributionSummary`` for it and a ``Timer`` for
+        the rest, and this interface has one method where Java has two.
+
+        The argument keeps its name because renaming it would break every
+        observer that passes it by keyword, and because it is a duration in every
+        case but that one. An implementation that puts durations into histogram
+        buckets should give that metric its own: seconds-shaped buckets over a
+        value of 1, 2 or 3 report an attempt count as a handful of very fast
+        handlers. :class:`~acemq_amqp.prometheus.PrometheusObserver` does exactly
+        that, with :data:`~acemq_amqp.prometheus.DEFAULT_ATTEMPT_BUCKETS`.
+        """
 
     def gauge(self, metric: str, value: int, labels: Mapping[str, str]) -> None:
         """Sets a current value."""

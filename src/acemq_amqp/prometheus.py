@@ -43,12 +43,16 @@ from typing import Any
 
 from .errors import AceMQError
 from .telemetry import (
+    METRIC_CONSUME_ATTEMPTS,
     METRIC_CONSUME_DURATION,
     METRIC_CONSUME_IN_FLIGHT,
     METRIC_CONSUME_TOTAL,
     METRIC_DEAD_LETTERED_TOTAL,
     METRIC_OUTBOX_LAG,
     METRIC_OUTBOX_TOTAL,
+    METRIC_PIPELINE_RUN_DURATION,
+    METRIC_PIPELINE_RUN_TOTAL,
+    METRIC_PUBLISH_DURATION,
     METRIC_PUBLISH_TOTAL,
     METRIC_REQUEST_DURATION,
     METRIC_REQUEST_TOTAL,
@@ -86,6 +90,22 @@ DEFAULT_DURATION_BUCKETS = (
     60.0,
 )
 
+#: Buckets for :data:`~acemq_amqp.telemetry.METRIC_CONSUME_ATTEMPTS`, which is a
+#: count of attempts rather than a duration.
+#:
+#: The one metric this library reports through
+#: :meth:`~acemq_amqp.telemetry.Observer.observe` that is not measured in
+#: seconds, and the reason it needs buckets of its own: on the duration buckets
+#: above, every delivery on attempt 1, 2 or 3 would land in the sub-five-second
+#: end and a distribution of attempt counts would read as a distribution of very
+#: fast handlers.
+#:
+#: Whole numbers, because attempts are whole numbers, reaching ten because a
+#: retry policy allowing more than that is unusual and the overflow bucket says
+#: so when there is one. The first bucket is the interesting one: a queue whose
+#: messages are mostly *not* in it is a queue whose dependency is struggling.
+DEFAULT_ATTEMPT_BUCKETS = (1.0, 2.0, 3.0, 4.0, 5.0, 10.0)
+
 
 class PrometheusObserver:
     """Writes what the library reports into a Prometheus registry.
@@ -103,7 +123,11 @@ class PrometheusObserver:
         ``prometheus_client.start_http_server`` serves
     :param namespace: a prefix for every metric name, for a process that already
         namespaces its metrics
-    :param buckets: the histogram buckets for the handler duration
+    :param buckets: the histogram buckets for every duration
+    :param attempt_buckets: the buckets for
+        :data:`~acemq_amqp.telemetry.METRIC_CONSUME_ATTEMPTS`, which counts
+        attempts rather than seconds and would read as a handful of very fast
+        handlers on seconds-shaped buckets
     :raises AceMQError: when prometheus-client is not installed
     """
 
@@ -113,6 +137,7 @@ class PrometheusObserver:
         *,
         namespace: str = "",
         buckets: tuple[float, ...] = DEFAULT_DURATION_BUCKETS,
+        attempt_buckets: tuple[float, ...] = DEFAULT_ATTEMPT_BUCKETS,
     ) -> None:
         try:
             import prometheus_client
@@ -126,6 +151,7 @@ class PrometheusObserver:
         self._registry = registry if registry is not None else prometheus_client.REGISTRY
         self._namespace = namespace
         self._buckets = buckets
+        self._attempt_buckets = attempt_buckets
         self._collectors: dict[str, Any] = {}
         self._label_names: dict[str, tuple[str, ...]] = {}
 
@@ -182,11 +208,21 @@ class PrometheusObserver:
         )
 
     def _histogram(self, metric: str, names: tuple[str, ...]) -> Any:
+        # The attempt distribution gets its own buckets, and has to: it is the
+        # one thing reported through ``observe`` that is not a number of seconds,
+        # and on seconds-shaped buckets a delivery on attempt 2 is recorded as a
+        # handler that took two seconds. Everything else is a duration and takes
+        # whatever this observer was given.
+        buckets = (
+            self._attempt_buckets
+            if metric == METRIC_CONSUME_ATTEMPTS
+            else self._buckets
+        )
         return self._client.Histogram(
             _prometheus_name(metric),
             _documentation(metric),
             names,
-            buckets=self._buckets,
+            buckets=buckets,
             namespace=self._namespace,
             registry=self._registry,
         )
@@ -195,9 +231,11 @@ class PrometheusObserver:
 #: What each metric means, for the HELP line a scraper shows beside it.
 _HELP = {
     METRIC_PUBLISH_TOTAL: "Publishes, by outcome",
+    METRIC_PUBLISH_DURATION: "How long a publish takes, from send to confirm, in seconds",
     METRIC_CONSUME_TOTAL: "Deliveries settled, by outcome",
     METRIC_CONSUME_DURATION: "How long a delivery takes, in seconds",
     METRIC_CONSUME_IN_FLIGHT: "Messages being handled right now",
+    METRIC_CONSUME_ATTEMPTS: "Which attempt a delivery was on when it was handled",
     METRIC_RETRIED_TOTAL: "Messages given another attempt",
     METRIC_DEAD_LETTERED_TOTAL: "Messages sent to a dead-letter or parking queue",
     METRIC_RUNG_MISSING: "Long retries that waited in the consumer for want of a rung queue",
@@ -206,6 +244,8 @@ _HELP = {
     METRIC_OUTBOX_LAG: "How long an outbox record waited to be published, in seconds",
     METRIC_REQUEST_TOTAL: "Request and reply round trips, by outcome",
     METRIC_REQUEST_DURATION: "How long a round trip took, in seconds",
+    METRIC_PIPELINE_RUN_TOTAL: "Pipeline runs that finished, by outcome",
+    METRIC_PIPELINE_RUN_DURATION: "How old a message was when it left a pipeline, in seconds",
 }
 
 

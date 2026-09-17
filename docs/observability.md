@@ -119,8 +119,10 @@ another. Java publishes them through Micrometer and .NET through
 | Metric | |
 |---|---|
 | `acemq.publish.total` | Publishes. Labelled `exchange`, `routing.key` and `outcome`: `confirmed`, `unroutable`, `failed` |
+| `acemq.publish.duration` | Seconds, from calling `send` to the broker answering, carrying the same labels. Recorded for a publish that failed and one that reached no queue as well |
 | `acemq.consume.total` | Deliveries settled. Labelled `queue` and `outcome`: `acked`, `retried`, `rejected`, `dead_lettered`, `parked` |
 | `acemq.consume.duration` | Seconds, timed around the interceptors as well as the handler, and carrying the same `outcome` |
+| `acemq.consume.attempts` | Which attempt a delivery was on when it arrived. A distribution rather than a duration — see [the one metric that is not seconds](#the-one-metric-that-is-not-seconds) |
 | `acemq.consume.in.flight` | A gauge: how many are being handled right now |
 | `acemq.messages.retried.total` | Messages given another attempt. Says `where`: `consumer`, `broker` or `requeued` |
 | `acemq.messages.dead.lettered.total` | Messages set aside, tagged `outcome`: `dead_lettered` went to `{queue}.dlq`, `parked` went to `{queue}.parked` because the body would not decode or a handler returned `park(...)` |
@@ -130,25 +132,50 @@ another. Java publishes them through Micrometer and .NET through
 | `acemq.outbox.lag` | **Worth an alert.** How long a record waited between being committed and being published, in seconds. See [the outbox](#the-outbox-lag-and-the-half-of-it-this-library-can-write) |
 | `acemq.request.total` | Request and reply round trips, as the caller experienced them. Labelled `routing.key` and `outcome`: `answered`, `timed_out` or `failed`. See [request and reply](request-reply.md#the-two-metrics) |
 | `acemq.request.duration` | Seconds, the same labels. The timer starts before the request is published and a call that times out is recorded at its deadline |
+| `acemq.pipeline.run.total` | Routing-slip runs that reached the end of their itinerary. Labelled `pipeline`, `step` and `outcome`. Written by `follow_slip` |
+| `acemq.pipeline.run.duration` | Seconds, the same labels: how old the message was when it left the pipeline, so it covers the whole route rather than one hop |
 
-### And the names this library does not write
+**That is every name Java's `MetricNames` publishes.** A dashboard built against
+Java, Go or .NET reads against this library, panel for panel — with two caveats
+below, neither of which leaves a panel blank.
 
-Worth stating, because a dashboard panel that is empty looks the same as a
-service that has stopped. `MetricNames` also names `acemq.publish.duration`,
-`acemq.consume.attempts`, `acemq.pipeline.run.duration` and
-`acemq.pipeline.run.total`. Nothing here emits any of them.
+### The one metric that is not seconds
 
-`Observer` has counters, gauges and durations and no general distribution, so
-`acemq.consume.attempts` has nowhere to go — and the number is on every message
-as `Envelope.attempt`, which a handler that wants it records in one line.
-`acemq.publish.duration` is the timing beside `acemq.publish.total`, and only
-the total is written here.
+`acemq.consume.attempts` is a distribution of attempt *counts*, not of durations,
+and `Observer` has one method for both — Java has a `DistributionSummary` and a
+`Timer` where this has `observe`. So it arrives through `observe` with a value of
+1, 2, 3 and so on.
 
-The routing-slip names have a different reason. `follow_slip` is built over a
-connection rather than being something the connection knows it is doing, so
-nothing on that path is holding an observer. It is answered on the trace
-instead — a `pipeline.run_finished` event — which is where the shape of one
-particular run belongs anyway.
+That matters for an `Observer` you write yourself. An implementation that puts
+every `observe` into seconds-shaped histogram buckets will report a delivery on
+attempt 2 as a handler that took two seconds, and the whole distribution will
+pile into the fast end. `PrometheusObserver` gives it buckets of its own —
+`DEFAULT_ATTEMPT_BUCKETS`, whole numbers from 1 to 10, overridable with
+`attempt_buckets=` — so the first bucket answers "how many got it right first
+time" exactly. **A rising distribution is a dependency in trouble, and it says so
+before anything else does:** the dead letters only move once the attempts run
+out, so a queue whose messages have started needing three tries each looks
+entirely healthy on every other number until the first one gives up.
+
+It is recorded when the delivery arrives rather than when it is settled, because
+it is a fact about the delivery that is true before the handler runs — a message
+whose body will not decode is counted too, and nothing this consumer is still
+working on when the process stops is lost.
+
+### One outcome value that is never written
+
+`acemq.pipeline.run.total` carries `outcome`, and the only value it ever takes
+here is `completed`. Java also writes `ended_early`, for a step that returned
+nothing with stops still to go. **This library has no way for a routing-slip step
+to end a run**: a `Stage` always returns the payload for the next stop, so there
+is no honest moment to emit it, and emitting `completed` for a run that stopped
+halfway would be a wrong number rather than a missing one. `OUTCOME_ENDED_EARLY`
+is defined so a shared dashboard can be read rather than guessed at, and nothing
+writes it.
+
+`NOTHING` in `then(...)` is the nearest thing, and it is not the same thing: a
+`then` chain has no pipeline name, no step name and no run identifier, so there
+is no run for it to end.
 
 ### The tags Java carries and this library does not
 

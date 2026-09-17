@@ -10,6 +10,79 @@ While the version is `0.x` the public API may change in any release.
 
 ### Added
 
+- **Every metric name Java publishes is now written here.** The six that were
+  not — `acemq.publish.duration`, `acemq.consume.attempts`,
+  `acemq.request.duration`, `acemq.request.total`,
+  `acemq.pipeline.run.duration` and `acemq.pipeline.run.total` — were honestly
+  documented as absent, with a reason each, which is better than claiming
+  compatibility that is not there and worse than being compatible. **A dashboard
+  built against a Java, Go or .NET estate now reads against this library panel
+  for panel.** The request pair came with the requester and responder counters
+  above; these are the other four.
+
+  `acemq.publish.duration` is the timing that was missing beside
+  `acemq.publish.total`, and it carries exactly the same labels, deliberately: a
+  dashboard dividing one into the other needs both series cut the same way, and
+  a duration with a label the total does not have cannot be divided into it. It
+  runs from inside `send` to the broker answering, so the codec, the interceptor
+  chain, the wait for an outstanding-publish permit and the confirm round trip
+  are all inside it — a timer started after the encode would hide a slow codec
+  completely. It is recorded whatever the outcome, including a publish that
+  raised and a mandatory one that reached no queue, because **the slow publishes
+  are the interesting ones** and a timing covering only the successes drops
+  exactly those.
+
+  `acemq.consume.attempts` is the number an operator gets earliest. The dead
+  letters only move once the attempts run out, so a queue whose messages have
+  quietly started needing three tries each looks entirely healthy on every other
+  number until the first one gives up. It is recorded when the delivery arrives
+  rather than when it is settled: the attempt is a fact about the delivery that
+  is true before the handler runs, a body that will not decode is counted too,
+  and nothing this consumer is still working on when the process stops is lost.
+
+  **It is the one metric here that is not measured in seconds**, and that has a
+  consequence for anybody who has written an `Observer`. Java has a
+  `DistributionSummary` for it and a `Timer` for everything else; this interface
+  has one `observe`, and adding a second method would break every observer an
+  application has already written for the sake of one metric. So the attempt
+  count arrives through `observe` with a value of 1, 2, 3. An implementation that
+  puts every `observe` into seconds-shaped histogram buckets will report a
+  delivery on attempt 2 as a handler that took two seconds and pile the whole
+  distribution into the fast end. `PrometheusObserver` gives it buckets of its
+  own — `DEFAULT_ATTEMPT_BUCKETS`, whole numbers from 1 to 10, overridable with
+  `attempt_buckets=` — so the first bucket answers "how many got it right first
+  time" exactly rather than approximately. The `Observer.observe` docstring says
+  all of this, because it is the one place somebody writing one will read.
+
+  `acemq.pipeline.run.duration` and `acemq.pipeline.run.total` are written by
+  `follow_slip`, from the step that finds no next stop — the step that finished
+  the run — so the counter goes up once per run however many services the
+  message passed through. They carry `pipeline`, `step` and `outcome`. The
+  duration is the **envelope's own age** rather than a timer, and that is the
+  whole point of having it: the envelope was created when the message entered
+  the pipeline and carried through every hop, so it is the only number that
+  spans services. Summing each step's `acemq.consume.duration` misses every
+  second the message spent waiting on a queue between two of them, which on a
+  busy pipeline is most of the answer.
+
+  **One outcome value is named and never written, and that is deliberate.**
+  `OUTCOME_ENDED_EARLY` exists so a dashboard shared with Java can be read
+  rather than guessed at, and nothing here emits it: Java writes `ended_early`
+  for a pipeline step that returned nothing with stops still to go, and a
+  routing-slip `Stage` here always returns the payload for the next stop. There
+  is no honest moment to emit it, and emitting `completed` for a run that
+  stopped halfway would be a wrong number rather than a missing one. `NOTHING`
+  in `then(...)` is the nearest thing and is not the same thing — a `then` chain
+  has no pipeline name, no step name and no run to end.
+
+  Java also tags every metric with `message.type` and `transport`, and nothing
+  here does, on any metric. That is a narrowing kept from before rather than
+  introduced now: `message.type` is producer-controlled and unbounded unless
+  somebody is disciplined about it, and `transport` has one value in a library
+  with one transport. A Grafana panel filtered on either label matches nothing
+  here; everything that does not filter on them reads identically. Both
+  `docs/observability.md` and the README say so.
+
 - **A requester and a responder now count what they did, and the caller's round
   trip is a metric.** `responder.answered`, `responder.unanswerable`,
   `requester.timed_out` and `requester.unmatched` are the four numbers Java and
@@ -313,9 +386,10 @@ While the version is `0.x` the public API may change in any release.
 
   Where a tutorial publishes several messages it uses `send_all`, and
   `docs/tutorial-observability.md` builds its dashboard only from names this
-  library actually writes — the six of Java's that it does not are called out
-  there as well as in `docs/observability.md`, because a dashboard is where an
-  empty panel does the damage.
+  library actually writes. That list was six names short of Java's when the
+  tutorial was written; all six are written now — see **Added** — and the page
+  builds a dashboard from the whole set, with the two caveats that still apply
+  called out, because a dashboard is where a wrong panel does the damage.
 
 ### Changed
 
@@ -406,13 +480,12 @@ Documentation, all of it a claim the code stopped supporting.
 - **The metric-name compatibility claim was wider than the truth.** The README
   and `docs/observability.md` both said the names here are Java's `MetricNames`
   and that a dashboard built against one library reads against another, without
-  saying that six of Java's names are not written here at all:
+  saying that six of Java's names were not written here at all:
   `acemq.publish.duration`, `acemq.consume.attempts`, `acemq.request.duration`,
   `acemq.request.total`, `acemq.pipeline.run.duration` and
-  `acemq.pipeline.run.total`. Every name that *is* written is Java's character
-  for character; the six that are not are now listed, with the reason for each,
-  because a dashboard panel that is empty looks the same as a service that has
-  stopped.
+  `acemq.pipeline.run.total`. Listing them with a reason each was the fix at the
+  time; writing them was the better one, and all six are now written — see
+  **Added**. The claim is true as it stands.
 
 - **The encrypted-body divergence table was missing Ruby**, which writes Java's
   framing byte for byte. `docs/serialization.md` and

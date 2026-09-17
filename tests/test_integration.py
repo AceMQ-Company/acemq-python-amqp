@@ -48,8 +48,10 @@ from aiormq.exceptions import AMQPConnectionError, ChannelPreconditionFailed
 
 from acemq_amqp import (
     DEAD_LETTER_EXCHANGE,
+    METRIC_CONSUME_ATTEMPTS,
     METRIC_CONSUME_DURATION,
     METRIC_CONSUME_TOTAL,
+    METRIC_PUBLISH_DURATION,
     METRIC_PUBLISH_TOTAL,
     RETRY_EXCHANGE,
     Ack,
@@ -923,6 +925,22 @@ async def test_metrics_count_a_real_round_trip(
     assert metrics.counts[published] == 1
     assert metrics.counts[metric_key(METRIC_CONSUME_TOTAL, acked)] == 1
     assert metrics.durations[metric_key(METRIC_CONSUME_DURATION, acked)].count == 1
+
+    # The timing beside the publish total, with the same labels so a dashboard
+    # can divide one into the other. A real broker rather than the fake because
+    # the confirm round trip is most of what it measures.
+    timed = metrics.durations[
+        metric_key(
+            METRIC_PUBLISH_DURATION,
+            {"exchange": "", "routing.key": queue, "outcome": "confirmed"},
+        )
+    ]
+    assert timed.count == 1
+    assert timed.total > 0
+
+    # And which attempt the delivery was on, which for a first delivery is one.
+    attempts = metrics.durations[metric_key(METRIC_CONSUME_ATTEMPTS, {"queue": queue})]
+    assert (attempts.count, attempts.slowest) == (1, 1.0)
 
 
 async def _counted(metrics: Metrics, metric: str, labels: dict[str, str]) -> bool:

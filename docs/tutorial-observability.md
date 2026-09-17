@@ -108,21 +108,22 @@ library reads against another.
 | `acemq.outbox.lag` | how long a record waited between commit and publish, in seconds |
 | `acemq.request.total` | request and reply round trips, labelled `routing.key` and `outcome`: `answered`, `timed_out` or `failed` |
 | `acemq.request.duration` | how long a round trip took, in seconds, with the same labels |
+| `acemq.publish.duration` | how long a publish took, from `send` to the broker answering, with the same labels as the publish total |
+| `acemq.consume.attempts` | which attempt a delivery was on when it arrived, labelled `queue` |
+| `acemq.pipeline.run.total` | routing-slip runs that reached the end, labelled `pipeline`, `step` and `outcome` |
+| `acemq.pipeline.run.duration` | how old the message was when it left the pipeline, in seconds |
 
-**Build your dashboard from that list and nothing else.** Java's `MetricNames`
-also spells `acemq.publish.duration`, `acemq.consume.attempts`,
-`acemq.pipeline.run.duration` and `acemq.pipeline.run.total`. **Nothing here
-emits any of them**, and a panel that is empty looks exactly like a service that
-has stopped — which is the worst possible thing for a panel to look like at 3am.
+**That is every name Java's `MetricNames` publishes**, so a dashboard built
+against Java, Go or .NET reads against this one panel for panel. Two things are
+worth knowing before you build it, and neither leaves a panel blank.
 
-Two reasons, and neither is an oversight waiting to be fixed. `Observer` has
-counters, gauges and durations and no general distribution, so
-`acemq.consume.attempts` has nowhere to go — and the number is on every message
-as `envelope.attempt`, which a handler that wants it records in one line. And
-the pipeline runner is built *over* a connection rather than being something the
-connection knows it is doing, so nothing on that path is holding an observer; it
-is answered on the trace instead. See
-[the names this library does not write](observability.md#and-the-names-this-library-does-not-write).
+`acemq.consume.attempts` is a count of attempts rather than a number of seconds —
+the only metric here that is not — so an `Observer` of your own should give it
+buckets that are whole numbers. `PrometheusObserver` already does.
+`acemq.pipeline.run.total` carries `outcome` and the only value it ever takes
+here is `completed`; Java also writes `ended_early`, which nothing in this
+library can honestly emit. See
+[what is reported](observability.md#what-is-reported) for both.
 
 There is also no counter for "a message arrived". Every delivery is counted once
 when it is **settled**, and the sum across the outcomes of `acemq.consume.total`

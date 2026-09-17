@@ -62,10 +62,12 @@ from .interceptors import (
 from .retry import ZERO, RetryPolicy, Wait, no_retry
 from .security import Security
 from .telemetry import (
+    METRIC_CONSUME_ATTEMPTS,
     METRIC_CONSUME_DURATION,
     METRIC_CONSUME_IN_FLIGHT,
     METRIC_CONSUME_TOTAL,
     METRIC_DEAD_LETTERED_TOTAL,
+    METRIC_PUBLISH_DURATION,
     METRIC_PUBLISH_TOTAL,
     METRIC_RETRIED_TOTAL,
     METRIC_RUNG_MISSING,
@@ -321,17 +323,36 @@ class Publisher:
 
     async def _send(self, context: PublishContext) -> PublishResult:
         """The innermost work: encode what the interceptors left, and send it."""
-        # Encoded here rather than before the chain ran, so an interceptor can
-        # change the payload as well as its metadata. A codec that has already
-        # run leaves an interceptor with bytes and nothing it can do to them.
-        body = self._codec.encode(context.payload)
         observer = self._connection.observer
         # ``routing.key`` and not ``key``: Java and .NET both tag a publish with
         # the fully-qualified name, and a dashboard that groups by it should
         # read the same in all five languages.
         labels = {TAG_EXCHANGE: context.exchange, TAG_ROUTING_KEY: context.routing_key}
+        # Started before the encode, because everything from here on is time the
+        # caller spends inside send(): the codec, the wait for a permit and the
+        # broker's confirm are all things that make a publish slow, and a timer
+        # that began after the encode would hide a slow codec completely.
+        started = time.monotonic()
 
+        def record(outcome: str) -> None:
+            """The pair, always together and always with the same labels.
+
+            Two calls rather than one because the interface has two methods, and
+            in this order because a dashboard dividing the duration's count into
+            the total should never see the total lead it.
+            """
+            observer.observe(
+                METRIC_PUBLISH_DURATION,
+                time.monotonic() - started,
+                {**labels, TAG_OUTCOME: outcome},
+            )
+            observer.count(METRIC_PUBLISH_TOTAL, 1, {**labels, TAG_OUTCOME: outcome})
+
+        # Encoded here rather than before the chain ran, so an interceptor can
+        # change the payload as well as its metadata. A codec that has already
+        # run leaves an interceptor with bytes and nothing it can do to them.
         try:
+            body = self._codec.encode(context.payload)
             result = await self._connection.publish_raw(
                 context.exchange,
                 context.routing_key,
@@ -346,7 +367,7 @@ class Publisher:
                 ),
             )
         except Exception:
-            observer.count(METRIC_PUBLISH_TOTAL, 1, {**labels, TAG_OUTCOME: OUTCOME_FAILED})
+            record(OUTCOME_FAILED)
             raise
 
         # Raised rather than left in the result, because a caller who does not
@@ -354,9 +375,7 @@ class Publisher:
         # somewhere. Unroutable is the quietest failure AMQP has: the publish
         # succeeds, the consumer waits, and nothing anywhere says why.
         if context.mandatory and not result.routed:
-            observer.count(
-                METRIC_PUBLISH_TOTAL, 1, {**labels, TAG_OUTCOME: OUTCOME_UNROUTABLE}
-            )
+            record(OUTCOME_UNROUTABLE)
             raise PublishError(
                 context.envelope.id,
                 context.exchange,
@@ -365,7 +384,7 @@ class Publisher:
                 unroutable=True,
             )
 
-        observer.count(METRIC_PUBLISH_TOTAL, 1, {**labels, TAG_OUTCOME: OUTCOME_CONFIRMED})
+        record(OUTCOME_CONFIRMED)
         return result
 
 
@@ -507,6 +526,17 @@ class Consumer:
         # the sum across the outcomes is how many arrived. One counter that
         # leads the others by however many messages are in flight is a counter
         # that makes an operator wonder which one is lying.
+        #
+        # The attempt is a distribution rather than a counter, and it is recorded
+        # here on arrival rather than at the settlement: it is a fact about the
+        # delivery that is true before the handler runs, and recording it after
+        # would drop every message this consumer is still working on when the
+        # process stops. A rising distribution is a dependency in trouble, and it
+        # says so before anything else does — the dead letters only move once the
+        # attempts run out.
+        self._observer.observe(
+            METRIC_CONSUME_ATTEMPTS, float(envelope.attempt), self._labels
+        )
         self._in_flight += 1
         self._observer.gauge(METRIC_CONSUME_IN_FLIGHT, self._in_flight, self._labels)
         try:

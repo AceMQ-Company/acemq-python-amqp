@@ -25,9 +25,15 @@ import pytest
 from fake_transport import FakeTransport
 
 from acemq_amqp import (
+    METRIC_CONSUME_ATTEMPTS,
     METRIC_CONSUME_DURATION,
     METRIC_CONSUME_IN_FLIGHT,
+    METRIC_PIPELINE_RUN_DURATION,
+    METRIC_PIPELINE_RUN_TOTAL,
+    METRIC_PUBLISH_DURATION,
     METRIC_PUBLISH_TOTAL,
+    METRIC_REQUEST_DURATION,
+    METRIC_REQUEST_TOTAL,
     AceMQError,
     Connection,
     Observer,
@@ -132,3 +138,57 @@ async def test_a_connection_reports_through_it(registry: object) -> None:
         'acemq_publish_total{exchange="",outcome="confirmed",routing_key="orders.new"} 1.0'
         in rendered(registry)
     )
+
+
+def test_the_attempt_distribution_gets_buckets_that_are_not_seconds(
+    registry: object,
+) -> None:
+    # The one thing reported through observe() that is not a number of seconds.
+    # On the duration buckets a delivery on attempt 2 would be recorded as a
+    # handler that took two seconds, and every attempt count would pile into the
+    # sub-five-second end.
+    observer = PrometheusObserver(registry)
+    for attempt in (1.0, 1.0, 3.0, 7.0):
+        observer.observe(METRIC_CONSUME_ATTEMPTS, attempt, {"queue": QUEUE})
+
+    body = rendered(registry)
+    assert "acemq_consume_attempts_count{" in body
+    # Whole-number buckets, so the first one answers "how many got it right
+    # first time" exactly rather than approximately.
+    assert 'acemq_consume_attempts_bucket{le="1.0",queue="orders.new"} 2.0' in body
+    assert 'acemq_consume_attempts_bucket{le="3.0",queue="orders.new"} 3.0' in body
+    assert 'acemq_consume_attempts_bucket{le="10.0",queue="orders.new"} 4.0' in body
+    # And no seconds-shaped bucket anywhere on it.
+    assert 'acemq_consume_attempts_bucket{le="0.005"' not in body
+
+
+def test_durations_keep_their_own_buckets(registry: object) -> None:
+    observer = PrometheusObserver(registry)
+    observer.observe(METRIC_CONSUME_DURATION, 0.02, {"queue": QUEUE})
+
+    body = rendered(registry)
+    assert 'acemq_consume_duration_bucket{le="0.025",queue="orders.new"} 1.0' in body
+
+
+def test_the_help_line_says_what_each_of_the_new_names_means(registry: object) -> None:
+    # A name with no HELP is a name a scraper shows as itself, which is the same
+    # as no documentation at the moment somebody needs it.
+    observer = PrometheusObserver(registry)
+    observer.observe(METRIC_PUBLISH_DURATION, 0.01, {"exchange": "", "outcome": "confirmed"})
+    observer.observe(METRIC_CONSUME_ATTEMPTS, 1.0, {"queue": QUEUE})
+    observer.observe(METRIC_REQUEST_DURATION, 0.01, {"outcome": "answered"})
+    observer.count(METRIC_REQUEST_TOTAL, 1, {"outcome": "answered"})
+    observer.observe(METRIC_PIPELINE_RUN_DURATION, 0.01, {"pipeline": "fulfilment"})
+    observer.count(METRIC_PIPELINE_RUN_TOTAL, 1, {"pipeline": "fulfilment"})
+
+    body = rendered(registry)
+    for name in (
+        "acemq_publish_duration",
+        "acemq_consume_attempts",
+        "acemq_request_duration",
+        "acemq_request_total",
+        "acemq_pipeline_run_duration",
+        "acemq_pipeline_run_total",
+    ):
+        line = next(li for li in body.splitlines() if li.startswith(f"# HELP {name} "))
+        assert line != f"# HELP {name} {name}"

@@ -658,12 +658,19 @@ dashboard built against one library reads against another:
 | `acemq.outbox.lag` | **Worth an alert.** Seconds a record waited between being committed and being published — the one number that reveals a stopped relay. Java, Go and .NET write the same two |
 | `acemq.request.total` | Request and reply round trips, as the caller experienced them. Labelled `routing.key` and `outcome`: `answered`, `timed_out` or `failed` |
 | `acemq.request.duration` | Seconds, the same labels. A call that times out is recorded at its deadline |
+| `acemq.publish.duration` | Seconds, from `send` to the broker answering, with the same labels as the publish total. Recorded for a failed publish too |
+| `acemq.consume.attempts` | Which attempt a delivery was on when it arrived. Labelled `queue` |
+| `acemq.pipeline.run.total` | Routing-slip runs that reached the end of their itinerary. Labelled `pipeline`, `step` and `outcome` |
+| `acemq.pipeline.run.duration` | Seconds: how old the message was when it left the pipeline, so it covers the whole route rather than one hop |
 
-What this library does *not* write is worth saying, because the alternative is a
-dashboard panel that is empty and looks broken. Java's `MetricNames` also names
-`acemq.publish.duration`, `acemq.consume.attempts`, `acemq.pipeline.run.duration`
-and `acemq.pipeline.run.total`; nothing here emits those, and the pipeline half
-of that list is answered by the tracing adapter instead.
+**That is every name Java's `MetricNames` publishes**, so a dashboard built
+against Java, Go or .NET reads against this one. Two caveats, neither of which
+leaves a panel blank: `acemq.consume.attempts` is a count of attempts rather than
+a number of seconds and needs whole-number histogram buckets, which
+`PrometheusObserver` gives it; and `acemq.pipeline.run.total` only ever carries
+`outcome="completed"`, because a routing-slip step here has no way to end a run
+before its last stop. See
+[observability](docs/observability.md#what-is-reported).
 
 `routing.key` and the other dotted tag names are exported to Prometheus with
 underscores, because a Prometheus label name allows nothing else.
