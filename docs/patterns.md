@@ -744,15 +744,19 @@ declared alongside everything else rather than through a call of its own.
 
 **What changes is what an acknowledgement means**, and it is the thing to
 understand before using one. Acknowledging does not remove the message; it
-advances *this* consumer's position. And rejecting does not dead-letter, because
-there is nothing to remove the message from. A message a handler cannot deal
-with has to be dealt with by the handler — logged, copied elsewhere, counted —
-and the stream moves on regardless. Nothing is lost, and nothing is retried for
-you.
+advances *this* consumer's position, and the message stays on the stream for
+another consumer to read tomorrow.
 
-The retry policy is therefore not a parameter on `read_stream`. Retrying on a
-stream means republishing to it, which appends a second copy for every other
-consumer to read as well.
+What a *failure* means changes with it, and not in the direction another
+library's documentation suggests. `read_stream` returns an ordinary `Consumer`,
+so it does what one always does: it republishes a copy and acknowledges the
+original. `reject()` therefore puts a copy in `{stream}.dlq` and leaves the
+original on the stream, and `retry()` **publishes the message back onto the
+stream**, appending a copy for every other consumer to read as well. The retry
+policy is not a parameter on `read_stream` for exactly that reason — but the
+connection's default policy still reaches the consumer, so a stream handler's
+failures are the handler's to deal with. See [streams](streams.md#what-an-acknowledgement-means-here)
+for the whole table.
 
 Where to start:
 
@@ -774,9 +778,10 @@ defaults to 10. `consumer_name` is what makes server-side offset tracking
 possible. `concurrency` is 1 by default, because a stream's order is usually why
 it is a stream.
 
-`Connection.message_count` on a stream says how many messages are **retained**,
-not how many are outstanding, for the same reason: there is no such thing as
-outstanding on a stream.
+`Connection.message_count` on a stream reports **zero**, whatever the stream
+holds, for the same reason: depth counts the messages nobody has taken yet, and
+on a stream nobody ever takes one. To know how far behind a reader is, record
+the `x-stream-offset` header each delivery carries.
 
 ## The claim check
 

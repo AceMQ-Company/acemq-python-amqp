@@ -21,16 +21,25 @@ independently and a new one can start from the beginning.
 
 That changes what an acknowledgement means, and it is the thing to understand
 before using one. Acknowledging does not remove the message; it advances *this*
-consumer's position. And rejecting does not dead-letter, because there is
-nothing to remove the message from. A message a handler cannot deal with has to
-be dealt with by the handler — logged, copied elsewhere, counted — and the
-stream moves on regardless. Nothing is lost, and nothing is retried for you.
+consumer's position, and the message stays on the stream for somebody else to
+read tomorrow.
 
-For the same reason
+What a failure means changes with it. :func:`read_stream` returns an ordinary
+:class:`~acemq_amqp.Consumer`, so it does what one always does: it republishes a
+copy and acknowledges the original. Nothing is removed from the stream, because
+nothing can be — but a rejected message does put a copy in ``{stream}.dlq``, an
+unreadable one a copy in ``{stream}.parked``, and a retry **appends the message
+to the stream again**, where every other consumer will read it as well. That
+last one is why :func:`read_stream` takes no retry policy; the connection's
+default still reaches the consumer, so a stream handler's failures are the
+handler's to deal with — logged, copied elsewhere, counted — and the stream
+moves on regardless.
+
 :meth:`Connection.message_count <acemq_amqp.Connection.message_count>` says
-nothing useful about a stream: the broker reports zero, because a message on a
-stream is not waiting for anybody. Depth is a property of a queue, and a stream
-is not one.
+nothing useful about a stream either: the broker reports zero, because a message
+on a stream is not waiting for anybody. Depth is a property of a queue, and a
+stream is not one. How far behind a reader is comes from the ``x-stream-offset``
+header each delivery carries.
 """
 
 from __future__ import annotations
@@ -204,8 +213,12 @@ async def read_stream(
     The retry policy is deliberately not a parameter. Retrying on a stream means
     republishing to it, which appends a second copy of the message for every
     other consumer to read as well — so a stream's failures belong to its
-    handler, and pretending otherwise would put the surprise somewhere it cannot
-    be seen.
+    handler, and advertising a knob whose effect is to grow the log would put
+    the surprise somewhere it cannot be seen. Note what that does *not* mean:
+    the connection's own policy still applies, because this is an ordinary
+    consumer, so a stream read from a connection with a retry policy on it will
+    append retries. The default, :func:`~acemq_amqp.no_retry`, is the right one
+    here.
 
     :param connection: where the stream is
     :param name: which stream
