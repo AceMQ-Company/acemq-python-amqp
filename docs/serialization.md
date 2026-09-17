@@ -255,6 +255,9 @@ arrived with, the reader schema it was being read onto, and Avro's own account o
 what diverged. The alternative is a record of silent nonsense, which is the
 failure this whole mode exists to prevent.
 
+Where this library lands against the other four, and the bytes both behaviours
+are pinned to, are in [schema resolution](#schema-resolution).
+
 | Mode | Writes | Reads |
 |---|---|---|
 | fixed schema | `avro/binary` | `avro/binary`, any `avro/*`, `application/avro`, any type containing `avro` that is not the registered one |
@@ -391,6 +394,89 @@ not JSON: ...; TextCodec: acemq: this message is not UTF-8 text: ...
 
 That is the shape a queue needs during a migration, and the shape it needs where
 several producers were written at different times.
+
+## Schema resolution
+
+Handed the writer's schema and the reader's, Avro reconciles the two: a field the
+writer added that the reader does not declare is skipped, and a field the writer
+omitted is filled in from the reader's default. Handed only the writer's, there is
+nothing to reconcile, and the record arrives in the shape it was written.
+
+So there is one rule, and it is the same rule in all five AceMQ libraries:
+
+> **Resolution happens when the library has a reader schema to resolve onto.**
+
+What differs between the languages is where a reader schema comes from, and
+therefore how often there is one. Nothing about the bytes differs.
+
+| Library | Resolves | Where its reader schema comes from |
+|---|---|---|
+| Go | When asked | A Go struct carries no schema, so there is nothing to resolve onto until the caller passes `avro.ReaderSchema(...)` |
+| Java | Sometimes | A generated `SpecificRecord` class carries a schema of its own, and `AvroCodec.registered(registry, readerSchema)` is handed one. A `GenericRecord` through a plain registry codec asks for nothing in particular, so the reader schema is the writer's and nothing resolves |
+| .NET | Always | The codec is constructed with a schema |
+| Python | Always | The codec is constructed with a schema |
+| Ruby | Always | The codec is constructed with a schema |
+
+This is not an inconsistency waiting to be flattened. A library that resolves and
+a library that does not are both right about the same bytes — they are answering
+different questions, because only one of them was told what the reader expects.
+
+**The case that bites is a field the writer removed that the reader declares with
+a default.** With resolution, the field arrives carrying that default. Without it,
+the field is simply absent: a missing key, whatever the language calls one. A
+consumer written against the reader schema then reads a value that was never on
+the wire, or fails to read a field it is sure it declared, and which of those
+happens is decided entirely by whether a reader schema was in play.
+
+The other direction is the one people expect to be dangerous and is not. A field
+the writer added that the reader does not declare is skipped under resolution and
+present without it, and either way the fields the reader does declare come back
+correct — the unknown field does not shift the ones after it.
+
+Both cases are pinned, with the bytes, in
+`tests/fixtures/avro-resolution-fixtures.json`,
+which every AceMQ library carries a copy of. It records the decoded value under
+each behaviour, as `resolved` and `writerShape`, and which library lands on
+which.
+
+### Asking for resolution in Python
+
+There is nothing to ask for. A codec here cannot be built without a schema, so it
+always has a reader schema and every message is resolved onto it:
+
+```python
+# Resolves onto the schema it was built with, which is the only kind there is.
+codec = await AvroCodec.from_registry(registry, "order.placed", my_schema)
+
+# Resolves onto a different one: publish the version you write, read onto yours.
+codec = await AvroCodec.from_registry(
+    registry, "order.placed", schema, reader_schema=my_schema
+)
+
+# The same reader schema for a service that only consumes.
+codec = AvroCodec.reading(my_schema)
+```
+
+`reader_schema=` does not switch resolution on — it says which schema to resolve
+*onto*. Left out, that is the schema being written, so a consumer reading its own
+producer's messages gets the shape it registered; given, the two are separated,
+which is what a service that publishes one version and consumes another needs.
+
+The `writerShape` column is reachable from here, and only by saying so: build the
+codec with the **writer's** schema as its reader schema and resolution has
+nothing left to do, so the record arrives as it was written. That is worth
+knowing mainly because it is what a consumer accidentally does when it pins
+itself to the producer's current schema — it is how an estate quietly loses the
+defaults it thought it had. `tests/test_avro_resolution.py` asserts both columns
+against the shared fixture for exactly that reason.
+
+One edge worth knowing before you meet it: a codec resolves only against writer
+schemas it has been taught. A message framing an identifier that has not reached
+`learn_from(registry, id)` raises `FatalError` naming the identifier rather than
+guessing at a schema, and a change Avro will not resolve at all — a field whose
+type changed, a field added without a default — raises `FatalError` naming both
+schemas. Neither is a resolution that silently did not happen, which is the
+failure mode this section exists to rule out.
 
 ## Writing one
 
@@ -567,6 +653,10 @@ store, and puts the key on the wire instead. See
 
 Schema *evolution* is mostly a different problem from serialization and has its
 own answer: see [the schema registry](patterns.md#schema-registry). The half of
-it that is a codec's problem does ship — the `reader_schema` argument, and
-`AvroCodec.reading(...)` for a service that only consumes, resolve a writer's
-schema onto the reader schema. See [the reader schema](#the-reader-schema).
+it that is a codec's problem does ship, and ships switched on: an `AvroCodec`
+cannot be built without a schema, so it always has a reader schema and always
+resolves a writer's schema onto it. `reader_schema=` and `AvroCodec.reading(...)`
+say which schema to resolve onto rather than whether to. See
+[the reader schema](#the-reader-schema) and
+[schema resolution](#schema-resolution), which pins the behaviour against the
+fixture the other four libraries assert against.
