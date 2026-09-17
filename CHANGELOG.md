@@ -10,6 +10,53 @@ While the version is `0.x` the public API may change in any release.
 
 ### Added
 
+- **`AvroCodec.reading(...)`, so a consumer can say which schema it was written
+  against and have Avro resolve every message onto it.** This is the half of the
+  registered mode that was missing, and without it the mode delivered rather
+  less than it promised: a codec read every message onto the schema it also
+  published with, so a consumer that wanted to read an older or a newer producer
+  had to claim a schema identifier it had no business owning and pretend to be a
+  publisher to get one.
+
+  What the resolution buys is the thing a schema registry exists for. Given the
+  writer's schema alone, a consumer receives whatever the producer sent: a field
+  it has never heard of arrives and has to be read past — get that wrong and
+  every field after it shifts and decodes as something else — and a field it
+  expects is simply absent until the producer starts sending it. Given both
+  schemas, Avro resolves them: the unknown field is discarded, the missing one is
+  filled in from the reader's own default, and the consumer sees the shape it was
+  written against whichever version of the producer wrote the message. **A
+  producer can now add a field with a default and deploy before its consumers**,
+  which is the whole argument for a registry and was not previously true here.
+
+  A change Avro will not resolve — a field whose type changed under it, a field
+  added without a default — raises `FatalError` naming the schema identifier the
+  message arrived with, the schema it was being read onto, and Avro's own account
+  of what diverged. That failure used to arrive as a generic "this message is not
+  Avro this codec reads", which on a queue carrying three producer versions at
+  once is not enough to act on.
+
+  Nothing is registered by a reading codec, because a service that only consumes
+  writes no schema and has no identifier to frame; `encode` says so rather than
+  inventing one. Teach it the writer versions it will meet the way a registered
+  codec has always been taught them, with `learn_from(registry, id)` outside the
+  message path — the registry here is async and a codec is not.
+
+  **Nothing on the wire changed and nothing needs to be done to existing code.**
+  A codec built with `AvroCodec(schema)` or `AvroCodec.from_registry(...)`
+  behaves exactly as before, byte for byte and refusal for refusal, and the
+  framing stays the one Java, Go, Ruby and .NET read. What to do about it is a
+  consumer-side choice: a service that consumes a type it does not publish should
+  build its codec with `AvroCodec.reading(my_schema)` instead of inventing a
+  schema identifier for itself, and a service that does both can pass
+  `reader_schema=` to `AvroCodec.from_registry(...)` and keep one codec. Java
+  spells this `AvroCodec.registered(registry, readerSchema)` and .NET reads it
+  off `ReaderSchema`; Go and Ruby have no equivalent yet.
+
+- **`AvroCodec.reader_schema_text`**, the schema every message is resolved onto,
+  as text. The same as `schema_text` unless a reader schema was given, which is
+  the only case where the two differ.
+
 - **`OutboxRelay` reports what it is doing, so a stopped relay is visible.** It
   counts every record it handles on `acemq.outbox.total`, tagged
   `outcome="published"` or `outcome="failed"`, and times every record it

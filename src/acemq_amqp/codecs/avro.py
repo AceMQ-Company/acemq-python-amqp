@@ -42,6 +42,27 @@ resolve it against its own. This is what makes a field addition safe, and it is
 the mode to use unless there is a reason not to. It writes
 ``application/vnd.acemq.avro``.
 
+**A consumer says which schema it was written against, and Avro resolves the
+writer's onto it.** That is what schema evolution actually needs, and it is the
+second half of the registered mode: with the writer's schema alone a consumer
+receives whatever the producer sent, so a field it has never heard of arrives and
+a field it expects is simply missing until the producer starts sending it. Given
+both schemas, Avro resolves them — a field the reader does not know is skipped,
+and one the writer never wrote is filled in from the reader's default — so the
+consumer always sees the shape it was compiled against, whichever version of the
+producer wrote the message:
+
+.. code-block:: python
+
+    codec = AvroCodec.reading(my_schema)     # consume only; nothing to register
+    await codec.learn_from(registry, 1)      # the version still in production
+    await codec.learn_from(registry, 2)      # and the one being rolled out
+
+A change Avro does not call compatible — a field whose type changed, a field
+added without a default — raises :class:`~acemq_amqp.ack.FatalError` naming both
+schemas, rather than a record of silent nonsense. This is Java's
+``registered(registry, readerSchema)`` and .NET's ``ReaderSchema``.
+
 The framing is **one zero byte, then four bytes of identifier, big-endian, then
 the Avro body** — the layout Confluent's clients use, and byte-for-byte the one
 the Java and Go libraries write, so messages written here can be read by any of
@@ -107,22 +128,79 @@ _MAGIC = 0
 _FRAME_BYTES = 5
 
 
+class _NeverRaisedError(Exception):
+    """Stands in for an exception type a future fastavro stopped exposing.
+
+    Catching it catches nothing, so a resolution failure falls through to the
+    general refusal below rather than the module failing to import.
+    """
+
+
+def _resolution_failure() -> type[BaseException]:
+    """The exception fastavro raises when two schemas cannot be resolved.
+
+    ``SchemaResolutionError`` lives in a private module and is re-exported from
+    ``fastavro.read``; it is the one thing this codec needs from fastavro beyond
+    reading and writing, and it is reached by name so that nothing new is
+    installed and an older or newer fastavro cannot stop the import.
+    """
+    try:
+        from fastavro import read as reading
+    except ImportError:  # pragma: no cover - fastavro without its own read module
+        return _NeverRaisedError
+    failure = getattr(reading, "SchemaResolutionError", None)
+    if isinstance(failure, type) and issubclass(failure, BaseException):
+        return failure
+    return _NeverRaisedError  # pragma: no cover - depends on the install
+
+
+def _parse(avro: Any, schema: str | dict[str, Any], text: str) -> Any:
+    """A schema fastavro can use, or a refusal saying it is not one."""
+    try:
+        return avro.parse_schema(json.loads(text) if isinstance(schema, str) else schema)
+    except Exception as failure:
+        raise AceMQError(f"acemq: this is not a usable Avro schema: {failure}") from failure
+
+
+def _name_of(schema: Any) -> str:
+    """What to call a schema in a failure message, which is its full name."""
+    if isinstance(schema, dict):
+        for key in ("name", "type"):
+            value = schema.get(key)
+            if isinstance(value, str):
+                return value
+    return str(schema)
+
+
 class AvroCodec:
     """Reads and writes Avro.
 
     :param schema: the schema, as JSON text or as the parsed dict a schema file
-        holds. This is the schema messages are written with, and — in registered
-        mode — the reader schema every message is resolved onto
+        holds. This is the schema messages are written with, and — unless
+        ``reader_schema`` says otherwise — the one every message is resolved onto
     :param schema_id: the registry identifier to frame into each message. Given
         this, the codec is in registered mode and writes
         ``application/vnd.acemq.avro``; without it the codec has a fixed schema
         and writes ``avro/binary``. Prefer :meth:`from_registry`, which fetches
         the identifier for you
-    :raises AceMQError: when fastavro is not installed, or the schema is not
+    :param reader_schema: the schema this consumer was written against. Every
+        message is resolved onto it, so a field the writer added is skipped and
+        one the writer never wrote is filled in from this schema's default. It
+        belongs with the registered mode, where the writer's schema varies from
+        message to message; in fixed mode both ends are pinned and giving one
+        only means reading a known writer onto a different reader. Prefer
+        :meth:`reading`, which is the consumer's whole story in one call
+    :raises AceMQError: when fastavro is not installed, or either schema is not
         usable Avro
     """
 
-    def __init__(self, schema: str | dict[str, Any], *, schema_id: int | None = None) -> None:
+    def __init__(
+        self,
+        schema: str | dict[str, Any],
+        *,
+        schema_id: int | None = None,
+        reader_schema: str | dict[str, Any] | None = None,
+    ) -> None:
         try:
             import fastavro
         except ImportError as missing:  # pragma: no cover - depends on the install
@@ -135,15 +213,24 @@ class AvroCodec:
             raise ValueError("acemq: a schema identifier is a positive integer")
 
         self._avro: Any = fastavro
+        self._clash = _resolution_failure()
         self._text = schema if isinstance(schema, str) else json.dumps(schema)
-        try:
-            self._schema: Any = fastavro.parse_schema(
-                json.loads(self._text) if isinstance(schema, str) else schema
+        self._schema: Any = _parse(fastavro, schema, self._text)
+
+        if reader_schema is None:
+            self._reader_text = self._text
+            self._reader: Any = self._schema
+        else:
+            self._reader_text = (
+                reader_schema if isinstance(reader_schema, str) else json.dumps(reader_schema)
             )
-        except Exception as failure:
-            raise AceMQError(f"acemq: this is not a usable Avro schema: {failure}") from failure
+            self._reader = _parse(fastavro, reader_schema, self._reader_text)
 
         self._schema_id = schema_id
+        # Registered mode is normally "there is an identifier to frame", but a
+        # codec built by reading() has no identifier and is in it all the same:
+        # it reads framed messages and writes none.
+        self._registered = schema_id is not None
         self._lock = threading.Lock()
         # Writer schemas by identifier, so a definition is parsed once rather
         # than on every message. An identifier stands for one schema forever.
@@ -152,23 +239,60 @@ class AvroCodec:
             self._known[schema_id] = self._schema
 
     @classmethod
+    def reading(cls, reader_schema: str | dict[str, Any]) -> AvroCodec:
+        """Returns a codec that only reads, resolving every message onto a schema.
+
+        This is the consumer's half of the registered mode, and the one place
+        schema evolution is actually paid for. The codec reads framed messages —
+        it claims ``application/vnd.acemq.avro`` like any registered codec — looks
+        the writer's schema up among the ones it has been taught, and hands Avro
+        both, so a field the producer added is skipped and a field the producer
+        has not started sending yet arrives as this schema's default.
+
+        Nothing is registered, because nothing is written: a consumer that never
+        publishes has no schema to put in a registry and no identifier to frame,
+        and :meth:`encode` says so rather than inventing one. Teach it the writer
+        versions it will meet with :meth:`learn_from` or :meth:`learn`.
+
+        Java spells this ``AvroCodec.registered(registry, readerSchema)`` and
+        .NET reads it off ``ReaderSchema``; both can look an identifier up from
+        inside ``encode`` and so keep one codec for both directions. The registry
+        here is async and a codec is not, which is why the two directions are two
+        objects.
+
+        :param reader_schema: the schema this consumer was written against
+        :returns: a read-only codec in registered mode
+        :raises AceMQError: when fastavro is not installed, or the schema is not
+            usable Avro
+        """
+        codec = cls(reader_schema)
+        codec._registered = True
+        return codec
+
+    @classmethod
     async def from_registry(
         cls,
         registry: SchemaRegistry,
         subject: str,
         schema: str | dict[str, Any],
+        *,
+        reader_schema: str | dict[str, Any] | None = None,
     ) -> AvroCodec:
         """Registers a schema and returns a codec that frames its identifier.
 
         :param registry: where schema identifiers are resolved
         :param subject: groups the versions of one message type, conventionally
             the message type itself — ``order.placed``
-        :param schema: the schema to write with, and to resolve messages onto
+        :param schema: the schema to write with, and — unless ``reader_schema``
+            says otherwise — to resolve messages onto
+        :param reader_schema: the schema to resolve every message onto, for a
+            service that publishes one version and consumes another. Only
+            ``schema`` is registered; this one is never written
         :returns: a codec in registered mode
         """
         codec = cls(schema)
         definition = await registry.register(subject, "avro", codec.schema_text)
-        return cls(schema, schema_id=definition.id)
+        return cls(schema, schema_id=definition.id, reader_schema=reader_schema)
 
     @property
     def content_type(self) -> str:
@@ -178,12 +302,21 @@ class AvroCodec:
     @property
     def is_registered(self) -> bool:
         """Whether messages carry a schema identifier on the front."""
-        return self._schema_id is not None
+        return self._registered
 
     @property
     def schema_text(self) -> str:
         """The schema as text, which is what a registry stores."""
         return self._text
+
+    @property
+    def reader_schema_text(self) -> str:
+        """The schema every message is resolved onto, as text.
+
+        The same as :attr:`schema_text` unless a reader schema was given, which
+        is the only case where the two differ.
+        """
+        return self._reader_text
 
     @property
     def schema_id(self) -> int | None:
@@ -219,6 +352,14 @@ class AvroCodec:
         self.learn(schema_id, definition.definition)
 
     def encode(self, payload: Any) -> bytes:
+        if self._registered and self._schema_id is None:
+            raise AceMQError(
+                "acemq: this codec was built with AvroCodec.reading(...) to consume, and has "
+                "no schema identifier to frame into a message. Publish with await "
+                "AvroCodec.from_registry(registry, subject, schema), which registers the "
+                "schema you write and gives back the identifier."
+            )
+
         if dataclasses.is_dataclass(payload) and not isinstance(payload, type):
             payload = dataclasses.asdict(payload)
 
@@ -237,21 +378,45 @@ class AvroCodec:
 
     def decode(self, body: bytes, content_type: str | None = None) -> Any:
         writer_schema = self._writer_schema_for(body, content_type)
-        offset = _FRAME_BYTES if self._schema_id is not None else 0
+        offset = _FRAME_BYTES if self._registered else 0
         try:
             # Writer schema and reader schema both given to Avro, which is the
             # whole point of the registered mode: it resolves the difference, so
             # a field the writer added and this reader does not know is skipped
-            # rather than shifting every field after it.
+            # rather than shifting every field after it, and a field this reader
+            # expects and the writer never sent arrives as the reader's default.
             return self._avro.schemaless_reader(
-                io.BytesIO(body[offset:]), writer_schema, self._schema
+                io.BytesIO(body[offset:]), writer_schema, self._reader
             )
         except FatalError:
             raise
+        except self._clash as clash:
+            raise FatalError(self._cannot_resolve(body, writer_schema, clash)) from clash
         except Exception as failure:
             raise FatalError(
                 f"acemq: this message is not Avro this codec reads: {failure}"
             ) from failure
+
+    def _cannot_resolve(self, body: bytes, writer_schema: Any, clash: BaseException) -> str:
+        """Why two schemas would not go together, naming both of them.
+
+        Avro's own message says what diverged — ``long is not string``, ``no
+        default value for field x`` — and says nothing about whose schemas they
+        were. On a queue carrying several producer versions at once that is the
+        first thing anybody needs, so the identifier the message arrived with and
+        the name of the schema this codec reads onto are put in front of it.
+        """
+        writer = _name_of(writer_schema)
+        if self._registered and len(body) >= _FRAME_BYTES:
+            writer = f"schema {int.from_bytes(body[1:_FRAME_BYTES], 'big')} ({writer})"
+        return (
+            f"acemq: this message was written with {writer} and this codec reads onto "
+            f"{_name_of(self._reader)}, and Avro will not resolve the one onto the other: "
+            f"{clash}. The two have diverged by something Avro does not call a compatible "
+            "change — a field whose type changed, or a field added without a default — so no "
+            "reader can make these bytes mean that record. Give the new field a default, or "
+            "read this version with a codec built against a schema that resolves against it."
+        )
 
     def can_decode(self, content_type: str | None) -> bool:
         """Accepts the Avro content types, and never an absent one.
@@ -279,7 +444,7 @@ class AvroCodec:
 
     def _writer_schema_for(self, body: bytes, content_type: str | None) -> Any:
         """The schema a message was written with, or a refusal saying why not."""
-        if self._schema_id is not None:
+        if self._registered:
             if len(body) < _FRAME_BYTES or body[0] != _MAGIC:
                 raise FatalError(
                     "acemq: this message has no schema identifier on the front of it. This "
@@ -330,5 +495,12 @@ class AvroCodec:
         return self._schema
 
     def __repr__(self) -> str:
-        where = f"schema_id={self._schema_id}" if self.is_registered else "fixed"
+        if not self._registered:
+            where = "fixed"
+        elif self._schema_id is None:
+            where = "reading"
+        else:
+            where = f"schema_id={self._schema_id}"
+        if self._reader_text != self._text:
+            where += f", reader={_name_of(self._reader)}"
         return f"AvroCodec({where})"

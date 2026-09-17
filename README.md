@@ -473,6 +473,26 @@ message that was perfectly readable. That is the gap these close: not
 capability, interoperability. See [Codecs](docs/serialization.md), and note what
 the XML codec does about document type declarations.
 
+Avro is the one that needs a word here, because its bytes describe nothing about
+themselves and a reader has to hold the schema the writer used:
+
+```python
+# the producer: registers its schema and frames the identifier into every message
+codec = await AvroCodec.from_registry(registry, "order.placed", schema)
+
+# the consumer: says which schema it was written against, and every message is
+# resolved onto it — whichever version of the producer wrote it
+codec = AvroCodec.reading(my_schema)
+await codec.learn_from(registry, 7)
+```
+
+That second line is what lets a producer add a field without a synchronised
+deployment: Avro is given both schemas, so a field this consumer has never heard
+of is skipped and a field it expects but the producer has not started sending
+arrives as its own default. A change Avro will not resolve — a field whose type
+changed, or one added without a default — is a `FatalError` naming both schemas
+rather than a record of silent nonsense.
+
 ### Encrypted bodies
 
 `EncryptedCodec` wraps any of the above and encrypts what it produced, so the

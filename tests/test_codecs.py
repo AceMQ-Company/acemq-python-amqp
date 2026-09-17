@@ -68,6 +68,38 @@ AVRO_SCHEMA_V2 = json.dumps(
     }
 )
 
+# The same field added and *not* given a default, which is the change Avro
+# refuses: there is nothing to put in the field when an older producer's message
+# arrives without it.
+AVRO_SCHEMA_V2_NO_DEFAULT = json.dumps(
+    {
+        "type": "record",
+        "name": "OrderPlaced",
+        "namespace": "org.acemq.test",
+        "fields": [
+            {"name": "orderId", "type": "string"},
+            {"name": "totalCents", "type": "long"},
+            {"name": "tenant", "type": "string"},
+            {"name": "channel", "type": "string"},
+        ],
+    }
+)
+
+# A field whose type changed under it, which no reader can resolve in either
+# direction — the bytes on the wire are not the bytes this schema describes.
+AVRO_SCHEMA_RETYPED = json.dumps(
+    {
+        "type": "record",
+        "name": "OrderPlaced",
+        "namespace": "org.acemq.test",
+        "fields": [
+            {"name": "orderId", "type": "string"},
+            {"name": "totalCents", "type": "string"},
+            {"name": "tenant", "type": "string"},
+        ],
+    }
+)
+
 ORDER = {"orderId": "o-1", "totalCents": 4250, "tenant": "acme"}
 
 
@@ -427,6 +459,167 @@ def test_a_registered_codec_resolves_a_writer_schema_against_its_own() -> None:
 
     decoded = consumer.decode(producer.encode(ORDER), "application/vnd.acemq.avro")
     assert decoded == {**ORDER, "channel": "web"}
+
+
+# --------------------------------------------------------------------------
+# Reader schemas, which is schema evolution from the consumer's side
+# --------------------------------------------------------------------------
+
+
+def test_a_reading_codec_is_registered_and_writes_nothing() -> None:
+    codec = AvroCodec.reading(AVRO_SCHEMA_V2)
+    assert codec.is_registered is True
+    assert codec.schema_id is None
+    assert codec.content_type == "application/vnd.acemq.avro"
+    # It claims the registered framing and refuses the fixed one, exactly as a
+    # codec built with an identifier does: it is the same mode, read-only.
+    assert codec.can_decode("application/vnd.acemq.avro") is True
+    assert codec.can_decode("avro/binary") is False
+    assert codec.can_decode(None) is False
+
+
+def test_a_reading_codec_says_it_has_no_identifier_to_publish_with() -> None:
+    codec = AvroCodec.reading(AVRO_SCHEMA_V2)
+    with pytest.raises(AceMQError, match="no schema identifier to frame"):
+        codec.encode(ORDER)
+
+
+def test_a_field_the_producer_has_not_started_sending_arrives_as_its_default() -> None:
+    """The change a registry exists to survive, from the consumer's side.
+
+    The producer is still on the old schema and writes three fields. The
+    consumer has been released with a fourth, and reads four — the new one
+    filled in from its own default rather than the message being refused.
+    """
+    producer = AvroCodec(AVRO_SCHEMA, schema_id=1)
+    consumer = AvroCodec.reading(AVRO_SCHEMA_V2)
+    consumer.learn(1, AVRO_SCHEMA)
+
+    assert consumer.decode(producer.encode(ORDER), "application/vnd.acemq.avro") == {
+        **ORDER,
+        "channel": "web",
+    }
+
+
+def test_a_field_the_reader_has_never_heard_of_is_skipped_rather_than_shifting() -> None:
+    """The same change from the other side: the producer went first.
+
+    A field the reader does not know is read past and discarded. Without the
+    writer's schema those bytes would be read as the beginning of whatever field
+    came next and every value after them would be wrong.
+    """
+    producer = AvroCodec(AVRO_SCHEMA_V2, schema_id=2)
+    consumer = AvroCodec.reading(AVRO_SCHEMA)
+    consumer.learn(2, AVRO_SCHEMA_V2)
+
+    body = producer.encode({**ORDER, "channel": "mobile"})
+    assert consumer.decode(body, "application/vnd.acemq.avro") == ORDER
+
+
+def test_a_change_avro_will_not_resolve_names_both_schemas() -> None:
+    producer = AvroCodec(AVRO_SCHEMA, schema_id=1)
+    consumer = AvroCodec.reading(AVRO_SCHEMA_RETYPED)
+    consumer.learn(1, AVRO_SCHEMA)
+
+    with pytest.raises(FatalError) as refused:
+        consumer.decode(producer.encode(ORDER), "application/vnd.acemq.avro")
+
+    said = str(refused.value)
+    # The identifier the message arrived with, the schema it is read onto, and
+    # Avro's own account of what diverged. On a queue carrying three producer
+    # versions at once, the identifier is the first thing anybody needs.
+    assert "schema 1 (org.acemq.test.OrderPlaced)" in said
+    assert "reads onto org.acemq.test.OrderPlaced" in said
+    assert "long is not string" in said
+
+
+def test_a_field_added_without_a_default_cannot_be_resolved_either() -> None:
+    # Adding a field is only safe when it has a default. Without one there is
+    # nothing to put in it when an older producer's message arrives, and Avro
+    # says so rather than inventing a zero or an empty string.
+    producer = AvroCodec(AVRO_SCHEMA, schema_id=1)
+    consumer = AvroCodec.reading(AVRO_SCHEMA_V2_NO_DEFAULT)
+    consumer.learn(1, AVRO_SCHEMA)
+
+    with pytest.raises(FatalError, match="will not resolve the one onto the other"):
+        consumer.decode(producer.encode(ORDER), "application/vnd.acemq.avro")
+
+
+def test_a_reading_codec_still_names_an_identifier_it_was_never_taught() -> None:
+    codec = AvroCodec.reading(AVRO_SCHEMA_V2)
+    framed = AvroCodec(AVRO_SCHEMA, schema_id=4).encode(ORDER)
+    with pytest.raises(FatalError, match="written with schema 4"):
+        codec.decode(framed, "application/vnd.acemq.avro")
+
+
+def test_a_reading_codec_refuses_a_message_with_no_identifier_on_it() -> None:
+    codec = AvroCodec.reading(AVRO_SCHEMA_V2)
+    with pytest.raises(FatalError, match="no schema identifier"):
+        codec.decode(AvroCodec(AVRO_SCHEMA).encode(ORDER), "application/vnd.acemq.avro")
+
+
+def test_a_reader_schema_changes_nothing_about_the_bytes() -> None:
+    """A service that publishes one version and consumes another.
+
+    The reader schema is a decoding instruction and nothing else: what goes on
+    the wire is still written with the schema the identifier stands for, byte
+    for byte, so the other four libraries read it unchanged.
+    """
+    plain = AvroCodec(AVRO_SCHEMA, schema_id=1)
+    resolving = AvroCodec(AVRO_SCHEMA, schema_id=1, reader_schema=AVRO_SCHEMA_V2)
+
+    assert resolving.encode(ORDER) == plain.encode(ORDER)
+    assert resolving.content_type == plain.content_type
+    assert resolving.schema_text == plain.schema_text
+    assert resolving.reader_schema_text == AVRO_SCHEMA_V2
+    assert resolving.decode(plain.encode(ORDER), "application/vnd.acemq.avro") == {
+        **ORDER,
+        "channel": "web",
+    }
+
+
+def test_without_a_reader_schema_the_codec_reads_onto_the_one_it_writes() -> None:
+    # The paths that existed before reader schemas did, unchanged: a fixed codec
+    # and a registered one both resolve onto their own schema, and both report
+    # that schema as the one they read with.
+    fixed = AvroCodec(AVRO_SCHEMA)
+    registered = AvroCodec(AVRO_SCHEMA, schema_id=1)
+
+    assert fixed.reader_schema_text == fixed.schema_text == AVRO_SCHEMA
+    assert registered.reader_schema_text == registered.schema_text == AVRO_SCHEMA
+    assert fixed.decode(fixed.encode(ORDER), "avro/binary") == ORDER
+    assert registered.decode(registered.encode(ORDER), "application/vnd.acemq.avro") == ORDER
+
+
+def test_a_reader_schema_that_is_not_avro_is_refused_at_construction() -> None:
+    with pytest.raises(AceMQError, match="not a usable Avro schema"):
+        AvroCodec(AVRO_SCHEMA, schema_id=1, reader_schema='{"type": "nonsense"}')
+    with pytest.raises(AceMQError, match="not a usable Avro schema"):
+        AvroCodec.reading('{"type": "nonsense"}')
+
+
+async def test_a_reader_schema_can_come_from_the_registry_path_too() -> None:
+    registry = InMemorySchemaRegistry()
+    producer = await AvroCodec.from_registry(registry, "order.placed", AVRO_SCHEMA)
+    body = producer.encode(ORDER)
+    identifier = int.from_bytes(body[1:5], "big")
+
+    # A consumer that never publishes registers nothing at all: it holds the
+    # schema it was written against and looks the writer's up once, outside the
+    # message path, because the registry here is async and a codec is not.
+    consumer = AvroCodec.reading(AVRO_SCHEMA_V2)
+    await consumer.learn_from(registry, identifier)
+    assert consumer.decode(body, "application/vnd.acemq.avro") == {**ORDER, "channel": "web"}
+
+    # And a service that does both keeps one codec, publishing the version it
+    # registered and reading every version onto its own.
+    both = await AvroCodec.from_registry(
+        registry, "order.placed", AVRO_SCHEMA, reader_schema=AVRO_SCHEMA_V2
+    )
+    assert both.schema_id == identifier
+    assert both.schema_text == AVRO_SCHEMA
+    assert both.encode(ORDER) == body
+    assert both.decode(body, "application/vnd.acemq.avro") == {**ORDER, "channel": "web"}
 
 
 async def test_a_codec_can_be_built_from_the_registry_this_library_ships() -> None:
