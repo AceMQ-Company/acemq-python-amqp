@@ -147,9 +147,13 @@ footer { max-width:47rem; margin:0 auto; padding:1.5rem 1.25rem 4rem;
 }
 CSS
 
-# Six top-level entries with the rest grouped underneath, rather than fourteen in
-# a row. Fourteen was legible at 1600px and wrapped into three lines on a laptop,
-# and a navigation nobody can scan is one nobody uses.
+# A handful of top-level entries with the rest grouped underneath, rather than
+# one row of everything. Fourteen in a row was legible at 1600px and wrapped into
+# three lines on a laptop, and a navigation nobody can scan is one nobody uses.
+#
+# Tutorials is the accented one, as it is in Java and .NET: it is the entry
+# somebody arriving with no AceMQ at all should land on, and Getting started is
+# the same page for somebody who has already decided.
 #
 # The groups open on hover and on focus, so the keyboard reaches them too, and
 # every link is a plain anchor -- the menu needs no JavaScript and still works
@@ -157,7 +161,8 @@ CSS
 NAV='<nav class="top">
   <span class="brand"><img src="assets/acemq.png" alt="AceMQ"> for Python</span>
   <a href="index.html">Overview</a>
-  <a class="tutorials" href="getting-started.html">Getting started</a>
+  <a href="getting-started.html">Getting started</a>
+  <a class="tutorials" href="tutorials.html">Tutorials</a>
 
   <div class="group">
     <button type="button" aria-haspopup="true">Guide</button>
@@ -169,6 +174,8 @@ NAV='<nav class="top">
       <a href="interceptors.html">Interceptors</a>
       <a href="testing.html">Testing without a broker</a>
       <a href="patterns.html">Patterns</a>
+      <a href="request-reply.html">Request and reply</a>
+      <a href="streams.html">Streams</a>
     </div>
   </div>
 
