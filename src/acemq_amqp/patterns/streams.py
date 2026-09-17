@@ -24,16 +24,21 @@ before using one. Acknowledging does not remove the message; it advances *this*
 consumer's position, and the message stays on the stream for somebody else to
 read tomorrow.
 
-What a failure means changes with it. :func:`read_stream` returns an ordinary
-:class:`~acemq_amqp.Consumer`, so it does what one always does: it republishes a
-copy and acknowledges the original. Nothing is removed from the stream, because
-nothing can be — but a rejected message does put a copy in ``{stream}.dlq``, an
-unreadable one a copy in ``{stream}.parked``, and a retry **appends the message
-to the stream again**, where every other consumer will read it as well. That
-last one is why :func:`read_stream` takes no retry policy; the connection's
-default still reaches the consumer, so a stream handler's failures are the
-handler's to deal with — logged, copied elsewhere, counted — and the stream
-moves on regardless.
+What a failure means changes with it. A copy of a refused message can still be
+put somewhere a person will look — :func:`~acemq_amqp.reject` puts one in
+``{stream}.dlq`` and :func:`~acemq_amqp.park` one in ``{stream}.parked``, both
+ordinary queues beside the stream — because neither of those touches the log.
+
+**A retry cannot be.** Retrying means republishing, and republishing onto a
+stream *appends*: a second copy of the message that every other consumer of that
+log reads as a new one, for as long as the retention policy keeps it. So a
+handler reading a stream is not allowed to ask for one. :func:`read_stream`
+refuses :func:`~acemq_amqp.retry` with a :class:`StreamRetryError` naming the two
+honest alternatives — park the message, or accept it and checkpoint past the
+failure — and it runs its consumer on :func:`~acemq_amqp.no_retry` whatever the
+connection's own policy says, so an exception escaping a handler cannot append a
+copy either. Nothing this library does adds to a stream that a handler did not
+publish itself.
 
 :meth:`Connection.message_count <acemq_amqp.Connection.message_count>` says
 nothing useful about a stream either: the broker reports zero, because a message
@@ -44,14 +49,21 @@ header each delivery carries.
 
 from __future__ import annotations
 
+import inspect
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
+from ..ack import Ack, Action, FatalError
 from ..codec import Codec
-from ..connection import Connection, Consumer, Handler
+from ..connection import AsyncHandler, Connection, Consumer, Handler, Message
+from ..errors import AceMQError
+from ..retry import no_retry
 from ..topology import QUEUE_TYPE_ARG as _QUEUE_TYPE_ARG
 from ..topology import Topology
+
+log = logging.getLogger("acemq")
 
 #: Marks a queue as a stream at declaration. It cannot be changed afterwards.
 #: It is the same argument that makes an ordinary queue quorum rather than
@@ -71,6 +83,75 @@ SEGMENT_BYTES_ARG = "x-stream-max-segment-size-bytes"
 #: gives back does not mention streams. Ten is enough to keep one busy and small
 #: enough that a slow handler is not holding a batch nobody else can have.
 DEFAULT_STREAM_PREFETCH = 10
+
+
+class StreamRetryError(AceMQError, FatalError):
+    """A stream handler asked for a retry, which a stream cannot give it.
+
+    Retrying means republishing, and republishing onto a stream appends: a
+    second copy of the message on the log, which every other consumer of that
+    stream reads as a new one and which stays there for the retention. A handler
+    that failed three times would leave three copies behind, and the copies
+    outlive the outage that caused them.
+
+    There is no third outcome that quietly works, so this names the two that do.
+    **Park it** — :func:`~acemq_amqp.park` puts a copy in ``{stream}.parked``,
+    which is a queue beside the stream rather than part of it, and leaves the log
+    untouched. **Or checkpoint and move on** — :func:`~acemq_amqp.accept`
+    advances this consumer's position past the message and the failure becomes
+    the handler's to record, which is the outcome most projections want: the
+    message is still on the log and can be read again from an earlier offset
+    once whatever broke is fixed.
+
+    Both an :class:`~acemq_amqp.AceMQError` and a
+    :class:`~acemq_amqp.FatalError`, because it is both: something this library
+    refused to do, and a request no number of further attempts would make
+    reasonable. The second is what makes the delivery end up in ``{stream}.dlq``
+    with this sentence on it rather than going round a retry ladder that would
+    do the very thing being refused.
+    """
+
+
+def _refusing_retries(stream: str, handler: Handler) -> AsyncHandler:
+    """A handler that cannot ask for a retry, whatever the one inside it says.
+
+    The constraint sits here, on the handler, rather than on a stream-specific
+    consumer class, and that is a deliberate choice worth stating. Java needs a
+    separate ``StreamConsumer`` because its ``MessageConsumer`` exposes the retry
+    ladder as configuration — a type that offered a dead-letter policy for a
+    stream would be a type where half the settings are wrong. Python's
+    :class:`~acemq_amqp.Consumer` exposes no such thing: it is ``queue``,
+    ``running``, ``in_flight`` and ``close``, every one of which means exactly
+    what it says on a stream. The three-outcome settle path comes from the
+    :class:`~acemq_amqp.Ack` a handler returns, so the refusal belongs where the
+    ``Ack`` is read, and a second consumer class would be a copy of the first
+    with nothing removed from it.
+    """
+
+    async def read(message: Message) -> Ack:
+        returned = handler(message)
+        decision: Ack = await returned if inspect.isawaitable(returned) else returned
+        if isinstance(decision, Ack) and decision.action is Action.RETRY:
+            # Logged here as well as carried on the dead letter, because the two
+            # reach different people. Whoever drains ``{stream}.dlq`` finds the
+            # reason on the message; whoever wrote the handler is reading logs.
+            log.error(
+                "acemq: the handler for stream %s asked to retry %s, which a stream "
+                "cannot do. Return park(...) or accept() instead.",
+                stream,
+                message.envelope.id,
+            )
+            raise StreamRetryError(
+                f"acemq: a handler reading the stream {stream!r} asked to retry "
+                f"message {message.envelope.id}. A stream never removes a message, "
+                "so retrying one means appending a second copy of it to the log for "
+                "every other consumer to read as well. Park it instead — park(...) "
+                f"puts a copy in {stream}.parked and leaves the log alone — or "
+                "accept() to checkpoint past it and record the failure yourself."
+            )
+        return decision
+
+    return read
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,19 +291,34 @@ async def read_stream(
 
         consumer = await read_stream(mq, "events", project, offset=from_first())
 
-    The retry policy is deliberately not a parameter. Retrying on a stream means
-    republishing to it, which appends a second copy of the message for every
-    other consumer to read as well — so a stream's failures belong to its
-    handler, and advertising a knob whose effect is to grow the log would put
-    the surprise somewhere it cannot be seen. Note what that does *not* mean:
-    the connection's own policy still applies, because this is an ordinary
-    consumer, so a stream read from a connection with a retry policy on it will
-    append retries. The default, :func:`~acemq_amqp.no_retry`, is the right one
-    here.
+    **Nothing this consumer does appends to the stream.** There is no retry
+    policy to pass and there is no policy it can inherit: it runs on
+    :func:`~acemq_amqp.no_retry` whatever the connection's own default is, and a
+    handler that returns :func:`~acemq_amqp.retry` is refused with a
+    :class:`StreamRetryError`. Both close the same hole from the two directions
+    a retry could arrive from — a handler asking for one, and an exception
+    escaping a handler onto a connection that has a retry policy — because
+    retrying on a stream means republishing to it, which appends a second copy
+    for every other consumer of that log to read as well.
+
+    What a failing handler has instead is two outcomes, and they are enough.
+    :func:`~acemq_amqp.park` puts a copy in ``{name}.parked``, a queue beside the
+    stream rather than part of it, and the log is untouched.
+    :func:`~acemq_amqp.accept` checkpoints past the message and leaves the
+    failure for the handler to record — which is what most projections want,
+    because the message is still on the log and can be read again from an earlier
+    offset once whatever broke is fixed. :func:`~acemq_amqp.reject` is the third
+    and it works too, putting a copy in ``{name}.dlq``; it is not offered as one
+    of the two because "this message is bad" is rarely what a stream failure is.
+
+    An ordinary :class:`~acemq_amqp.Consumer` comes back rather than a
+    stream-specific class. See :func:`_refusing_retries` for why: every method on
+    it means what it says on a stream, so there is nothing a second type would
+    take away.
 
     :param connection: where the stream is
     :param name: which stream
-    :param handler: what to do with each message
+    :param handler: what to do with each message. It may not ask for a retry
     :param offset: where to start, the next message by default
     :param prefetch: how many messages to hold. It cannot be zero: RabbitMQ
         refuses a stream consumer without one
@@ -231,9 +327,9 @@ async def read_stream(
     :param codec: a codec other than the connection's
     :param concurrency: how many messages to work on at once. One by default,
         because a stream's order is usually why it is a stream
-    :param declare: declare ``{name}.dlq``, ``{name}.parked`` and the rungs the
-        connection's retry policy asks for, before subscribing. On by default;
-        see :meth:`acemq_amqp.Connection.consume`
+    :param declare: declare ``{name}.dlq`` and ``{name}.parked`` before
+        subscribing. On by default; see :meth:`acemq_amqp.Connection.consume`.
+        No retry rungs are declared, because nothing here retries
     :returns: the running consumer
     """
     if prefetch < 1:
@@ -243,8 +339,14 @@ async def read_stream(
 
     return await connection.consume(
         name,
-        handler,
+        _refusing_retries(name, handler),
         codec=codec,
+        # Said rather than inherited. A connection carrying a retry policy for
+        # its queues would otherwise turn every exception out of a stream handler
+        # into a copy on the log, which is the one thing a stream consumer must
+        # never do — and it would do it silently, because from outside a stream
+        # that is growing looks like a stream that is busy.
+        retry=no_retry(),
         prefetch=prefetch,
         concurrency=concurrency,
         tag=consumer_name,

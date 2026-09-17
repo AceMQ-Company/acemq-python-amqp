@@ -747,16 +747,16 @@ understand before using one. Acknowledging does not remove the message; it
 advances *this* consumer's position, and the message stays on the stream for
 another consumer to read tomorrow.
 
-What a *failure* means changes with it, and not in the direction another
-library's documentation suggests. `read_stream` returns an ordinary `Consumer`,
-so it does what one always does: it republishes a copy and acknowledges the
-original. `reject()` therefore puts a copy in `{stream}.dlq` and leaves the
-original on the stream, and `retry()` **publishes the message back onto the
-stream**, appending a copy for every other consumer to read as well. The retry
-policy is not a parameter on `read_stream` for exactly that reason — but the
-connection's default policy still reaches the consumer, so a stream handler's
-failures are the handler's to deal with. See [streams](streams.md#what-an-acknowledgement-means-here)
-for the whole table.
+What a *failure* means changes with it. `read_stream` returns an ordinary
+`Consumer`, so a refused message is republished as a copy and the original
+acknowledged: `park()` puts a copy in `{stream}.parked` and `reject()` one in
+`{stream}.dlq`, both leaving the log untouched because both are ordinary queues
+beside it. **`retry()` is refused**, with a `StreamRetryError` naming those
+alternatives, because retrying on a stream means republishing *to* it —
+appending a copy for every other consumer to read as well. A stream consumer
+also runs on `no_retry()` whatever the connection's policy is, so an exception
+escaping a handler cannot append one either. See
+[streams](streams.md#what-an-acknowledgement-means-here) for the whole table.
 
 Where to start:
 

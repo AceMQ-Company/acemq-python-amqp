@@ -21,10 +21,23 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fake_transport import FakeTransport
 
-from acemq_amqp import Ack, Connection, Message, accept
+from acemq_amqp import (
+    AceMQError,
+    Ack,
+    Connection,
+    FatalError,
+    Message,
+    accept,
+    fixed_retry,
+    headers,
+    park,
+    reject,
+    retry,
+)
 from acemq_amqp.patterns import (
     DEFAULT_STREAM_PREFETCH,
     StreamRetention,
+    StreamRetryError,
     declare_stream,
     from_first,
     from_last,
@@ -150,3 +163,111 @@ async def test_a_stream_consumer_cannot_have_no_prefetch() -> None:
     mq = Connection(FakeTransport())
     with pytest.raises(ValueError, match="prefetch of at least 1"):
         await read_stream(mq, NAME, handler, prefetch=0)
+
+
+async def test_a_handler_asking_to_retry_is_refused_and_nothing_is_appended() -> None:
+    # The whole point. A retry on a stream is a republish, and a republish onto
+    # a stream appends: a second copy of the message that every other consumer
+    # of that log reads as a new one.
+    transport = FakeTransport()
+    mq = Connection(transport, retry=fixed_retry(3, timedelta(0)))
+    await declare_stream(mq, NAME)
+
+    async def gives_up(message: Message) -> Ack:
+        return retry(RuntimeError("the pricing service is down"))
+
+    consumer = await read_stream(mq, NAME, gives_up)
+    settlement = await transport.deliver(NAME, b'{"id": "7"}')
+    await consumer.close()
+
+    # Nothing was published back onto the stream, which is the assertion this
+    # test exists for: before the refusal there were three copies here.
+    assert transport.sent_to(NAME) == []
+
+    # The copy went to the dead letters instead, carrying the sentence that says
+    # what to do about it.
+    dead = transport.sent_to(f"{NAME}.dlq")
+    assert len(dead) == 1
+    reason = str(dead[0].headers[headers.ERROR])
+    assert "asked to retry" in reason
+    assert f"puts a copy in {NAME}.parked" in reason
+    assert "accept() to checkpoint past it" in reason
+    assert settlement.acked
+
+
+async def test_a_handler_that_raises_is_not_retried_onto_the_stream_either() -> None:
+    # The second way a retry could arrive. A connection with a retry policy on
+    # it used to turn every exception out of a stream handler into a copy on the
+    # log, silently: from outside, a stream that is growing looks like one that
+    # is busy.
+    transport = FakeTransport()
+    mq = Connection(transport, retry=fixed_retry(3, timedelta(0)))
+    await declare_stream(mq, NAME)
+
+    async def raises(message: Message) -> Ack:
+        raise RuntimeError("the pricing service is down")
+
+    consumer = await read_stream(mq, NAME, raises)
+    await transport.deliver(NAME, b'{"id": "7"}')
+    await consumer.close()
+
+    assert transport.sent_to(NAME) == []
+    assert len(transport.sent_to(f"{NAME}.dlq")) == 1
+
+
+async def test_a_stream_consumer_declares_no_retry_rungs() -> None:
+    # It runs on no_retry(), so there are no rungs to declare. A rung queue for
+    # a consumer that will never use one is a durable queue nothing ever reads.
+    transport = FakeTransport()
+    mq = Connection(transport, retry=fixed_retry(3, timedelta(minutes=5)))
+    await declare_stream(mq, NAME)
+
+    consumer = await read_stream(mq, NAME, handler)
+    await consumer.close()
+
+    assert f"{NAME}.dlq" in transport.queues
+    assert f"{NAME}.parked" in transport.queues
+    assert [name for name in transport.queues if ".retry." in name] == []
+
+
+async def test_parking_and_rejecting_still_work_and_leave_the_log_alone() -> None:
+    # The two outcomes a failing stream handler does have, and the third that is
+    # not offered but works. None of them touches the stream.
+    transport = FakeTransport()
+    mq = Connection(transport)
+    await declare_stream(mq, NAME)
+
+    decisions = iter([park(ValueError("version 9")), reject(ValueError("no such sku"))])
+
+    async def gives_up(message: Message) -> Ack:
+        return next(decisions)
+
+    consumer = await read_stream(mq, NAME, gives_up)
+    await transport.deliver(NAME, b'{"id": "7"}')
+    await transport.deliver(NAME, b'{"id": "8"}')
+    await consumer.close()
+
+    assert transport.sent_to(NAME) == []
+    assert len(transport.sent_to(f"{NAME}.parked")) == 1
+    assert len(transport.sent_to(f"{NAME}.dlq")) == 1
+
+
+async def test_a_refused_retry_is_a_fatal_error_and_an_acemq_error() -> None:
+    # Both, and both are load-bearing. AceMQError is how a caller catches what
+    # this library refused; FatalError is what stops the delivery going round a
+    # retry ladder that would do the very thing being refused.
+    assert issubclass(StreamRetryError, AceMQError)
+    assert issubclass(StreamRetryError, FatalError)
+
+
+async def test_accepting_advances_the_position_and_publishes_nothing() -> None:
+    transport = FakeTransport()
+    mq = Connection(transport)
+    await declare_stream(mq, NAME)
+
+    consumer = await read_stream(mq, NAME, handler)
+    settlement = await transport.deliver(NAME, b'{"id": "7"}')
+    await consumer.close()
+
+    assert settlement.acked
+    assert transport.sent == []

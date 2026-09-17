@@ -1434,6 +1434,70 @@ async def test_a_stream_hands_the_same_history_to_every_reader(
     assert await mq.message_count(name) == 0
 
 
+async def test_a_failing_stream_handler_appends_nothing_to_the_log(
+    mq: Connection, workspace: Workspace
+) -> None:
+    """The reproduction that made the refusal necessary, run the other way round.
+
+    One message, a connection carrying a retry policy, and a handler that always
+    fails. This used to leave attempts 1, 2 and 3 on the log for ever — and a
+    projection rebuilt from ``from_first()`` months later replayed all three.
+    Nothing this library does appends to a stream now, and reading the whole
+    stream back from the beginning is the only way to prove it.
+    """
+    name = workspace.name("events")
+    await declare_stream(mq, name, StreamRetention(max_age=timedelta(hours=1)))
+    workspace.register(name)
+    dlq = f"{name}.dlq"
+    workspace.register(dlq)
+
+    await mq.publisher(routing_key=name, mandatory=True).send({"n": 0})
+
+    # A policy generous enough to have appended three copies before.
+    retrying = Connection(
+        mq.transport, retry=fixed_retry(3, timedelta(milliseconds=200))
+    )
+    failed = asyncio.Event()
+
+    async def always_fails(message: Message) -> Ack:
+        failed.set()
+        return retry(RuntimeError("the pricing service is down"))
+
+    consumer = await read_stream(retrying, name, always_fails, offset=from_first())
+    try:
+        await asyncio.wait_for(failed.wait(), 20.0)
+        await until(lambda: _count(mq, dlq, 1), f"the copy reached {dlq}")
+    finally:
+        await consumer.close()
+
+    # The log still holds exactly the one message that was published to it.
+    seen: list[int] = []
+    everything = asyncio.Event()
+
+    async def count_them(message: Message) -> Ack:
+        seen.append(message.payload["n"])
+        everything.set()
+        return accept()
+
+    reader = await read_stream(mq, name, count_them, offset=from_first())
+    try:
+        await asyncio.wait_for(everything.wait(), 20.0)
+        # Long enough for a second or third copy to have been handed over if
+        # there were one. The assertion is about absence, so the wait is the test.
+        await asyncio.sleep(1.0)
+    finally:
+        await reader.close()
+    assert seen == [0]
+
+    # And the sentence naming the alternatives travelled with the dead letter.
+    dead = await mq.pull(dlq)
+    assert dead is not None
+    await dead.ack()
+    reason = str(Envelope.from_headers(dead.headers, dlq).error)
+    assert "asked to retry" in reason
+    assert f"puts a copy in {name}.parked" in reason
+
+
 @pytest.fixture
 def blocking() -> Iterator[sync.SyncConnection]:
     connection = sync.connect(BROKER)

@@ -141,7 +141,13 @@ consumer = await read_stream(
 
 An ordinary [`Consumer`](consuming.md) comes back — the same object
 `mq.consume` returns, closed the same way, usable as an `async with`. The
-handler takes a `Message` and returns an `Ack`, exactly as anywhere else.
+handler takes a `Message` and returns an `Ack`, exactly as anywhere else, with
+one thing it may not say: see
+[what an acknowledgement means here](#what-an-acknowledgement-means-here).
+
+There is no `retry` parameter and no policy to inherit. A stream consumer runs on
+`no_retry()` whatever the connection's default is, because retrying on a stream
+appends to it.
 
 `prefetch` **cannot be zero**: RabbitMQ refuses a stream consumer without one,
 because it is the only backpressure a stream has, and the message it gives back
@@ -163,40 +169,66 @@ This is the part to understand before using one.
 position. The message stays on the stream for its retention, and another
 consumer reading from `from_first()` tomorrow sees everything you consumed.
 
-Everything else follows from that, and not always in the direction another
-library's documentation would suggest. Java's streams page says a stream has no
-dead-letter queue and that a failed message stays where it is. **In this library
-that is only half true**, because a stream consumer is the same `Consumer` the
-rest of the library uses and it does what it always does: it **republishes a
-copy** and then acknowledges the original.
+Everything else follows from that. A copy of a refused message can still be put
+somewhere a person will look, because the queues beside a stream are ordinary
+queues and nothing that happens in them touches the log. **A retry cannot be**,
+and `read_stream` refuses one:
 
 | the handler returns | what happens |
 |---|---|
 | `accept()` | acknowledged. The position advances; the message is still on the stream |
-| `reject(e)` | a copy is published to `{stream}.dlq`, then the delivery is acknowledged. The original is still on the stream |
-| `park(e)`, or a body the codec refuses | a copy goes to `{stream}.parked`, same shape |
-| `retry(e)` with attempts left | the message is **published back onto the stream**, appending a second copy, and the delivery is acknowledged |
-| `retry(e)` with no attempts left | a copy goes to `{stream}.dlq` |
+| `park(e)`, or a body the codec refuses | a copy is published to `{stream}.parked`, then the delivery is acknowledged. The original is still on the stream |
+| `reject(e)` | a copy goes to `{stream}.dlq`, same shape |
+| `retry(e)` | **refused.** `StreamRetryError` naming the two alternatives, and a copy of the message goes to `{stream}.dlq` carrying that sentence. **Nothing is appended to the stream** |
+| the handler raises | the same: nothing is retried, and a copy goes to `{stream}.dlq` |
 
-The fourth row is the one that bites. A retry on a queue puts a message back on
-that queue; a retry on a stream **appends** to it, so every other consumer of
-that stream reads the retry as a new message, and a handler that fails three
-times leaves three copies on the log for ever. With
+The fourth row used to be the one that bit. A retry on a queue puts a message
+back on that queue; a retry on a stream **appends** to it, so every other
+consumer of that stream read the retry as a new message and a handler that
+failed three times left three copies on the log for ever. With
 `fixed_retry(3, timedelta(milliseconds=200))` on the connection, one published
-message and a handler that always raises produces exactly that: attempts 1, 2
+message and a handler that always raised produced exactly that: attempts 1, 2
 and 3 all sitting on the stream, and one copy in `{stream}.dlq`.
 
-This is why `read_stream` has **no `retry` parameter**. It is not an oversight
-and it is not a way of saying nothing retries — the connection's default policy
-still reaches the consumer, because it is an ordinary consumer. It is that
-naming the policy on `read_stream` would advertise a knob whose effect is to
-corrupt the log, and hiding the surprise behind a parameter is worse than
-leaving it where it can be read.
+Both doors are now shut. A handler returning `retry(...)` gets:
 
-**So a failing handler's failure belongs to the handler.** Log it, copy it
-somewhere, count it, and let the stream move on. The default connection policy
-is [`no_retry()`](reliability.md#a-policy), which for a stream is the right
-default and the reason the trap is not usually sprung.
+```
+acemq: a handler reading the stream 'events' asked to retry message 0f9c….
+A stream never removes a message, so retrying one means appending a second
+copy of it to the log for every other consumer to read as well. Park it
+instead — park(...) puts a copy in events.parked and leaves the log alone —
+or accept() to checkpoint past it and record the failure yourself.
+```
+
+and a handler that *raises* gets no retry either, because `read_stream` runs its
+consumer on [`no_retry()`](reliability.md#a-policy) whatever the connection's
+own policy is. That is the second door and it mattered more than the first: a
+connection carrying a retry policy for its queues used to turn every exception
+out of a stream handler into a copy on the log, silently — from outside, a
+stream that is growing looks like a stream that is busy.
+
+`StreamRetryError` is both an `AceMQError` and a `FatalError`. The first is how
+a caller catches what this library refused; the second is what keeps the
+delivery off a retry ladder that would do the very thing being refused.
+
+**So a failing handler has two honest outcomes, and they are enough.** Park it,
+and the message is in a queue somebody drains. Or accept it, checkpoint past it,
+and record the failure yourself — which is what most projections want, because
+the message is still on the log and can be read again from an earlier offset
+once whatever broke is fixed. `reject(...)` works too and is the same shape as
+parking; it is not offered as one of the two because "this message is bad" is
+rarely what a stream failure is.
+
+Java models this with a separate `StreamConsumer` whose failure policy is `STOP`
+or `SKIP` and nothing else. Python constrains the consumer instead of replacing
+it, and the reason is that the two libraries are removing different things.
+Java's `MessageConsumer` exposes the retry ladder as *configuration*, so a type
+offering a dead-letter policy for a stream would be a type where half the
+settings are wrong. Python's `Consumer` exposes `queue`, `running`, `in_flight`
+and `close`, every one of which means exactly what it says on a stream. The
+three-outcome settle path comes from the `Ack` a handler returns, not from the
+consumer, so the refusal belongs where the `Ack` is read — and a second consumer
+class would be a copy of the first with nothing taken away.
 
 ### The queues a stream consumer declares
 
@@ -205,9 +237,14 @@ the same as [any other consumer](consuming.md#what-starting-a-consumer-declares)
 because the table above means it really can publish to both. Those are ordinary
 quorum queues, and a message in one is a message a person has to look at.
 
+**No retry rungs are declared**, because nothing here retries. An ordinary
+consumer on a connection with a long-delay policy declares `{queue}.retry.5m`
+and its neighbours; a stream consumer declares none of them, and a rung queue
+for a consumer that will never use one is a durable queue nothing ever reads.
+
 Pass `declare=False` to stop it — for a login without `configure` permission, or
 because you would rather a stream's failures went somewhere you chose. A consumer
-started that way still publishes to those names if a handler rejects, so
+started that way still publishes to those names if a handler parks or rejects, so
 somebody else has to have declared them.
 
 ### Depth does not mean anything on a stream
@@ -289,10 +326,10 @@ event sourcing, audit logs, analytics fan-out.
 
 Stay with a queue for work that is done once and finished. Consuming removes
 nothing, so two workers reading one stream both do the same job — a stream is the
-wrong shape for distributing work. And as the table above shows, the retry
-ladder, the dead-letter queue and the parking lot do not mean on a stream what
-they mean on a queue. Rebuilding those on top of one is how a simple job becomes
-a distributed systems project.
+wrong shape for distributing work. And as the table above shows, the retry ladder
+does not exist on a stream at all, and the dead-letter queue and the parking lot
+hold copies rather than the message itself. Rebuilding those on top of one is how
+a simple job becomes a distributed systems project.
 
 ## Requirements
 

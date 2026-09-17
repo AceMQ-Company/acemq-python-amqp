@@ -216,13 +216,16 @@ While the version is `0.x` the public API may change in any release.
     consumer counters on the responder's queue, `request_span` for the round
     trip, and an interceptor for a count that has to be exactly Java's shape.
   - **Java's streams page says a stream has no dead-letter queue and that a
-    failed message stays where it is.** Here it does not. `read_stream` returns
+    failed message stays where it is.** Here it half does. `read_stream` returns
     an ordinary `Consumer`, so `reject()` republishes a copy to `{stream}.dlq`
-    and `park()` to `{stream}.parked`, and **`retry()` publishes the message back
-    onto the stream**, appending a copy every other consumer will read.
-    Reproduced against a broker: one message, `fixed_retry(3, 200ms)`, and the
-    log ends up holding attempts 1, 2 and 3 with a fourth copy in the dead-letter
-    queue. `docs/streams.md` carries the whole settlement table.
+    and `park()` to `{stream}.parked` — neither of which touches the log, because
+    both of those are ordinary queues beside it. `retry()` *did* publish the
+    message back onto the stream, appending a copy every other consumer would
+    read; reproduced against a broker with one message and
+    `fixed_retry(3, 200ms)`, the log ended up holding attempts 1, 2 and 3 with a
+    fourth copy in the dead-letter queue. That is now refused rather than
+    documented — see **Changed** below. `docs/streams.md` carries the settlement
+    table.
   - **Java's request/reply page says the reply queue carries `x-expires`.** This
     one does not, and does not need to: a generated reply queue is exclusive and
     auto-deleting, so the broker removes it when the connection goes, which
@@ -246,6 +249,78 @@ While the version is `0.x` the public API may change in any release.
   empty panel does the damage.
 
 ### Changed
+
+- **A stream handler may no longer ask for a retry, and a stream consumer no
+  longer inherits one.** `read_stream` refuses `retry(...)` with a new
+  `StreamRetryError`, and runs its consumer on `no_retry()` whatever the
+  connection's own policy is. **Nothing this library does now appends to a
+  stream.**
+
+  What was there before was a footgun that had been carefully documented rather
+  than removed. A retry is a republish, and republishing onto a stream
+  *appends*: the message goes on the end of the log, where every other consumer
+  of that stream reads it as a new one and where it stays for the whole
+  retention. One message, `fixed_retry(3, 200ms)` on the connection and a
+  handler that always fails left attempts 1, 2 and 3 sitting on the log for ever
+  and a fourth copy in `{stream}.dlq`. A projection rebuilt from `from_first()`
+  six months later would replay all three.
+
+  It was worse than a knob somebody might reach for, because there was no knob.
+  `read_stream` deliberately took no retry policy — and the connection's policy
+  reached the consumer anyway, so the damage arrived through a setting made
+  somewhere else for a completely different queue. From outside, a stream that is
+  growing looks exactly like a stream that is busy.
+
+  **Both doors are now shut.** A handler returning `retry(...)` gets a
+  `StreamRetryError` naming the two honest alternatives, and a copy of the
+  message goes to `{stream}.dlq` carrying the same sentence:
+
+  ```
+  acemq: a handler reading the stream 'events' asked to retry message 0f9c….
+  A stream never removes a message, so retrying one means appending a second
+  copy of it to the log for every other consumer to read as well. Park it
+  instead — park(...) puts a copy in events.parked and leaves the log alone —
+  or accept() to checkpoint past it and record the failure yourself.
+  ```
+
+  A handler that *raises* is not retried either, which is the half that mattered
+  more: an exception is how Python says a thing failed, so most stream retries
+  were never asked for in the first place.
+
+  The two alternatives are enough, and the error names them because a failure
+  message that only says no is a failure message somebody works around. **Park
+  it** and the copy is in a queue somebody drains, with the log untouched.
+  **Or checkpoint and move on** — `accept()` advances this consumer's position
+  and the failure becomes the handler's to record, which is what most
+  projections want, because the message is still on the log and can be read
+  again from an earlier offset once whatever broke is fixed. `reject(...)` still
+  works and is the same shape as parking; it is not offered as one of the two
+  because "this message is bad" is rarely what a stream failure is.
+
+  **Why the consumer is constrained rather than replaced.** Java models this
+  with a separate `StreamConsumer` whose failure policy is `STOP` or `SKIP` and
+  nothing else, and the obvious move was to port that type. It would have been
+  the wrong port, because the two libraries have different things to remove.
+  Java's `MessageConsumer` exposes the retry ladder as *configuration*, so a type
+  that offered a dead-letter policy for a stream would be a type where half the
+  settings are wrong. Python's `Consumer` exposes `queue`, `running`,
+  `in_flight` and `close`, every one of which means exactly what it says on a
+  stream. The three-outcome settle path comes from the `Ack` a handler returns
+  and not from the consumer type, so the constraint belongs where the `Ack` is
+  read — and a `StreamConsumer` here would have been a copy of `Consumer` with
+  nothing taken away, plus one more class to learn and one more thing that can
+  be held after `read_stream` returns.
+
+  **What breaks.** A stream handler that returned `retry(...)` and was relying on
+  the append. There is no compatibility shim and there should not be: the old
+  behaviour silently corrupted a log, and a service still depending on it wants
+  to find out now rather than from a projection that is wrong in a year.
+  Nothing else changes — `accept()`, `park()` and `reject()` do what they always
+  did, the consumer is the same object, and a stream consumer now declares
+  `{stream}.dlq` and `{stream}.parked` and no retry rungs, because it has no use
+  for them.
+
+  `docs/streams.md` and `docs/patterns.md` carry the new settlement table.
 
 - **`tracing.outbox_published(...)` is still application-only, and now says why
   that is a smaller limitation than it read as.** The span attribute
@@ -304,11 +379,9 @@ Documentation, all of it a claim the code stopped supporting.
   remove it from. Half of that is right — nothing is ever removed from a stream —
   and the conclusion is not: `read_stream` returns an ordinary `Consumer`, so a
   rejection republishes a copy to `{stream}.dlq` and acknowledges the original,
-  exactly as on a queue, and a retry appends the message to the stream itself.
-  Both now say what happens, and `read_stream`'s docstring adds the part that
-  followed from it: the policy is not a *parameter*, but the connection's own
-  policy still reaches the consumer, so a stream read from a connection carrying
-  one will append its retries.
+  exactly as on a queue. A retry appended the message to the stream itself,
+  which is the behaviour the **Changed** entry above removes. Both pages now say
+  what happens.
 
 - **`Connection.message_count` on a stream was documented as the retained
   count.** `docs/patterns.md` said it reports how many messages are retained
