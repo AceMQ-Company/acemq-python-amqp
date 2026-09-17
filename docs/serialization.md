@@ -414,8 +414,8 @@ therefore how often there is one. Nothing about the bytes differs.
 | Go | When asked | A Go struct carries no schema, so there is nothing to resolve onto until the caller passes `avro.ReaderSchema(...)` |
 | Java | Sometimes | A generated `SpecificRecord` class carries a schema of its own, and `AvroCodec.registered(registry, readerSchema)` is handed one. A `GenericRecord` through a plain registry codec asks for nothing in particular, so the reader schema is the writer's and nothing resolves |
 | .NET | By default | The codec is constructed with a schema, so there is always one to resolve onto unless the caller declines it: `Registered(registry, schema, readerSchema)` reads against a different schema than it writes, and `WithoutReaderSchema()` leaves the codec none at all |
-| Python | Always | The codec is constructed with a schema |
-| Ruby | Always | The codec is constructed with a schema |
+| Python | By default | The codec is constructed with a schema, and that schema is the reader schema unless `reader_schema=` names another. A fixed-schema `AvroCodec(schema)` has no registry to learn a writer schema from, so there is nothing per message to resolve |
+| Ruby | By default | `registered(...)` is constructed with a schema, and that schema is the reader schema unless `reader_schema:` names another. `AvroCodec.of` fixes one schema for the codec's whole life, reads what it writes, and resolves nothing |
 
 This is not an inconsistency waiting to be flattened. A library that resolves and
 a library that does not are both right about the same bytes — they are answering

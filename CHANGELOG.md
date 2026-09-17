@@ -76,6 +76,17 @@ While the version is `0.x` the public API may change in any release.
   description say the same. Prose only: the bytes, the cases, the schema ids and
   both columns are unchanged, and every assertion here passed untouched.
 
+  The **Python** and **Ruby** rows are corrected the same way and now match the
+  copies in all five repositories. Both said `Always`, which is a stronger claim
+  than either library supports: `reader_schema=` here and `reader_schema:` in
+  Ruby each move the codec off that default, so the honest word is *by default*.
+  Ruby's row had also hidden a second case entirely — `AvroCodec.of` fixes one
+  schema for the codec's whole life, reads what it writes, and resolves nothing.
+  Python's row stops at "nothing per message to resolve" rather than "reads what
+  it writes", deliberately: a fixed-schema `AvroCodec(schema)` can still be
+  handed `reader_schema=` in its constructor, and the load-bearing part is that
+  it has no registry to learn a writer schema from.
+
 - **Every metric name Java publishes is now written here.** The six that were
   not — `acemq.publish.duration`, `acemq.consume.attempts`,
   `acemq.request.duration`, `acemq.request.total`,
