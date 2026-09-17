@@ -54,6 +54,23 @@
         "x-acemq-type": "order.placed"  ,
         "x-acemq-version": 1  
       }
+    },
+    {
+      "case": "claimed",
+      "routingKey": "fx.claimed",
+      "messageId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      "body": "\"{\\\"id\\\":\\\"o-4\\\"}\"",
+      "contentType": "application/json",
+      "headers": {
+        "x-acemq-attempt": 1  ,
+        "x-acemq-claim": "s3://payloads/orders/o-4"  ,
+        "x-acemq-correlation": "corr-3"  ,
+        "x-acemq-first-seen": 1767323045678  ,
+        "x-acemq-id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"  ,
+        "x-acemq-origin": "orders@host-7"  ,
+        "x-acemq-type": "order.placed"  ,
+        "x-acemq-version": 1  
+      }
     }
   ]
 }
