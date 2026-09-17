@@ -133,6 +133,60 @@ While the version is `0.x` the public API may change in any release.
   re-exported from the package root, and both carrying a `HELP` line in
   `PrometheusObserver`.
 
+- **Seven documentation pages the site was missing beside Java's and .NET's:**
+  `docs/request-reply.md`, `docs/streams.md`, and the four tutorials plus their
+  index — `docs/tutorials.md`, `docs/tutorial-first-message.md`,
+  `docs/tutorial-surviving-failure.md`, `docs/tutorial-exactly-once.md` and
+  `docs/tutorial-observability.md`. The tutorials teach the same four subjects in
+  the same order as Java's and .NET's, so somebody arriving from another language
+  finds tutorial 3 teaching tutorial 3, and Tutorials is now the accented
+  top-level navigation entry in all three sites.
+
+  They are written against **this** library rather than translated from Java's,
+  which mattered more than it sounds like it should. Every code sample was run
+  against a real broker before it shipped, and doing that turned up four claims
+  that a transliteration would have carried across intact:
+
+  - **Java and .NET both document request/reply counters that do not exist
+    here.** `requester.timedOut()`, `requester.unmatched()`,
+    `responder.answered()` and `responder.unanswerable()` are on both of their
+    pages under a heading saying all five libraries promise them identically.
+    Python promises none of them: `Requester` and `serve` are built over a
+    connection rather than being something the connection knows it is doing, so
+    neither is holding an `Observer`. `docs/request-reply.md` says so, names the
+    reason, and points at the three things that *are* available — the ordinary
+    consumer counters on the responder's queue, `request_span` for the round
+    trip, and an interceptor for a count that has to be exactly Java's shape.
+  - **Java's streams page says a stream has no dead-letter queue and that a
+    failed message stays where it is.** Here it does not. `read_stream` returns
+    an ordinary `Consumer`, so `reject()` republishes a copy to `{stream}.dlq`
+    and `park()` to `{stream}.parked`, and **`retry()` publishes the message back
+    onto the stream**, appending a copy every other consumer will read.
+    Reproduced against a broker: one message, `fixed_retry(3, 200ms)`, and the
+    log ends up holding attempts 1, 2 and 3 with a fourth copy in the dead-letter
+    queue. `docs/streams.md` carries the whole settlement table.
+  - **Java's request/reply page says the reply queue carries `x-expires`.** This
+    one does not, and does not need to: a generated reply queue is exclusive and
+    auto-deleting, so the broker removes it when the connection goes, which
+    covers the crash `x-expires` is there for without a timer to tune.
+  - **There is no blocking request/reply**, which nothing said. `acemq_amqp.sync`
+    has a connection, a publisher and a consumer; a `Requester` waits on an
+    `asyncio.Future` per outstanding call, which is the one thing a blocking
+    facade cannot hand to a thread that is not on the loop. A blocking
+    *responder* can still be written by hand, and the page shows how.
+
+  The tutorials also differ from Java's and .NET's in needing a broker for all
+  four rather than for the last two: there is no `memory://` here, because
+  `Transport` is a six-method `Protocol` and the fake a test needs is a small
+  class rather than a shipped subsystem. Stated up front rather than discovered
+  at step 3.
+
+  Where a tutorial publishes several messages it uses `send_all`, and
+  `docs/tutorial-observability.md` builds its dashboard only from names this
+  library actually writes — the six of Java's that it does not are called out
+  there as well as in `docs/observability.md`, because a dashboard is where an
+  empty panel does the damage.
+
 ### Changed
 
 - **`tracing.outbox_published(...)` is still application-only, and now says why
@@ -185,6 +239,25 @@ Documentation, all of it a claim the code stopped supporting.
   `docs/patterns.md` both said three patterns have a storage seam; there are
   four, and `ClaimCheckStore` is the one that is synchronous and not in
   `acemq_amqp.patterns.sql`.
+
+- **"Rejecting does not dead-letter" was wrong about streams.** The
+  `acemq_amqp.patterns.streams` module docstring and `docs/patterns.md` both said
+  a rejected message on a stream is not dead-lettered because there is nothing to
+  remove it from. Half of that is right — nothing is ever removed from a stream —
+  and the conclusion is not: `read_stream` returns an ordinary `Consumer`, so a
+  rejection republishes a copy to `{stream}.dlq` and acknowledges the original,
+  exactly as on a queue, and a retry appends the message to the stream itself.
+  Both now say what happens, and `read_stream`'s docstring adds the part that
+  followed from it: the policy is not a *parameter*, but the connection's own
+  policy still reaches the consumer, so a stream read from a connection carrying
+  one will append its retries.
+
+- **`Connection.message_count` on a stream was documented as the retained
+  count.** `docs/patterns.md` said it reports how many messages are retained
+  rather than outstanding. The broker reports **zero**, whatever the stream
+  holds, because depth counts messages nobody has taken and on a stream nobody
+  ever takes one. The `x-stream-offset` header each delivery carries is what
+  answers the question that was being asked, and both pages now say so.
 
 ## [0.5.0] - 2026-09-09
 
