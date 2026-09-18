@@ -70,6 +70,19 @@ While the version is `0.x` the public API may change in any release.
   together. A blocked broker is not probed at all — the answer is already known
   and the round trip would spend the whole deadline arriving at it.
 
+### Fixed
+
+- **Closing a consumer whose workers were already cancelled no longer raises
+  `CancelledError` at the caller.** `Consumer.close()` waited on its workers with
+  `asyncio.gather`, which re-raises the cancellation of a task that was cancelled
+  before closing began — the ordinary shape of a shutdown that cancels the loop's
+  tasks and then closes the connection. `Connection.close()` passed it on, so a
+  caller inspecting `task.exception()` afterwards was told that *it* had been
+  cancelled by something it had asked to shut down. Each worker is now awaited
+  with the cancellation swallowed when `task.cancelled()` says the worker was the
+  one cancelled. A worker that failed on its own is still reported: the guard is
+  on cancellation and nothing else.
+
 ## [0.6.0] - 2026-09-17
 
 ### Added

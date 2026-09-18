@@ -266,6 +266,14 @@ schedule.
 Closing the connection closes every consumer on it first, so a service that
 exits its `async with await connect(...)` block has already drained.
 
+Closing is not itself a cancellation. A shutdown that cancelled the tasks on the
+loop before closing the connection leaves workers that are already cancelled, and
+waiting on one of those raises `CancelledError`; closing swallows it rather than
+letting it out, because a caller who is merely shutting down should not be told
+that *they* were cancelled — which is what anything reading `task.exception()`
+afterwards would be handed. A worker that failed on its own is still reported:
+the guard is on cancellation and nothing else.
+
 ## What the consumer will tell you
 
 ```python

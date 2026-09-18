@@ -23,6 +23,7 @@ confirmed against a real broker in the integration tests.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -525,3 +526,42 @@ async def test_a_consumer_needs_at_least_one_worker() -> None:
     connection = Connection(transport)
     with pytest.raises(ValueError, match="at least 1"):
         await connection.consume(QUEUE, always(accept()), concurrency=0)
+
+
+async def test_closing_a_consumer_whose_workers_were_cancelled_is_not_a_cancellation() -> None:
+    # The shape of an ordinary shutdown: something cancelled the tasks on the
+    # loop and then closed the connection. Waiting on a worker that is already
+    # cancelled raises CancelledError, and letting that out of close() tells a
+    # caller who is merely shutting down that *they* were cancelled — which is
+    # what anything reading task.exception() afterwards would be handed.
+    transport = FakeTransport()
+    connection = Connection(transport)
+    consumer = await connection.consume(QUEUE, always(accept()))
+
+    for worker in consumer._workers:
+        worker.cancel()
+
+    closing = asyncio.create_task(connection.close())
+    await closing
+
+    assert closing.cancelled() is False
+    assert closing.exception() is None
+    assert consumer.closed is True
+    assert transport.closed is True
+
+
+async def test_closing_still_reports_a_worker_that_failed() -> None:
+    # The guard is on cancellation and nothing else: a worker that died of its
+    # own accord is news, and swallowing that would hide the one failure closing
+    # can actually tell somebody about.
+    transport = FakeTransport()
+    connection = Connection(transport)
+    consumer = await connection.consume(QUEUE, always(accept()))
+
+    async def fails() -> None:
+        raise RuntimeError("the worker died")
+
+    consumer._workers = [asyncio.create_task(fails())]
+
+    with pytest.raises(RuntimeError, match="the worker died"):
+        await consumer.close()

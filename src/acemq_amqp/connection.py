@@ -1072,7 +1072,18 @@ class Consumer:
 
         for _ in self._workers:
             self._work.put_nowait(None)
-        await asyncio.gather(*self._workers)
+        for worker in self._workers:
+            try:
+                await worker
+            except asyncio.CancelledError:
+                # A worker that was already cancelled — a task group unwinding,
+                # a shutdown that cancelled the loop's tasks before closing the
+                # connection — is not news to report to a caller who is merely
+                # closing. Re-raising it here makes closing look like the
+                # *caller* was cancelled, which is what anything inspecting
+                # ``task.exception()`` afterwards would be told.
+                if not worker.cancelled():
+                    raise
 
         if self._subscription is not None:
             await self._subscription.close()
