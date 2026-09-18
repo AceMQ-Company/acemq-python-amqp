@@ -227,6 +227,48 @@ class Transport(Protocol):
 
 
 @runtime_checkable
+class BlockedState(Protocol):
+    """A transport that can say whether the broker has blocked its connection.
+
+    RabbitMQ sends ``connection.blocked`` when it is low on memory or disk and
+    ``connection.unblocked`` when the alarm clears. In between it stops reading
+    from the socket, so everything sent on that connection — a publish, a
+    declaration, a health probe — waits rather than failing. From outside that
+    is indistinguishable from a broker that has silently gone away, and the two
+    want opposite responses: a blocked broker is one to wait for, a dead one is
+    one to fail over from.
+
+    Separate from :class:`Transport` because not every transport has an answer.
+    A fake in a test is never blocked and can say so; a client library that
+    keeps the state to itself cannot be asked at all, which is what ``None``
+    below is for. It is the same shape as Java's ``isBlocked()`` and
+    ``blockedReason()``, .NET's ``IsBlocked``/``BlockedReason`` and Go's
+    ``BlockedReason()``.
+    """
+
+    @property
+    def blocked(self) -> bool | None:
+        """Whether the broker has blocked this connection.
+
+        ``None`` rather than ``False`` when the question could not be asked at
+        all — a client that does not expose the state, a connection that is
+        between reconnections. The two are different facts and a report that
+        folds them together says a broker is fine when nobody looked.
+        """
+
+    @property
+    def blocked_reason(self) -> str | None:
+        """What the broker said when it blocked this connection.
+
+        ``None`` when it is not blocked, and also ``None`` when the client read
+        the reason and did not keep it — which is what aio-pika does, and why
+        this is separate from :attr:`blocked` rather than a string that is empty
+        when there is nothing to say. A reason invented here would read exactly
+        like one RabbitMQ sent.
+        """
+
+
+@runtime_checkable
 class MessageSource(Protocol):
     """A transport that can be asked for one message instead of subscribed to.
 

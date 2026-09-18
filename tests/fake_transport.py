@@ -101,6 +101,17 @@ class FakeTransport:
     specs: dict[str, ConsumeSpec] = field(default_factory=dict)
     closed: bool = False
 
+    #: Whether the broker has blocked this connection, which a test sets to
+    #: rehearse a disk or memory alarm. ``None`` is the third answer a transport
+    #: can give — the question could not be asked — and is deliberately not the
+    #: default here, because this fake always knows.
+    blocked: bool | None = False
+
+    #: What the broker said when it blocked. ``None`` is what the RabbitMQ
+    #: transport answers even while blocked, because aio-pika does not keep the
+    #: reason; a test that sets one is rehearsing a transport that does.
+    blocked_reason: str | None = None
+
     async def declare_queue(self, name: str, spec: QueueSpec) -> None:
         self.queues[name] = spec
 

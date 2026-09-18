@@ -58,6 +58,8 @@ from .codec import (
     register_codec,
 )
 from .connection import (
+    BLOCKED_DETAIL,
+    DEFAULT_HEALTH_TIMEOUT,
     AsyncHandler,
     BrokerHealth,
     Connection,
@@ -137,6 +139,7 @@ from .topology import (
     rung_args,
 )
 from .transport import (
+    BlockedState,
     ConsumeSpec,
     Delivery,
     ExchangeSpec,
@@ -158,9 +161,11 @@ retry = _retry
 __version__ = "0.6.0"
 
 __all__ = [
+    "BLOCKED_DETAIL",
     "BYTES_CONTENT_TYPE",
     "DEAD_LETTER_EXCHANGE",
     "DEFAULT_BROKER_WAIT_THRESHOLD",
+    "DEFAULT_HEALTH_TIMEOUT",
     "DEVELOPMENT_MARKER",
     "JSON_CONTENT_TYPE",
     "METRIC_CONSUME_ATTEMPTS",
@@ -187,6 +192,7 @@ __all__ = [
     "Ack",
     "Action",
     "AsyncHandler",
+    "BlockedState",
     "BrokerHealth",
     "BytesCodec",
     "Codec",

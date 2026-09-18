@@ -87,6 +87,82 @@ class RabbitMQTransport:
         """The aio-pika connection, for anything this library does not wrap."""
         return self._connection
 
+    @property
+    def blocked(self) -> bool | None:
+        """Whether RabbitMQ has blocked this connection, or ``None`` when unknown.
+
+        A blocked connection is the broker protecting itself from a disk or
+        memory alarm, and while it lasts the broker stops reading the socket: a
+        publish, a declaration and a health probe all wait instead of failing.
+        Knowing that is the difference between waiting for a broker that will
+        come back and failing over from one that has gone.
+
+        Read rather than received, because there is nothing to receive it with.
+        aio-pika exposes no blocked state and no callback for it; aiormq
+        underneath handles ``connection.blocked`` and ``connection.unblocked``
+        by clearing and setting one :class:`asyncio.Event` it keeps under a
+        name-mangled attribute, and that event is the only record of the state
+        anywhere in the stack. So this walks down to it and answers ``None``
+        when it is not there — a client that has moved it, a robust connection
+        that is between reconnections, a transport that is not RabbitMQ at all.
+
+        ``None`` is not ``False``. A health report that says the connection is
+        not blocked because nobody could look is worse than one that says the
+        question could not be asked.
+        """
+        unblocked = self._unblocked_event()
+        if unblocked is None:
+            return None
+        return not bool(unblocked.is_set())
+
+    @property
+    def blocked_reason(self) -> str | None:
+        """Always ``None`` here: the reason is not kept anywhere to read.
+
+        RabbitMQ does send one — "low on disk space", usually — and aiormq's
+        frame handler logs it and drops it rather than storing it on the
+        connection. Nor can it be caught as it arrives: the handlers for channel
+        zero are bound into a local table when the connection's reader task
+        starts, before ``connect()`` has returned to anything that might add
+        one, and neither aiormq nor aio-pika offers a hook of its own.
+
+        So the boolean is honest and the reason is absent, which is the pair
+        this library can actually stand behind. The property is here rather than
+        omitted because :class:`~acemq_amqp.transport.BlockedState` is what the
+        other four libraries expose, and because a client release that starts
+        keeping the reason should be one method changing rather than an API
+        growing.
+        """
+        return None
+
+    #: aiormq keeps the blocked state in an event under this name, cleared on
+    #: ``connection.blocked`` and set again on ``connection.unblocked``. It is
+    #: private and name-mangled, and there is no accessor above it.
+    _UNBLOCKED = "_Connection__connection_unblocked"
+
+    #: The attributes worth following down to it: on aio-pika 10 the path from
+    #: here is ``_connection.transport.connection`` — a ``RobustConnection``, an
+    #: ``UnderlayConnection`` and finally aiormq's own. Naming the links rather
+    #: than the path means a layer appearing or disappearing costs nothing.
+    _LINKS = ("_connection", "transport", "connection")
+
+    def _unblocked_event(self, depth: int = 4) -> asyncio.Event | None:
+        """aiormq's unblocked event, found by walking down the clients."""
+        seen: set[int] = set()
+        frontier: list[Any] = [self]
+        for _ in range(depth):
+            following: list[Any] = []
+            for node in frontier:
+                if node is None or id(node) in seen:
+                    continue
+                seen.add(id(node))
+                unblocked = getattr(node, self._UNBLOCKED, None)
+                if isinstance(unblocked, asyncio.Event):
+                    return unblocked
+                following += [getattr(node, link, None) for link in self._LINKS]
+            frontier = following
+        return None
+
     async def _admin_channel(self) -> AbstractChannel:
         """The channel declarations go on, made again if it has been killed.
 

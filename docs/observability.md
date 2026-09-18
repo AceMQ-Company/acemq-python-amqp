@@ -277,7 +277,7 @@ report = await mq.health()
 report.status     # HealthStatus.UP / DOWN / DEGRADED
 report.healthy    # what a readiness probe should return; degraded passes
 report.detail     # why, when it is not simply up
-report.parts      # {'consumers': 2, 'in-flight': 0, 'round-trip': 0.0021}
+report.parts      # {'consumers': 2, 'in-flight': 0, 'blocked': False, 'round-trip': 0.0021}
 print(report)     # 'degraded: these consumers have stopped reading: shipping.orders'
 ```
 
@@ -303,6 +303,57 @@ the same way, so it is worth an alert and not worth taking out of rotation.
 It costs a round trip, so it is not something to call per request. Wire it to a
 readiness probe and let the probe's interval decide how often.
 
+### A blocked connection is up, with the reason
+
+RabbitMQ blocks a connection when it is low on disk or memory, and while the
+alarm lasts it stops reading that connection's socket: a publish, a declaration
+and the health probe all wait rather than fail.
+
+That is reported **up**, and `parts["blocked"]` says so:
+
+```python
+mq.blocked          # True / False / None
+mq.blocked_reason   # the broker's words, when the client kept them
+
+report = await mq.health()
+report.status                 # HealthStatus.UP
+report.parts["blocked"]       # True
+```
+
+Reporting it down is what gets an instance restarted into the same blocked
+broker, having thrown away whatever it was holding — and the replacement will be
+blocked too, because the broker is the thing under pressure. Java's
+`AceMqHealthIndicator` and Go's check make the same call.
+
+`None` is the third answer and is not `False`: it means the question could not be
+asked at all — a transport that does not implement `BlockedState`, or a
+connection that has been closed. A report saying `blocked: null` is more use in
+an incident than one saying `false` because nobody looked.
+
+**The reason is usually absent on RabbitMQ.** The broker does send one, and
+aio-pika's AMQP layer logs it and drops it rather than keeping it on the
+connection; there is no callback to catch it as it arrives either. So
+`blocked_reason` is `None` there, and the boolean is what the library will stand
+behind. A reason invented here would read exactly like one the broker sent.
+
+### The probe has a deadline
+
+A blocked broker is precisely the state in which a round trip does not come
+back, so `health()` bounds its own probe — three seconds by default, and
+`await mq.health(timeout=1.0)` to say otherwise:
+
+- a probe that runs out of time is **abandoned** rather than waited for, because
+  cancelling a request to a broker that has stopped reading its socket means
+  waiting for a cancellation that travels the same way the request did;
+- before calling the silence a failure, the blocked state is read **again**: the
+  notification and the silence arrive together, and "the broker is protecting
+  itself" and "the broker has gone" are the same quiet socket otherwise;
+- a broker that is blocked is not probed at all, because the answer is already
+  known and the round trip would spend the whole deadline arriving at it.
+
+A health check that hangs takes the readiness endpoint down with it, which is
+worse than a report saying it could not tell.
+
 ### Three states, not a boolean
 
 `degraded` exists because "working, but not as well as it should" is worth an
@@ -323,11 +374,20 @@ report.parts["database"]
 
 `HealthCheck` is a `Protocol`: a `name` property and an `async check()`
 returning a `HealthReport`. `BrokerHealth(mq)` wraps the connection as one, and
-takes a `label` if `"broker"` is not the right name for it.
+takes a `label` if `"broker"` is not the right name for it, and a `timeout` that
+is passed to `health()`.
 
 The combined status is the **worst** of them: one thing being down makes the
 whole report down, because a service that cannot reach its broker is not ready
 however healthy the rest of it is.
+
+Which is why nothing between the connection and the aggregate is allowed to have
+a cruder opinion than the connection's. A blocked broker comes through
+`BrokerHealth` as **up**, so there is no "blocked is degraded" answer for the
+worst-of rule to pick up and impose on a report that had already decided
+otherwise. The deadlines follow the same argument: `BrokerHealth`'s is three
+seconds against the aggregate's five, so a broker that has stopped answering is
+described by the check that looked rather than by the aggregate giving up on it.
 
 Checks run **at once** rather than in turn, so a slow one does not add its
 latency to the others, and under a deadline, so one that hangs cannot hang the

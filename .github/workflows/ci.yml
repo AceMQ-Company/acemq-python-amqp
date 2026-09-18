@@ -76,7 +76,17 @@ jobs:
       - name: Install
         run: pip install -e ".[dev]"
 
+      - name: Find the broker container
+        # The blocked-connection test has to raise a real memory alarm, which
+        # takes rabbitmqctl: there is no way to make a broker block a connection
+        # from the client side. A service container's name is generated rather
+        # than chosen, so it is looked up by image and handed over as the command
+        # that fronts rabbitmqctl. Without this the test skips.
+        run: |
+          id="$(docker ps -q --filter ancestor=rabbitmq:4-alpine | head -1)"
+          echo "ACEMQ_TEST_BROKER_CTL=docker exec $id rabbitmqctl" >> "$GITHUB_ENV"
+
       - name: Test against the broker
         env:
           ACEMQ_TEST_BROKER: amqp://guest:guest@localhost:5672/
-        run: pytest -m integration -q
+        run: pytest -m integration -q -rs

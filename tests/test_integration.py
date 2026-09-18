@@ -32,9 +32,11 @@ import base64
 import contextlib
 import json
 import os
+import shlex
 import sqlite3
 import ssl
 import threading
+import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from datetime import timedelta
@@ -55,6 +57,7 @@ from acemq_amqp import (
     METRIC_PUBLISH_TOTAL,
     RETRY_EXCHANGE,
     Ack,
+    BrokerHealth,
     BytesCodec,
     Codec,
     CompositeCodec,
@@ -79,6 +82,7 @@ from acemq_amqp import (
     Topology,
     Verification,
     accept,
+    aggregate_health,
     connect,
     dead_letter_queue,
     exponential_retry,
@@ -166,6 +170,19 @@ CERTIFICATES = Path(os.environ.get("ACEMQ_TEST_TLS_CERTIFICATES", "/nonexistent"
 TLS_LOGIN = Credentials(
     os.environ.get("ACEMQ_TEST_TLS_USERNAME", "guest"),
     os.environ.get("ACEMQ_TEST_TLS_PASSWORD", "guest"),
+)
+
+#: How to run ``rabbitmqctl`` against the broker these tests are pointed at,
+#: given as the command that fronts it — ``docker exec acemq-python-it
+#: rabbitmqctl``, or just ``rabbitmqctl`` where the broker is local. Unset on a
+#: machine where the broker is shared or not the tests' to reconfigure, and the
+#: blocked-connection test skips rather than pretends: there is no way to make a
+#: broker block a connection from the client side, so a test that never sees a
+#: real block would be testing nothing.
+BROKER_CONTROL = os.environ.get("ACEMQ_TEST_BROKER_CTL", "")
+
+needs_control_of_the_broker = pytest.mark.skipif(
+    not BROKER_CONTROL, reason="ACEMQ_TEST_BROKER_CTL is not set"
 )
 
 needs_a_tls_broker = pytest.mark.skipif(
@@ -359,6 +376,25 @@ async def test_a_retry_really_comes_round_again_and_then_dead_letters(
     assert dead.envelope.attempt == 3
     assert "exhausted 3 attempts" in dead.envelope.error
     assert "RuntimeError: the database is down" in dead.envelope.error
+
+
+async def rabbitmqctl(*arguments: str) -> None:
+    """Runs one ``rabbitmqctl`` command against the broker under test.
+
+    Awaited rather than run inline, so that the connection being tested keeps
+    reading frames while the broker is being reconfigured — the notification
+    this exists to provoke arrives on it.
+    """
+    process = await asyncio.create_subprocess_exec(
+        *shlex.split(BROKER_CONTROL),
+        *arguments,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    output, _ = await process.communicate()
+    assert process.returncode == 0, (
+        f"{BROKER_CONTROL} {' '.join(arguments)} failed: {output.decode(errors='replace')}"
+    )
 
 
 async def until(check: Callable[[], Awaitable[bool]], what: str, timeout: float = 15.0) -> None:
@@ -884,6 +920,12 @@ async def test_health_asks_the_broker_something_and_leaves_nothing_behind(
     assert report.healthy is True
     assert report.parts["consumers"] == 1
     assert report.parts["round-trip"] >= 0
+    # The accessor still finds the blocked state on the client versions
+    # installed here. If this starts reading None, aio-pika or aiormq has moved
+    # it and the check has quietly stopped being able to tell a broker applying
+    # back pressure from one that has gone away.
+    assert report.parts["blocked"] is False
+    assert mq.blocked is False
 
     # Five probes and the queue count is what the workspace declared and no
     # more. The whole-run count before and after is checked outside pytest.
@@ -898,6 +940,81 @@ async def test_health_is_down_once_the_connection_has_gone(mq: Connection) -> No
 
     assert report.status is HealthStatus.DOWN
     assert report.healthy is False
+
+
+@needs_control_of_the_broker
+async def test_a_broker_that_has_blocked_this_connection_is_reported_up() -> None:
+    """The one that needs a broker under a real alarm.
+
+    A connection nobody has blocked proves nothing about this: the state is read
+    from the client, the reason a probe hangs is the broker no longer reading the
+    socket, and neither can be rehearsed. So the watermark is dropped far enough
+    that RabbitMQ raises the memory alarm, a publish makes it block this
+    connection, and the watermark goes back afterwards.
+    """
+    connection = await connect(BROKER, origin="acemq-python-tests@ci")
+    queue = f"{PREFIX}{uuid.uuid4().hex[:8]}.blocked"
+    publishing: asyncio.Task[PublishResult] | None = None
+    try:
+        await connection.declare(Topology().queue(queue))
+        assert connection.blocked is False
+        assert (await connection.health()).status is HealthStatus.UP
+
+        await rabbitmqctl("set_vm_memory_high_watermark", "0.0001")
+        # RabbitMQ sends connection.blocked to a connection that publishes while
+        # an alarm is on, and then stops reading its socket — so this publish is
+        # what causes the block and is also the first thing that will not be
+        # confirmed. Left running and dealt with once the alarm is off.
+        publishing = asyncio.create_task(
+            connection.publisher(routing_key=queue).send({"id": "7"})
+        )
+        await until(lambda: _is_blocked(connection), "the broker blocked the connection")
+
+        assert connection.blocked is True
+        # Honest rather than invented: RabbitMQ did send a reason and aio-pika
+        # did not keep it. If this ever reads as a string, a client release has
+        # started keeping it and the transport should hand it over.
+        assert connection.blocked_reason is None
+
+        started = time.monotonic()
+        report = await connection.health()
+        answered_in = time.monotonic() - started
+
+        # Up, with the reason. An orchestrator that restarts this instance moves
+        # it to the same blocked broker, having thrown away whatever it held.
+        assert report.status is HealthStatus.UP
+        assert report.healthy is True
+        assert report.parts["blocked"] is True
+        assert "blocked this connection" in report.detail
+        # And it answered rather than hanging on a round trip the broker is not
+        # reading. Well inside the three seconds the probe would have been given.
+        assert answered_in < 1.0
+
+        # The careful answer survives being combined with others, rather than
+        # being folded into a worst-of aggregate as degraded or down.
+        combined = await aggregate_health(BrokerHealth(connection))
+        assert combined.status is HealthStatus.UP
+        assert combined.parts["broker"].parts["blocked"] is True
+    finally:
+        # Before anything else: closing a blocked connection waits on a broker
+        # that is not reading, and the queue cannot be deleted through one either.
+        await rabbitmqctl("set_vm_memory_high_watermark", "0.4")
+        await until(lambda: _is_unblocked(connection), "the broker unblocked it")
+        if publishing is not None:
+            publishing.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await publishing
+        with contextlib.suppress(Exception):
+            await connection.delete_queue(queue)
+        await connection.close()
+
+
+async def _is_blocked(connection: Connection) -> bool:
+    return connection.blocked is True
+
+
+async def _is_unblocked(connection: Connection) -> bool:
+    return connection.blocked is False
 
 
 async def test_metrics_count_a_real_round_trip(

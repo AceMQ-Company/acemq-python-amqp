@@ -165,7 +165,7 @@ report = await mq.health()
 report.status        # HealthStatus.UP | DEGRADED | DOWN
 report.healthy       # UP or DEGRADED
 report.detail        # why, when it is not UP
-report.parts         # {'consumers': 2, 'in-flight': 0, 'round-trip': 0.0013}
+report.parts         # {'consumers': 2, 'in-flight': 0, 'blocked': False, ...}
 ```
 
 The broker half asks the broker a real question — whether a queue nobody has ever
@@ -179,6 +179,21 @@ The consumer half is the one a probe usually wants and **nothing outside can
 see**. A consumer whose workers have died without it being closed is one the
 broker is still sending messages to and nothing is reading — and from outside
 that is indistinguishable from a quiet queue.
+
+### A blocked broker is still up
+
+`parts["blocked"]` is the third thing a report carries, and a connection the
+broker has blocked — low disk, low memory — is reported **up, with the reason**.
+An orchestrator that restarts the instance for it moves the instance to the same
+blocked broker, having thrown away whatever it was holding. `mq.blocked` asks the
+same question directly, and answers `None` when the transport could not be asked
+at all, which is not the same as `False`.
+
+That is also why `health()` has a deadline of its own: a blocked broker stops
+reading its socket, so the round trip the check makes is exactly the one that
+does not come back. It gives the broker three seconds by default, then reads the
+blocked state again before deciding whether the silence was back pressure or a
+broker that has gone. See [metrics, health and tracing](observability.md).
 
 ### Three states, not a boolean
 

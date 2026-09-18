@@ -87,6 +87,7 @@ from .telemetry import (
 )
 from .topology import Topology, declare_where_failures_go
 from .transport import (
+    BlockedState,
     ConsumeSpec,
     Delivery,
     MessageSource,
@@ -118,6 +119,30 @@ DEFAULT_MAX_OUTSTANDING_PUBLISHES = 1000
 #: How long a publish waits for room when every permit is taken, unless a
 #: connection says otherwise. Java's ``confirmTimeout``, and the same ten seconds.
 DEFAULT_CONFIRM_TIMEOUT = timedelta(seconds=10)
+
+#: How long :meth:`Connection.health` gives the broker to answer its probe.
+#:
+#: Shorter than the five seconds :func:`~acemq_amqp.telemetry.aggregate_health`
+#: gives a whole set of checks, and deliberately: the connection's own answer for
+#: a broker that has stopped answering is the careful one — up when the broker
+#: has blocked this connection, down when it has simply gone — and an aggregate
+#: whose deadline expired first would replace it with a flat "did not answer
+#: within 5s". The inner deadline has to run out first for the outer one to have
+#: anything to report.
+DEFAULT_HEALTH_TIMEOUT = 3.0
+
+#: What a health report says about a connection the broker has blocked. It is
+#: reported **up**, which is the one place this disagrees with a naive reading of
+#: the state: a blocked connection is the broker protecting itself from a disk or
+#: memory alarm, and an application that fails its own readiness check for it is
+#: one an orchestrator restarts into the same blocked broker, having thrown away
+#: whatever it was holding. Java's ``AceMqHealthIndicator`` and Go's health check
+#: make the same call for the same reason.
+BLOCKED_DETAIL = (
+    "the broker has blocked this connection, usually because it is low on disk or "
+    "memory. Reported up on purpose: restarting into a broker that is still blocked "
+    "helps nobody, and this instance is still serving"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1205,7 +1230,42 @@ class Connection:
         """Whether this connection has been closed."""
         return self._closed
 
-    async def health(self) -> HealthReport:
+    @property
+    def blocked(self) -> bool | None:
+        """Whether the broker has blocked this connection, or ``None`` when the
+        transport cannot be asked.
+
+        RabbitMQ blocks a connection when it is low on memory or disk, and while
+        it lasts it stops reading that connection's socket: everything sent —
+        a publish, a declaration, :meth:`health`'s own probe — waits rather than
+        failing. It is the broker protecting itself and it is not an error, so
+        it is worth telling apart from the broker having gone away, which looks
+        identical from outside and wants the opposite response.
+
+        ``None`` means the question could not be asked at all, which is a
+        different fact from ``False`` and is reported as one: a transport that
+        does not implement
+        :class:`~acemq_amqp.transport.BlockedState`, or one whose client has
+        moved the state out of reach. See :attr:`blocked_reason` for why there
+        may be a boolean and no reason to go with it.
+        """
+        transport = self._transport
+        return transport.blocked if isinstance(transport, BlockedState) else None
+
+    @property
+    def blocked_reason(self) -> str | None:
+        """What the broker said when it blocked this connection, if anything.
+
+        ``None`` when the connection is not blocked, and also ``None`` when the
+        transport is blocked but cannot say why — which is what the RabbitMQ
+        transport answers, because aio-pika reads RabbitMQ's reason and does not
+        keep it. Reporting the block without the reason is the honest half;
+        inventing a reason would read exactly like one the broker sent.
+        """
+        transport = self._transport
+        return transport.blocked_reason if isinstance(transport, BlockedState) else None
+
+    async def health(self, timeout: float = DEFAULT_HEALTH_TIMEOUT) -> HealthReport:
         """Whether this connection can reach its broker, and its consumers run.
 
         The broker half is a declaration of a temporary queue, which is the
@@ -1219,23 +1279,55 @@ class Connection:
         one the broker is still sending messages to and nothing is reading, and
         from outside that is indistinguishable from a quiet queue.
 
+        **A blocked connection is up, with the reason.** The broker blocks a
+        connection when it is low on disk or memory, and an application that
+        fails its own readiness check for it is one an orchestrator restarts
+        into the same blocked broker, having thrown away whatever it was
+        holding. ``parts["blocked"]`` carries the state either way, and is
+        ``None`` when the transport could not be asked — see :attr:`blocked`.
+
+        **The probe is bounded.** A blocked broker stops reading the socket, so
+        the round trip this makes is precisely the thing that does not come back
+        when something is wrong; without a deadline of its own a health check
+        hangs, and a readiness endpoint that hangs takes the instance out of
+        rotation with no report at all. A probe that runs out of time is
+        abandoned rather than waited for, because a request that cannot be
+        answered cannot reliably be cancelled either.
+
         It costs a round trip, so it is not something to call per request. Wire
         it to a readiness probe and let the probe's interval decide how often.
 
+        :param timeout: how long to give the broker's answer, three seconds by
+            default. Shorter than the deadline
+            :func:`~acemq_amqp.telemetry.aggregate_health` puts around a whole
+            set of checks, so that this report rather than that one is what an
+            operator reads when a broker stops answering
         :returns: the report. Degraded means working but worth an alert
         """
         checked = datetime.now(timezone.utc)
         consumers = self.consumers
         stalled = [consumer.queue for consumer in consumers if not consumer.running]
+        blocked = self.blocked
         parts: dict[str, Any] = {
             "consumers": len(consumers),
             "in-flight": sum(consumer.in_flight for consumer in consumers),
+            "blocked": blocked,
         }
+        reason = self.blocked_reason
+        if reason:
+            parts["blocked-reason"] = reason
 
         if self._closed:
             return HealthReport(
                 HealthStatus.DOWN, "the connection has been closed", checked, parts
             )
+
+        if blocked:
+            # Asked before the probe rather than after it, because the probe is
+            # what a blocked broker will not answer: a round trip started here
+            # would spend the whole deadline arriving at the answer this already
+            # has.
+            return self._blocked_report(checked, parts, stalled, reason)
 
         # Asking whether a queue nothing has ever declared exists, rather than
         # declaring a temporary one. It is the same round trip and it proves the
@@ -1246,7 +1338,25 @@ class Connection:
         probe = f"acemq-health-{uuid.uuid4().hex}"
         started = time.monotonic()
         try:
-            await self._probe(probe)
+            await self._probe_within(probe, timeout)
+        except asyncio.TimeoutError:
+            # A round trip that does not come back is the ordinary way a block
+            # shows itself, and the notification may have arrived while this was
+            # waiting. Asked again rather than assumed, because "the broker is
+            # protecting itself" and "the broker has gone" are the same silence.
+            blocked = self.blocked
+            parts["blocked"] = blocked
+            reason = self.blocked_reason
+            if reason:
+                parts["blocked-reason"] = reason
+            if blocked:
+                return self._blocked_report(checked, parts, stalled, reason)
+            return HealthReport(
+                HealthStatus.DOWN,
+                f"the broker did not answer within {timeout:g}s",
+                checked,
+                parts,
+            )
         except Exception as failure:
             parts["error"] = _describe(failure)
             return HealthReport(
@@ -1260,11 +1370,71 @@ class Connection:
             # somebody; not worth taking this one out of rotation.
             return HealthReport(
                 HealthStatus.DEGRADED,
-                "these consumers have stopped reading: " + ", ".join(sorted(stalled)),
+                _stalled_detail(stalled),
                 checked,
                 {**parts, "stalled": sorted(stalled)},
             )
         return HealthReport(HealthStatus.UP, "", checked, parts)
+
+    def _blocked_report(
+        self,
+        checked: datetime,
+        parts: dict[str, Any],
+        stalled: list[str],
+        reason: str | None,
+    ) -> HealthReport:
+        """What a blocked connection reports: up, with the reason.
+
+        Up for the block itself, and still degraded when a consumer of this
+        process has stopped reading — that is this instance's own failure rather
+        than the broker's, it outlives the alarm, and a block is not a reason to
+        stop saying so.
+        """
+        detail = self._blocked_detail(reason)
+        if stalled:
+            return HealthReport(
+                HealthStatus.DEGRADED,
+                f"{_stalled_detail(stalled)}; and {detail}",
+                checked,
+                {**parts, "stalled": sorted(stalled)},
+            )
+        return HealthReport(HealthStatus.UP, detail, checked, parts)
+
+    @staticmethod
+    def _blocked_detail(reason: str | None) -> str:
+        """The blocked sentence, with the broker's reason when there is one."""
+        return BLOCKED_DETAIL if not reason else f"{BLOCKED_DETAIL} ({reason})"
+
+    async def _probe_within(self, name: str, timeout: float) -> None:
+        """One round trip to the broker, given ``timeout`` to come back.
+
+        The probe runs as a task that is abandoned rather than awaited when the
+        deadline passes, which is the difference between a bounded check and one
+        that merely looks bounded: cancelling a request to a broker that has
+        stopped reading its socket means waiting for a cancellation that travels
+        the same way the request did.
+
+        :raises asyncio.TimeoutError: when the broker did not answer in time
+        """
+        probe = asyncio.ensure_future(self._probe(name))
+        try:
+            done, _ = await asyncio.wait({probe}, timeout=timeout)
+        except asyncio.CancelledError:
+            # The caller gave up on the whole check. Waiting on a task is not
+            # cancelling it, so it is cancelled here rather than left running
+            # against a broker nobody is listening to any more.
+            probe.cancel()
+            probe.add_done_callback(_retrieved)
+            raise
+        if not done:
+            probe.cancel()
+            # Whatever it ends as is nobody's news now, and an abandoned task
+            # whose exception is never retrieved is a warning at collection time
+            # about a failure that has already been reported as a timeout.
+            probe.add_done_callback(_retrieved)
+            raise asyncio.TimeoutError
+        # Raises what the probe raised, which is what the caller reports.
+        probe.result()
 
     async def _probe(self, name: str) -> None:
         """One round trip to the broker that leaves nothing behind.
@@ -1573,19 +1743,30 @@ class BrokerHealth:
     :func:`~acemq_amqp.telemetry.aggregate_health` together, which is what a
     readiness endpoint actually needs.
 
+    A blocked broker comes back through here as **up, with the reason**, and
+    nothing in between folds it into anything else: the aggregate takes the
+    worst status it is given, so a check that reported back pressure as degraded
+    would quietly degrade a report that had decided otherwise. The deadline is
+    the same argument — :attr:`timeout` is shorter than the aggregate's, so that
+    a broker which has stopped answering is described by this check rather than
+    by the aggregate giving up on it.
+
     :param connection: what to ask
     :param label: what to call it in a combined report
+    :param timeout: how long to give the broker's answer. See
+        :meth:`Connection.health`
     """
 
     connection: Connection
     label: str = "broker"
+    timeout: float = DEFAULT_HEALTH_TIMEOUT
 
     @property
     def name(self) -> str:
         return self.label
 
     async def check(self) -> HealthReport:
-        return await self.connection.health()
+        return await self.connection.health(self.timeout)
 
 
 async def connect(
@@ -1686,6 +1867,17 @@ def default_origin() -> str:
     message that has already been published is worse than an honest hostname.
     """
     return f"acemq@{socket.gethostname()}"
+
+
+def _stalled_detail(stalled: list[str]) -> str:
+    """The sentence naming the consumers that have stopped reading."""
+    return "these consumers have stopped reading: " + ", ".join(sorted(stalled))
+
+
+def _retrieved(task: asyncio.Task[None]) -> None:
+    """Reads an abandoned task's outcome so asyncio does not complain about it."""
+    if not task.cancelled():
+        task.exception()
 
 
 def _describe(failure: BaseException | None) -> str:

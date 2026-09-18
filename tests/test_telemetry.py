@@ -80,7 +80,7 @@ from acemq_amqp.telemetry import (
     metric_key,
 )
 from acemq_amqp.topology import Topology
-from acemq_amqp.transport import Outbound, PublishResult
+from acemq_amqp.transport import ExchangeSpec, Outbound, PublishResult, QueueSpec
 
 QUEUE = "orders.new"
 
@@ -524,6 +524,157 @@ async def test_health_is_degraded_when_a_consumer_has_stopped_reading() -> None:
 
     assert report.status is HealthStatus.DEGRADED
     assert report.healthy is True
+    assert report.parts["stalled"] == [QUEUE]
+
+
+async def test_health_says_whether_the_broker_has_blocked_the_connection() -> None:
+    # The state a report has to carry, because a blocked broker and a broker
+    # that has gone away look identical from outside and want opposite
+    # responses: one is waited for, the other is failed over from.
+    connection = Connection(FakeTransport())
+
+    assert connection.blocked is False
+    assert (await connection.health()).parts["blocked"] is False
+
+
+async def test_blocked_is_none_rather_than_false_when_nobody_could_look() -> None:
+    # "Not blocked" and "the transport cannot be asked" are different facts, and
+    # a report that says false because it never looked is the one that gets
+    # believed in an incident.
+    class Bare:
+        """A transport with no blocked state at all."""
+
+        async def declare_queue(self, name: str, spec: QueueSpec) -> None: ...
+
+        async def declare_exchange(self, name: str, spec: ExchangeSpec) -> None: ...
+
+        async def bind(self, queue: str, exchange: str, routing_key: str) -> None: ...
+
+        async def publish(
+            self, exchange: str, routing_key: str, message: Outbound
+        ) -> PublishResult:
+            return PublishResult(confirmed=True)
+
+        async def consume(self, queue: str, spec: Any, deliver: Any) -> Any: ...
+
+        async def close(self) -> None: ...
+
+    connection = Connection(Bare())
+
+    assert connection.blocked is None
+    assert connection.blocked_reason is None
+    assert (await connection.health()).parts["blocked"] is None
+
+
+async def test_a_blocked_connection_is_up_with_the_reason() -> None:
+    # A blocked connection is the broker protecting itself from a disk or memory
+    # alarm. Reporting it down gets the instance restarted into the same blocked
+    # broker, having thrown away whatever it was holding — which is why Java's
+    # health indicator and Go's report it up, and why this one does.
+    transport = FakeTransport(blocked=True, blocked_reason="low on disk space")
+    connection = Connection(transport)
+
+    report = await connection.health()
+
+    assert report.status is HealthStatus.UP
+    assert report.healthy is True
+    assert report.parts["blocked"] is True
+    assert report.parts["blocked-reason"] == "low on disk space"
+    assert "low on disk space" in report.detail
+
+
+async def test_a_blocked_broker_is_not_probed_at_all() -> None:
+    # The probe is the round trip a blocked broker will not answer: it stops
+    # reading the socket. Asking first turns a deadline's worth of waiting into
+    # an answer that was already known.
+    class NeverAnswers(FakeTransport):
+        asked = False
+
+        async def queue_exists(self, name: str) -> bool:
+            type(self).asked = True
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")  # pragma: no cover
+
+    connection = Connection(NeverAnswers(blocked=True))
+
+    report = await asyncio.wait_for(connection.health(), 1.0)
+
+    assert report.status is HealthStatus.UP
+    assert NeverAnswers.asked is False
+
+
+async def test_a_health_check_that_cannot_be_answered_is_bounded_rather_than_hung() -> None:
+    # A readiness endpoint that hangs is worse than one that reports unknown: it
+    # takes the instance out of rotation with no report at all. So the deadline
+    # is inside the library rather than in whatever called it.
+    class Wedged(FakeTransport):
+        async def queue_exists(self, name: str) -> bool:
+            await asyncio.Event().wait()  # never returns, like a blocked broker
+            raise AssertionError("unreachable")  # pragma: no cover
+
+    report = await asyncio.wait_for(Connection(Wedged()).health(timeout=0.05), 2.0)
+
+    assert report.status is HealthStatus.DOWN
+    assert report.detail == "the broker did not answer within 0.05s"
+    assert report.parts["blocked"] is False
+
+
+async def test_a_broker_that_goes_quiet_because_it_blocked_is_still_up() -> None:
+    # The ordinary way a block shows itself: the notification and the silence
+    # arrive together, and the round trip started a moment earlier never comes
+    # back. So the state is asked again before the timeout is called a failure.
+    class BlocksWhileAsked(FakeTransport):
+        async def queue_exists(self, name: str) -> bool:
+            self.blocked = True
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")  # pragma: no cover
+
+    report = await asyncio.wait_for(Connection(BlocksWhileAsked()).health(timeout=0.05), 2.0)
+
+    assert report.status is HealthStatus.UP
+    assert report.parts["blocked"] is True
+
+
+async def test_a_blocked_broker_survives_being_aggregated() -> None:
+    # The flaw worth checking for: a careful answer — up, for a broker applying
+    # back pressure — folded into a combined report as degraded or down by
+    # something that took the worst of what it was given. The connection's own
+    # deadline is shorter than the aggregate's so that this report, and not the
+    # aggregate giving up, is what an operator reads.
+    class BlockedAndSilent(FakeTransport):
+        async def queue_exists(self, name: str) -> bool:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")  # pragma: no cover
+
+    connection = Connection(BlockedAndSilent(blocked=True))
+
+    report = await aggregate_health(
+        BrokerHealth(connection, timeout=0.05), _Always("database"), timeout=1.0
+    )
+
+    assert report.status is HealthStatus.UP
+    assert report.parts["broker"].status is HealthStatus.UP
+    assert report.parts["broker"].parts["blocked"] is True
+
+
+async def test_a_stalled_consumer_is_still_degraded_while_the_broker_is_blocked() -> None:
+    # The block is the broker's problem and clears with the alarm. A consumer of
+    # ours that has stopped reading is ours, outlives it, and is not something to
+    # stop reporting because something else is also wrong.
+    async def handler(message: Message) -> Ack:
+        return accept()
+
+    async with running(handler) as (transport, _, connection):
+        consumer = connection.consumers[0]
+        for _ in consumer._workers:
+            consumer._work.put_nowait(None)
+        await asyncio.gather(*consumer._workers)
+        transport.blocked = True
+
+        report = await connection.health()
+
+    assert report.status is HealthStatus.DEGRADED
+    assert report.parts["blocked"] is True
     assert report.parts["stalled"] == [QUEUE]
 
 

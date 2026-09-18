@@ -702,6 +702,8 @@ report = await mq.health()
 report.status     # HealthStatus.UP / DOWN / DEGRADED
 report.healthy    # what a readiness probe should return; degraded passes
 
+mq.blocked        # True / False / None — has the broker blocked this connection
+
 # Combined with the application's own checks, worst wins:
 report = await aggregate_health(BrokerHealth(mq), my_database_check)
 ```
@@ -719,9 +721,25 @@ and nothing is reading — indistinguishable from a quiet queue, and reported as
 certainly stall the same way, so it is worth an alert and not worth taking out
 of rotation.
 
+**A blocked connection is up, with the reason.** RabbitMQ blocks a connection
+when it is low on disk or memory and stops reading its socket until the alarm
+clears. Reporting that down gets the instance restarted into the same blocked
+broker, having thrown away whatever it was holding, so `parts["blocked"]` carries
+the state and the status stays up — the same call Java's `AceMqHealthIndicator`
+makes. `blocked` is `None` when the transport could not be asked at all, which is
+a different fact from `False`. On RabbitMQ the reason is absent: the broker sends
+one and aio-pika does not keep it, and an invented reason would read exactly like
+one it sent.
+
+`health()` bounds its own probe — three seconds by default — because a blocked
+broker is exactly the state in which a round trip does not come back, and a
+health check that hangs takes the readiness endpoint down with it.
+
 `aggregate_health` runs checks at once rather than in turn, under a deadline, so
 one that hangs cannot hang the probe with it — and a probe that hangs is a pod
-that never comes back.
+that never comes back. The connection's own deadline is the shorter of the two,
+so a broker that has gone quiet is described by the check that looked rather than
+by the aggregate giving up on it.
 
 ### Tracing
 

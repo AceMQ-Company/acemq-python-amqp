@@ -152,10 +152,13 @@ That is the point of the protocol being where it is — a fake exercises the sam
 code path RabbitMQ does, rather than a second implementation of it that can
 drift.
 
-Two optional protocols sit beside it and are worth implementing when a test
-needs them: `MessageSource` (`pull`, which replay reads through) and
-`QueueAdmin` (`queue_exists`, `message_count`, `delete_queue`, which the health
-check and the queue questions go through).
+Three optional protocols sit beside it and are worth implementing when a test
+needs them: `MessageSource` (`pull`, which replay reads through), `QueueAdmin`
+(`queue_exists`, `message_count`, `delete_queue`, which the health check and the
+queue questions go through) and `BlockedState` (`blocked`, `blocked_reason`,
+which is how a health report says the broker is applying back pressure). The
+fake in this repository implements all three; its `blocked` is a plain attribute
+a test sets to rehearse a disk or memory alarm without one.
 
 ## It is not kinder than a broker
 

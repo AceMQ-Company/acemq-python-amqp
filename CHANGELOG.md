@@ -8,6 +8,68 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Added
+
+- **A supported way to ask whether the broker has blocked the connection.**
+  `Connection.blocked` and `Connection.blocked_reason`, backed by a new
+  `BlockedState` protocol beside `MessageSource` and `QueueAdmin`, which the
+  RabbitMQ transport implements. Until now there was nothing: an integration
+  wanting the state had to walk `transport → connection → transport →
+  connection` looking for a private aiormq attribute by name, which is a path
+  that breaks on a client release and takes a health check's ability to tell
+  back pressure from a wedged socket with it. `blocked` answers `True`, `False`
+  or `None`, and `None` is not `False`: it means the question could not be asked
+  — a transport that does not implement the protocol, a connection that has been
+  closed — and a report saying `blocked: null` is more use in an incident than
+  one saying `false` because nobody looked. It is the shape Java already has as
+  `isBlocked()`/`blockedReason()`, .NET as `IsBlocked`/`BlockedReason` and Go as
+  `BlockedReason()`.
+
+  **The reason is `None` on RabbitMQ, and that is not an oversight.** RabbitMQ
+  sends a reason with `connection.blocked` — "low on disk space", usually — and
+  aiormq's handler logs it and drops it rather than keeping it on the
+  connection. Nor can it be caught as it arrives: the handlers for channel zero
+  are bound into a local table when the connection's reader task starts, before
+  `connect()` has returned to anything that might add one, and neither aiormq
+  nor aio-pika offers a callback of its own. So the boolean is honest and the
+  reason is absent. An invented one would read exactly like a reason the broker
+  sent, and the property is there for the client release that starts keeping it.
+
+### Changed
+
+- **A blocked connection is reported up, with the reason, instead of being
+  probed forever.** `Connection.health()` now reads the blocked state before it
+  asks the broker anything, carries it in `parts["blocked"]`, and reports
+  `UP` for it: a blocked connection is the broker protecting itself from a disk
+  or memory alarm, and an application that fails its own readiness check for it
+  is one an orchestrator restarts into the same blocked broker, having thrown
+  away whatever it was holding. That is the call Java's `AceMqHealthIndicator`
+  and Go's check already make. A consumer of this process that has stopped
+  reading is still `DEGRADED` while blocked, because that is this instance's own
+  failure, it outlives the alarm, and a block is not a reason to stop saying so.
+
+  Nothing in between is allowed a cruder opinion than the connection's, which is
+  the flaw worth naming: a built-in check that answered "blocked is degraded"
+  would be folded into `aggregate_health`'s worst-of rule and would quietly
+  overrule a report that had already decided otherwise. `BrokerHealth` passes the
+  connection's own answer through and takes a `timeout` that defaults to three
+  seconds against the aggregate's five, so a broker that has gone quiet is
+  described by the check that looked rather than by the aggregate giving up on
+  it.
+
+- **`Connection.health()` has a deadline.** Its own `HealthCheck` docstring says
+  a check must not hang, and it could: the probe is a `queue_exists` round trip,
+  and a blocked broker stops reading the socket, so the probe never returns and
+  takes the readiness endpoint down with it. Confirmed against a broker under a
+  real memory alarm, where a bare `queue_exists` had still not answered after two
+  seconds. It now takes a `timeout`, three seconds by default. A probe that runs
+  out of time is *abandoned* rather than awaited, because cancelling a request to
+  a broker that is not reading means waiting for a cancellation that travels the
+  same way the request did; and the blocked state is read again before the
+  silence is called a failure, since the notification and the silence arrive
+  together. A blocked broker is not probed at all — the answer is already known
+  and the round trip would spend the whole deadline arriving at it.
+
 ## [0.6.0] - 2026-09-17
 
 ### Added
