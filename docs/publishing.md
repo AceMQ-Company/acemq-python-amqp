@@ -157,9 +157,12 @@ were:
 
 The counts are the point. A batch that half succeeded is the ordinary outcome of
 a broker problem partway through, and a caller told only "it failed" resends
-messages that already arrived. `__cause__` carries the first underlying failure
-*in payload order* — not the first one the broker answered — for callers that
-need to tell a rejection from a timeout:
+messages that already arrived. The named failure is named rather than printed:
+a failure with nothing in its message — the `CancelledError` every send gets when
+the connection closes underneath the batch is the common one — is reported by its
+class, so the sentence never ends `The first failure was: ` and stops. `__cause__`
+carries the first underlying failure *in payload order* — not the first one the
+broker answered — for callers that need to tell a rejection from a timeout:
 
 ```python
 try:

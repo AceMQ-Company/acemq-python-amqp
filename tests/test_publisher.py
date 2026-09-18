@@ -228,6 +228,10 @@ class HoldingTransport(FakeTransport):
         """Fails one message's confirm."""
         self.confirms[index].set_exception(RuntimeError(reason))
 
+    def cancel(self, index: int) -> None:
+        """Abandons one message's confirm, the way a closing connection does."""
+        self.confirms[index].cancel()
+
 
 @dataclass
 class RefusingTransport(FakeTransport):
@@ -335,6 +339,31 @@ async def test_when_two_messages_fail_the_one_reported_is_the_first_in_payload_o
         "2 of 4 messages were not confirmed; 2 were. The first failure was: answered second"
     )
     assert str(failure.value.__cause__) == "answered second"
+
+
+async def test_a_batch_that_was_cancelled_names_the_failure_rather_than_trailing_off() -> None:
+    # The connection closing underneath a batch cancels every send, and a
+    # CancelledError has nothing in its message. Printed straight into the
+    # sentence it leaves "The first failure was: " with nothing after it — a
+    # report promising an explanation and stopping, which reads as a truncated
+    # log line rather than as the answer it is.
+    transport = HoldingTransport()
+    connection = Connection(transport)
+    publisher = connection.publisher(routing_key="orders.new")
+
+    batch = asyncio.create_task(publisher.send_all([{"id": str(n)} for n in range(2)]))
+    await transport.wait_until_sent(2)
+    transport.cancel(0)
+    transport.confirm(1)
+
+    with pytest.raises(PublishError) as failure:
+        await batch
+
+    assert str(failure.value) == (
+        "1 of 2 messages were not confirmed; 1 were. The first failure was: CancelledError"
+    )
+    assert not str(failure.value).endswith(": ")
+    assert isinstance(failure.value.__cause__, asyncio.CancelledError)
 
 
 async def test_a_batch_puts_no_more_on_the_wire_than_the_connection_allows() -> None:

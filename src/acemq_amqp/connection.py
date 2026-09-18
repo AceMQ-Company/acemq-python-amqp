@@ -330,6 +330,14 @@ class Publisher:
                 results.append(outcome)
 
         if first_failure is not None:
+            # Named rather than printed. A failure with nothing in its message —
+            # the CancelledError every task gets when the connection closes
+            # underneath the batch is the common one — renders as an empty
+            # string, and the sentence then ends "The first failure was: " and
+            # stops, promising an explanation it does not give. The class name
+            # is not much, but it is the difference between "the sends were
+            # cancelled" and nothing at all.
+            described = str(first_failure) or type(first_failure).__name__
             # The counts matter. A batch that half succeeded is the ordinary
             # outcome of a broker problem partway through, and this sentence is
             # word for word the one Java and .NET raise, so that an operator
@@ -338,10 +346,10 @@ class Publisher:
                 "",
                 self._exchange,
                 self._routing_key,
-                str(first_failure),
+                described,
                 summary=(
                     f"{failed} of {len(batch)} messages were not confirmed;"
-                    f" {len(results)} were. The first failure was: {first_failure}"
+                    f" {len(results)} were. The first failure was: {described}"
                 ),
             ) from first_failure
         return results

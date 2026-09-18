@@ -83,6 +83,15 @@ While the version is `0.x` the public API may change in any release.
   one cancelled. A worker that failed on its own is still reported: the guard is
   on cancellation and nothing else.
 
+- **`send_all`'s `PublishError` no longer ends with a dangling "The first failure
+  was: ".** The sentence interpolated the first failure directly, and a failure
+  with nothing in its message renders as an empty string — which is exactly what
+  the `CancelledError` every send gets when the connection closes underneath the
+  batch renders as. The result promised an explanation and stopped. The failure
+  is now named by its class when it has no message of its own, so the sentence
+  reads `The first failure was: CancelledError`; a failure that has a message is
+  unchanged, and still word for word what Java and .NET raise.
+
 ## [0.6.0] - 2026-09-17
 
 ### Added
