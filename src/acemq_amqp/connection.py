@@ -138,11 +138,19 @@ DEFAULT_HEALTH_TIMEOUT = 3.0
 #: one an orchestrator restarts into the same blocked broker, having thrown away
 #: whatever it was holding. Java's ``AceMqHealthIndicator`` and Go's health check
 #: make the same call for the same reason.
-BLOCKED_DETAIL = (
-    "the broker has blocked this connection, usually because it is low on disk or "
-    "memory. Reported up on purpose: restarting into a broker that is still blocked "
-    "helps nobody, and this instance is still serving"
-)
+#:
+#: **This is a fixed prefix, and it is the same sentence in every AceMQ
+#: library** — Go's ``blockedPrefix`` and Ruby's ``Health::BLOCKED`` are these
+#: exact words. An operator writes one alert rule that matches a blocked broker
+#: whatever language the service is in, so the wording is a contract rather than
+#: a phrasing. Anything the broker itself said is appended after a colon; this
+#: library cannot recover that reason (see :attr:`Connection.blocked_reason`),
+#: so on RabbitMQ the detail is the prefix alone.
+#:
+#: The reasoning above belongs in the documentation, not in the line somebody
+#: reads at three in the morning, which is why it is a comment here and not part
+#: of the string.
+BLOCKED_DETAIL = "the broker has blocked this connection; publishing is paused"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1421,8 +1429,14 @@ class Connection:
 
     @staticmethod
     def _blocked_detail(reason: str | None) -> str:
-        """The blocked sentence, with the broker's reason when there is one."""
-        return BLOCKED_DETAIL if not reason else f"{BLOCKED_DETAIL} ({reason})"
+        """The blocked sentence, with the broker's reason when there is one.
+
+        The reason follows a colon, which is how Go and Ruby write it too —
+        ``blockedPrefix + ": " + reason`` and ``"#{BLOCKED}: #{reason}"``. One
+        shape across the family means one alert rule reads a blocked broker
+        whatever language the service happens to be written in.
+        """
+        return BLOCKED_DETAIL if not reason else f"{BLOCKED_DETAIL}: {reason}"
 
     async def _probe_within(self, name: str, timeout: float) -> None:
         """One round trip to the broker, given ``timeout`` to come back.
