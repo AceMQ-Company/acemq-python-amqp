@@ -1,6 +1,6 @@
 # Verify a tag, build the distributions, and add them to the AceMQ package index.
 #
-# Triggered by a tag:  git tag v0.6.0 && git push origin v0.6.0
+# Triggered by a tag:  git tag v0.7.0 && git push origin v0.7.0
 #
 # # Where this publishes, and why not PyPI
 #
@@ -84,15 +84,15 @@ jobs:
             echo "::error::not a release version: '$VERSION'"
             exit 1
           fi
-          # The line stays on 0.6.x until that is deliberately changed. Without
-          # this a mistyped tag ships a 0.7.0 or a 1.0.0, and a version on PyPI
+          # The line stays on 0.7.x until that is deliberately changed. Without
+          # this a mistyped tag ships a 0.8.0 or a 1.0.0, and a version on PyPI
           # cannot be withdrawn -- yanking hides it from resolution and leaves
           # every lockfile that already names it working. Lift this when the
           # line moves on.
           case "$VERSION" in
-            0.6.*) ;;
+            0.7.*) ;;
             *)
-              echo "::error::this library releases 0.6.x only; '$VERSION' needs the guard in release.yml lifted first"
+              echo "::error::this library releases 0.7.x only; '$VERSION' needs the guard in release.yml lifted first"
               exit 1
               ;;
           esac

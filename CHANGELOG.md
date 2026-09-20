@@ -8,29 +8,7 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
-### Changed
-
-- **The health detail for a blocked connection is now the same sentence every
-  AceMQ library writes.** It was *"the broker has blocked this connection,
-  usually because it is low on disk or memory. Reported up on purpose…"* and is
-  now `the broker has blocked this connection; publishing is paused` — Go's
-  `blockedPrefix` and Ruby's `Health::BLOCKED`, word for word. The broker's own
-  reason follows a colon rather than sitting in parentheses, which is also what
-  those two do.
-
-  **An alert rule matching the old sentence stops matching.** That is the whole
-  point of changing it: an operator running services in more than one language
-  had to write one rule per language for a condition that is identical in all of
-  them, and would have gone on doing so. One sentence, one rule.
-
-  The justification that used to be inside the string — why a blocked connection
-  is reported up rather than down — has moved to the comment on
-  `BLOCKED_DETAIL` and to `docs/observability.md`. It is a good argument and it
-  does not belong in the line somebody reads at three in the morning.
-
-  On RabbitMQ the detail is the prefix alone, because this library cannot
-  recover the broker's reason: aiormq logs it and keeps only a flag. See
-  `Connection.blocked_reason`.
+## [0.7.0] - 2026-09-18
 
 ### Added
 
@@ -60,6 +38,28 @@ While the version is `0.x` the public API may change in any release.
   sent, and the property is there for the client release that starts keeping it.
 
 ### Changed
+
+- **The health detail for a blocked connection is now the same sentence every
+  AceMQ library writes.** It was *"the broker has blocked this connection,
+  usually because it is low on disk or memory. Reported up on purpose…"* and is
+  now `the broker has blocked this connection; publishing is paused` — Go's
+  `blockedPrefix` and Ruby's `Health::BLOCKED`, word for word. The broker's own
+  reason follows a colon rather than sitting in parentheses, which is also what
+  those two do.
+
+  **An alert rule matching the old sentence stops matching.** That is the whole
+  point of changing it: an operator running services in more than one language
+  had to write one rule per language for a condition that is identical in all of
+  them, and would have gone on doing so. One sentence, one rule.
+
+  The justification that used to be inside the string — why a blocked connection
+  is reported up rather than down — has moved to the comment on
+  `BLOCKED_DETAIL` and to `docs/observability.md`. It is a good argument and it
+  does not belong in the line somebody reads at three in the morning.
+
+  On RabbitMQ the detail is the prefix alone, because this library cannot
+  recover the broker's reason: aiormq logs it and keeps only a flag. See
+  `Connection.blocked_reason`.
 
 - **A blocked connection is reported up, with the reason, instead of being
   probed forever.** `Connection.health()` now reads the blocked state before it
