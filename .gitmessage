@@ -1,0 +1,9 @@
+# <type>(<scope>): <subject>          # 50 chars, imperative mood
+#
+# Types: feat fix perf refactor docs test build ci chore revert
+#
+# Body: what changed and why. Wrap at 72 columns.
+#
+# Footer: "Closes #123" / "BREAKING CHANGE: ..."
+#
+# Do not add Co-Authored-By or tool-generated trailers.

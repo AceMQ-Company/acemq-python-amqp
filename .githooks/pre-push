@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Last line of defence before anything leaves the machine.
+set -euo pipefail
+range="origin/$(git rev-parse --abbrev-ref HEAD)..HEAD"
+git rev-parse --verify -q "${range%%..*}" >/dev/null || range="HEAD"
+if git log --format='%B%n%an%n%ae%n%cn%n%ce' "$range" \
+   | grep -qiE 'claude|anthropic|co-authored-by[[:space:]]*:|\bgenerated with\b|🤖'; then
+  echo "ERROR: AI attribution found in commits about to be pushed." >&2
+  exit 1
+fi

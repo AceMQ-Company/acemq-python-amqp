@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Reject AI-assistant attribution in commit messages.
+set -euo pipefail
+if grep -qiE 'claude|anthropic|co-authored-by[[:space:]]*:|\bgenerated with\b|🤖' "$1"; then
+  echo "ERROR: AI attribution is not permitted in commit messages." >&2
+  grep -inE 'claude|anthropic|co-authored-by[[:space:]]*:|\bgenerated with\b|🤖' "$1" >&2
+  exit 1
+fi
