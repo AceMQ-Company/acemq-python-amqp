@@ -76,8 +76,8 @@ jobs:
         run: pip install -e ".[dev]"
 
       - name: Certificates
-        # Generated with the library's own devcerts, which is the thing a reader
-        # is told to use, so this exercises it as well as depending on it.
+        # Written by the library's own devcerts, which is the thing a reader is
+        # told to use, so this exercises it as well as depending on it.
         #
         # The second authority cannot come from devcerts: it stamps
         # "ACEMQ DEVELOPMENT ONLY - DO NOT TRUST" into every subject, and the
