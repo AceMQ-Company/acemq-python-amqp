@@ -10,7 +10,7 @@
 # Policy: docs/07-repositories-and-governance.md (ADR-010).
 set -euo pipefail
 
-PATTERN='claude|anthropic|co-authored-by[[:space:]]*:|generated with|assisted by (an )?ai|ai-generated|🤖'
+PATTERN='claude|anthropic|co-authored-by[[:space:]]*:|\bgenerated with\b|assisted by (an )?ai|ai-generated|🤖'
 TARGET="."; RANGE=""; MSG_FILE=""; found=0
 
 while [ $# -gt 0 ]; do
