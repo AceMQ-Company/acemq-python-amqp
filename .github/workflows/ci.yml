@@ -57,13 +57,12 @@ jobs:
   integration:
     name: against a real broker
     runs-on: ubuntu-latest
-    services:
-      broker:
-        image: rabbitmq:4-alpine
-        ports: ['5672:5672']
-        options: >-
-          --health-cmd "rabbitmq-diagnostics -q ping"
-          --health-interval 10s --health-timeout 5s --health-retries 10
+    # No service container. The brokers are started by a step instead, because
+    # two of the three things this job needs cannot be expressed as one:
+    # certificates do not exist until a step has generated them, and a service
+    # container's name is generated rather than chosen, which meant rabbitmqctl
+    # had to be found by `docker ps --filter ancestor=rabbitmq:4-alpine | head -1`
+    # -- fine with one broker on the machine and silently wrong with three.
 
     steps:
       - uses: actions/checkout@v4
@@ -76,17 +75,97 @@ jobs:
       - name: Install
         run: pip install -e ".[dev]"
 
-      - name: Find the broker container
-        # The blocked-connection test has to raise a real memory alarm, which
-        # takes rabbitmqctl: there is no way to make a broker block a connection
-        # from the client side. A service container's name is generated rather
-        # than chosen, so it is looked up by image and handed over as the command
-        # that fronts rabbitmqctl. Without this the test skips.
+      - name: Certificates
+        # Generated with the library's own devcerts, which is the thing a reader
+        # is told to use, so this exercises it as well as depending on it.
+        #
+        # The second authority cannot come from devcerts: it stamps
+        # "ACEMQ DEVELOPMENT ONLY - DO NOT TRUST" into every subject, and the
+        # library refuses those before it looks at who signed anything. A
+        # "wrong authority" built that way is rejected for being a development
+        # certificate, so the test passes while asserting nothing about
+        # authorities at all.
         run: |
-          id="$(docker ps -q --filter ancestor=rabbitmq:4-alpine | head -1)"
-          echo "ACEMQ_TEST_BROKER_CTL=docker exec $id rabbitmqctl" >> "$GITHUB_ENV"
+          python -m acemq_amqp.devcerts --directory certs --broker localhost --days 1
+          python tests/support/foreign_authority.py certs
+          # The broker runs as another user inside the container, and reports a
+          # key it cannot read as a listener that never started.
+          chmod 644 certs/*.key
+          # One broker serves plaintext and TLS from the generated config. Mutual
+          # TLS is the same config with one line changed, which is a second
+          # broker rather than a second config file for the same one.
+          sed 's/^ssl_options.fail_if_no_peer_cert.*/ssl_options.fail_if_no_peer_cert = true/' \
+            certs/rabbitmq.conf > certs/rabbitmq-mutual.conf
+          grep -q 'fail_if_no_peer_cert = true' certs/rabbitmq-mutual.conf
 
-      - name: Test against the broker
+      - name: Start the brokers
+        run: |
+          docker run -d --name acemq-python-it -e HOME=/tmp \
+            -p 5672:5672 -p 5671:5671 \
+            -v "$PWD/certs:/certs:ro" \
+            -v "$PWD/certs/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro" \
+            rabbitmq:4-alpine
+          docker run -d --name acemq-python-mtls -e HOME=/tmp \
+            -p 5673:5671 \
+            -v "$PWD/certs:/certs:ro" \
+            -v "$PWD/certs/rabbitmq-mutual.conf:/etc/rabbitmq/rabbitmq.conf:ro" \
+            rabbitmq:4-alpine
+          # The broker's own word for it. A TCP connect is not enough: Docker
+          # publishes the port as soon as the container starts, so a connection
+          # succeeds and is immediately reset for several seconds before
+          # RabbitMQ is listening. --since bounds the check to this boot.
+          started=$(date -u +%Y-%m-%dT%H:%M:%S)
+          for container in acemq-python-it acemq-python-mtls; do
+            ready=""
+            for _ in $(seq 1 60); do
+              if docker logs --since "$started" "$container" 2>&1 | grep -q "Server startup complete"; then
+                ready=yes; echo "$container is up"; break
+              fi
+              sleep 3
+            done
+            if [ -z "$ready" ]; then
+              echo "::error::$container never became ready"
+              docker logs "$container"
+              exit 1
+            fi
+          done
+
+      - name: Test against the brokers
         env:
           ACEMQ_TEST_BROKER: amqp://guest:guest@localhost:5672/
-        run: pytest -m integration -q -rs
+          ACEMQ_TEST_TLS_BROKER: amqps://guest:guest@localhost:5671/
+          ACEMQ_TEST_TLS_MUTUAL_BROKER: amqps://guest:guest@localhost:5673/
+          # The blocked-connection test has to raise a real memory alarm, which
+          # takes rabbitmqctl: there is no way to make a broker block a
+          # connection from the client side.
+          #
+          # HOME is the server's, not the container's. The node writes its Erlang
+          # cookie to /var/lib/rabbitmq, and rabbitmqctl started with the
+          # container's HOME=/tmp reads a different one and cannot authenticate
+          # to the node beside it -- which it reports as a cookie hash mismatch,
+          # not as a configuration mistake.
+          ACEMQ_TEST_BROKER_CTL: docker exec -e HOME=/var/lib/rabbitmq acemq-python-it rabbitmqctl
+        run: |
+          set -o pipefail
+          ACEMQ_TEST_TLS_CERTIFICATES="$PWD/certs" \
+            pytest -m integration -q -rs 2>&1 | tee integration.log
+
+      - name: Check nothing skipped
+        # Every broker test skips when its variables are unset, and a skip reads
+        # as success. Seven TLS tests skipped on every run for as long as this
+        # job has existed, because nothing here started a TLS broker and nothing
+        # noticed that nothing had. The other libraries all carry this guard;
+        # this one did not.
+        run: |
+          if grep -q "^SKIPPED" integration.log; then
+            echo "::error::an integration test skipped while the brokers were running"
+            grep "^SKIPPED" integration.log
+            exit 1
+          fi
+          echo "no integration test skipped"
+
+      - name: What the brokers said, if anything went wrong
+        if: failure()
+        run: |
+          docker logs acemq-python-it
+          docker logs acemq-python-mtls || true

@@ -176,13 +176,11 @@ jobs:
     # A release runs the integration suite. It is the one moment where waiting
     # for the slow tests is obviously worth it: this is the artifact people
     # depend on.
-    services:
-      broker:
-        image: rabbitmq:4-alpine
-        ports: ['5672:5672']
-        options: >-
-          --health-cmd "rabbitmq-diagnostics -q ping"
-          --health-interval 10s --health-timeout 5s --health-retries 10
+    #
+    # The brokers are started by a step rather than declared as services, for
+    # the same reasons as in ci.yml: certificates do not exist until a step has
+    # written them, and a service container's name is generated rather than
+    # chosen, which made rabbitmqctl something to go looking for.
 
     steps:
       - uses: actions/checkout@v4
@@ -195,31 +193,76 @@ jobs:
       - name: Install
         run: pip install -e ".[dev]"
 
-      - name: Find the broker container
-        # The blocked-connection test has to raise a real memory alarm, which
-        # takes rabbitmqctl: there is no way to make a broker block a connection
-        # from the client side. A service container's name is generated rather
-        # than chosen, so it is looked up by image and handed over as the command
-        # that fronts rabbitmqctl. Without this the test skips — and a release
-        # should not be the run where it quietly does.
+      - name: Certificates
         run: |
-          id="$(docker ps -q --filter ancestor=rabbitmq:4-alpine | head -1)"
-          echo "ACEMQ_TEST_BROKER_CTL=docker exec $id rabbitmqctl" >> "$GITHUB_ENV"
+          python -m acemq_amqp.devcerts --directory certs --broker localhost --days 1
+          # Not from devcerts: it marks everything it writes as a development
+          # certificate, and the library refuses those before it considers who
+          # signed them, so a "wrong authority" from devcerts would be refused
+          # for the wrong reason and the test would prove nothing.
+          python tests/support/foreign_authority.py certs
+          chmod 644 certs/*.key
+          sed 's/^ssl_options.fail_if_no_peer_cert.*/ssl_options.fail_if_no_peer_cert = true/' \
+            certs/rabbitmq.conf > certs/rabbitmq-mutual.conf
+          grep -q 'fail_if_no_peer_cert = true' certs/rabbitmq-mutual.conf
 
-      - name: Test against the broker
+      - name: Start the brokers
+        run: |
+          docker run -d --name acemq-python-it -e HOME=/tmp \
+            -p 5672:5672 -p 5671:5671 \
+            -v "$PWD/certs:/certs:ro" \
+            -v "$PWD/certs/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro" \
+            rabbitmq:4-alpine
+          docker run -d --name acemq-python-mtls -e HOME=/tmp \
+            -p 5673:5671 \
+            -v "$PWD/certs:/certs:ro" \
+            -v "$PWD/certs/rabbitmq-mutual.conf:/etc/rabbitmq/rabbitmq.conf:ro" \
+            rabbitmq:4-alpine
+          started=$(date -u +%Y-%m-%dT%H:%M:%S)
+          for container in acemq-python-it acemq-python-mtls; do
+            ready=""
+            for _ in $(seq 1 60); do
+              if docker logs --since "$started" "$container" 2>&1 | grep -q "Server startup complete"; then
+                ready=yes; echo "$container is up"; break
+              fi
+              sleep 3
+            done
+            if [ -z "$ready" ]; then
+              echo "::error::$container never became ready"
+              docker logs "$container"
+              exit 1
+            fi
+          done
+
+      - name: Test against the brokers
         env:
           ACEMQ_TEST_BROKER: amqp://guest:guest@localhost:5672/
+          ACEMQ_TEST_TLS_BROKER: amqps://guest:guest@localhost:5671/
+          ACEMQ_TEST_TLS_MUTUAL_BROKER: amqps://guest:guest@localhost:5673/
+          # HOME is the server's rather than the container's: the node wrote its
+          # Erlang cookie to /var/lib/rabbitmq, and rabbitmqctl started with the
+          # container's HOME=/tmp cannot authenticate to the node beside it.
+          ACEMQ_TEST_BROKER_CTL: docker exec -e HOME=/var/lib/rabbitmq acemq-python-it rabbitmqctl
         run: |
           set -o pipefail
-          pytest -m integration -q -rs 2>&1 | tee "$RUNNER_TEMP/broker-tests.log"
+          ACEMQ_TEST_TLS_CERTIFICATES="$PWD/certs" \
+            pytest -m integration -q -rs 2>&1 | tee "$RUNNER_TEMP/broker-tests.log"
 
       - name: Check the broker tests really ran
         # A suite that skipped everything reports the same green as one that
-        # passed everything. The TLS tests skip by design without a TLS broker;
-        # anything else skipping during a release is a test that was meant to
-        # check this artifact and did not.
+        # passed everything.
+        #
+        # Nothing may skip now. The TLS tests used to be excused here because no
+        # job started a TLS broker; both jobs do, so a skip means a broker that
+        # did not come up or a variable that stopped being passed, and a release
+        # is the worst run to discover either on.
         run: |
           log="$RUNNER_TEMP/broker-tests.log"
+          if grep -q "^SKIPPED" "$log"; then
+            echo "::error::an integration test skipped during a release"
+            grep "^SKIPPED" "$log"
+            exit 1
+          fi
           # Not `sed 's/.*[^0-9]\([0-9]\+\) passed.*/\1/p'`, which is what this
           # was and which never matched anything: it requires a non-digit before
           # the count, and pytest -q opens its summary with the number, at
@@ -227,11 +270,17 @@ jobs:
           # the release on it.
           passed=$(grep -oE '[0-9]+ passed' "$log" | head -1 | grep -oE '[0-9]+')
           passed=${passed:-0}
-          if [ "$passed" -lt 20 ]; then
-            echo "::error::only $passed broker tests passed; expected at least 20"
+          if [ "$passed" -lt 55 ]; then
+            echo "::error::only $passed broker tests passed; expected at least 55"
             exit 1
           fi
           echo "$passed broker tests passed"
+
+      - name: What the brokers said, if anything went wrong
+        if: failure()
+        run: |
+          docker logs acemq-python-it
+          docker logs acemq-python-mtls || true
 
   publish:
     needs: [verify, integration]

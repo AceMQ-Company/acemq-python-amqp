@@ -17,3 +17,10 @@ build/
 # and published from the workflow. Committing it would give the repository two
 # copies of every page, free to disagree.
 site/
+
+# Development certificates, written by acemq_amqp.devcerts and by the
+# integration job. Private keys, and never anything a repository should carry.
+# acemq-go-amqp-examples ignores the same three patterns for the same reason.
+/certs/
+*.crt
+*.key
