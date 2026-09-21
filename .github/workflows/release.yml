@@ -218,7 +218,7 @@ jobs:
             -v "$PWD/certs:/certs:ro" \
             -v "$PWD/certs/rabbitmq-mutual.conf:/etc/rabbitmq/rabbitmq.conf:ro" \
             rabbitmq:4-alpine
-          started=$(date -u +%Y-%m-%dT%H:%M:%S)
+          started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           for container in acemq-python-it acemq-python-mtls; do
             ready=""
             for _ in $(seq 1 60); do

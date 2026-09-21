@@ -114,7 +114,7 @@ jobs:
           # publishes the port as soon as the container starts, so a connection
           # succeeds and is immediately reset for several seconds before
           # RabbitMQ is listening. --since bounds the check to this boot.
-          started=$(date -u +%Y-%m-%dT%H:%M:%S)
+          started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           for container in acemq-python-it acemq-python-mtls; do
             ready=""
             for _ in $(seq 1 60); do
