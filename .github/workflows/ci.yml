@@ -169,3 +169,188 @@ jobs:
         run: |
           docker logs acemq-python-it
           docker logs acemq-python-mtls || true
+
+  # The same integration suite again, against the previous major release.
+  # "Works on RabbitMQ 3.13" was a claim nothing here checked: every broker this
+  # repository has ever started is rabbitmq:4-alpine, and 3.13 is the release
+  # most production estates are actually running -- the one an upgrade is being
+  # planned away from rather than towards, which is precisely when somebody
+  # needs to know whether the client still behaves.
+  #
+  # The matrix at the top of this file lists Python 3.13, which is an
+  # interpreter and not a broker. The numbers match by coincidence and that
+  # coincidence has already been read as coverage it is not, so: nothing above
+  # this line has ever spoken to a 3.13 broker.
+  #
+  # A job of its own rather than another dimension on that matrix. The matrix
+  # varies the interpreter, which asks whether this code loads and runs; the
+  # broker version asks how the thing on the far end of the socket behaves.
+  # Crossing them would start eight brokers to learn what two runs already say,
+  # and a red cell would not tell you which axis did it. The two jobs also have
+  # different lifetimes: the one above says the library works, this one says it
+  # has not yet dropped the previous major, and the day 3.13 goes out of support
+  # this job gets deleted whole -- a visible diff, where a deleted matrix row is
+  # a one-line change nobody reads.
+  compatibility:
+    name: integration tests on RabbitMQ 3.13
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # The same interpreter the job above uses, so the only thing that
+          # differs between the two runs is the broker. A job that changed both
+          # at once could not say which one a failure belonged to.
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Certificates
+        # Certificates here too, and both TLS brokers, rather than the
+        # plaintext-only shortcut a compatibility job could take. The .NET
+        # library takes that shortcut and writes down why: its TLS tests are
+        # almost entirely assertions about the client's own certificate
+        # verification, which runs before the broker has said a word about its
+        # version and therefore cannot vary with it. Half of that argument holds
+        # here. Three of this repository's seven TLS tests refuse something -- a
+        # development certificate, an authority the system does not vouch for,
+        # an authority that is real and did not sign this broker -- and the
+        # broker's version does not enter into any of them.
+        #
+        # The other four are why this job carries the full setup. Two read the
+        # negotiated protocol version, the agreed cipher and the issuer of the
+        # presented chain straight off the socket, which is a question about the
+        # broker's Erlang and its TLS terminator, and 3.13 ships a different
+        # Erlang from 4.x. The remaining two are the mutual-TLS pair, and they
+        # assert on the broker's own behaviour rather than the client's: that a
+        # client presenting no certificate is turned away, and that a client
+        # presenting one signed by a stranger is turned away as well. Both are
+        # fail_if_no_peer_cert doing its work on the server side. Covering 3.13
+        # over plaintext alone would leave the half most likely to differ across
+        # a broker major untested while still calling itself a compatibility
+        # job.
+        #
+        # There is an arithmetic reason on top of that one. The guard at the end
+        # of this job fails on any skip, and all seven TLS tests skip themselves
+        # when their variables are unset, so a plaintext-only job would have to
+        # either fail outright or carry a guard weaker than the job above -- and
+        # a quietly weakened guard is exactly how those seven tests went unrun
+        # for the life of this workflow.
+        run: |
+          python -m acemq_amqp.devcerts --directory certs --broker localhost --days 1
+          python tests/support/foreign_authority.py certs
+          chmod 644 certs/*.key
+          sed 's/^ssl_options.fail_if_no_peer_cert.*/ssl_options.fail_if_no_peer_cert = true/' \
+            certs/rabbitmq.conf > certs/rabbitmq-mutual.conf
+          grep -q 'fail_if_no_peer_cert = true' certs/rabbitmq-mutual.conf
+
+      - name: Start the 3.13 brokers
+        # rabbitmq:3.13-management, the tag the Java and Ruby compatibility jobs
+        # pin, so that "3.13" names one broker across the five libraries rather
+        # than whichever 3.13 build each repository reached for. Nothing in this
+        # suite talks to the management API; the plugin simply comes with that
+        # tag.
+        #
+        # Started by a step for the same reason the job above starts its own:
+        # the certificates being mounted do not exist until devcerts has written
+        # them, and a service container is pulled and running before any step of
+        # the job has executed.
+        #
+        # Names of their own, different from the job above. Nothing forces that
+        # -- the two jobs are on different runners -- but ACEMQ_TEST_BROKER_CTL
+        # below is a docker exec into a container named here, and a name shared
+        # between two jobs is a line that can be read as reaching into the other
+        # one's broker.
+        run: |
+          docker run -d --name acemq-python-compat -e HOME=/tmp \
+            -p 5672:5672 -p 5671:5671 \
+            -v "$PWD/certs:/certs:ro" \
+            -v "$PWD/certs/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro" \
+            rabbitmq:3.13-management
+          docker run -d --name acemq-python-compat-mtls -e HOME=/tmp \
+            -p 5673:5671 \
+            -v "$PWD/certs:/certs:ro" \
+            -v "$PWD/certs/rabbitmq-mutual.conf:/etc/rabbitmq/rabbitmq.conf:ro" \
+            rabbitmq:3.13-management
+          # The broker's own word for it, as above -- and it matters more here,
+          # because 3.13 boots more slowly than 4.x does and the management
+          # plugin is part of why. The trailing Z on the stamp is not decoration:
+          # docker reads a stamp without it as host-local time, so on any runner
+          # west of UTC --since would hide the very line being waited for.
+          started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          for container in acemq-python-compat acemq-python-compat-mtls; do
+            ready=""
+            for _ in $(seq 1 60); do
+              if docker logs --since "$started" "$container" 2>&1 | grep -q "Server startup complete"; then
+                ready=yes; echo "$container is up"; break
+              fi
+              sleep 3
+            done
+            if [ -z "$ready" ]; then
+              echo "::error::$container never became ready"
+              docker logs "$container"
+              exit 1
+            fi
+          done
+
+      - name: Test against the 3.13 brokers
+        env:
+          ACEMQ_TEST_BROKER: amqp://guest:guest@localhost:5672/
+          ACEMQ_TEST_TLS_BROKER: amqps://guest:guest@localhost:5671/
+          ACEMQ_TEST_TLS_MUTUAL_BROKER: amqps://guest:guest@localhost:5673/
+          # HOME is the server's, for the reason spelled out in the job above:
+          # rabbitmqctl started with the container's HOME=/tmp reads a different
+          # Erlang cookie from the node beside it and reports a cookie hash
+          # mismatch, which on this job of all jobs would read as 3.13 being
+          # incompatible rather than as a path being wrong.
+          ACEMQ_TEST_BROKER_CTL: docker exec -e HOME=/var/lib/rabbitmq acemq-python-compat rabbitmqctl
+        run: |
+          set -o pipefail
+          ACEMQ_TEST_TLS_CERTIFICATES="$PWD/certs" \
+            pytest -m integration -q -rs 2>&1 | tee broker-3.13.log
+
+      - name: Check nothing skipped
+        # The same guard as the job above, and it earns its place more here:
+        # this job's whole claim is "the suite passes against 3.13", so a test
+        # that quietly stopped running would leave that claim resting on a green
+        # tick and nothing else. The obvious way for that to happen is somebody
+        # reaching for a conditional skip the first time a test misbehaves on
+        # the older broker, which is the outcome most worth reporting rather
+        # than hiding.
+        #
+        # The count is checked as well, which the job above does not do, because
+        # a skip guard alone passes a run that tested nothing. The floor is 60,
+        # the same number the 4.x job runs, because it is the same run: sixty on
+        # rabbitmq:3.13-management, sixty on rabbitmq:4-alpine, the same sixty by
+        # name, none skipped and none failing on either. That was measured on a
+        # real 3.13.7 container before this job was written, not assumed from
+        # the other job's number. Keeping the two equal is the point. The day
+        # 3.13 can only manage fifty-nine, the honest answer is to work out
+        # which test that is and write down why, not to lower this line until
+        # the job goes green again.
+        run: |
+          if grep -q "^SKIPPED" broker-3.13.log; then
+            echo "::error::an integration test skipped while the 3.13 brokers were running"
+            grep "^SKIPPED" broker-3.13.log
+            exit 1
+          fi
+          passed=$(grep -oE '[0-9]+ passed' broker-3.13.log | tail -1 | cut -d' ' -f1)
+          if [ -z "$passed" ]; then
+            echo "::error::pytest printed no summary line; the run did not finish"
+            exit 1
+          fi
+          if [ "$passed" -lt 60 ]; then
+            echo "::error::only $passed integration tests ran on RabbitMQ 3.13; this suite has 60"
+            exit 1
+          fi
+          echo "$passed integration tests ran on RabbitMQ 3.13, none skipped"
+
+      - name: What the brokers said, if anything went wrong
+        if: failure()
+        run: |
+          docker logs acemq-python-compat
+          docker logs acemq-python-compat-mtls || true
