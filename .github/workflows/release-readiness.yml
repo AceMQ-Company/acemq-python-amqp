@@ -1,0 +1,77 @@
+# Ask, once a day, whether this repository is ready to release.
+#
+# The preflight is a good check that nobody is obliged to run. It fires on a
+# version tag through the pre-push hook, which is the last possible moment, and
+# it can be run by hand, which means when somebody remembers. Neither answers
+# the question that actually matters between releases: is there something
+# finished here that has not shipped, and if so would it ship cleanly?
+#
+# So this asks on a schedule. It is not a gate — nothing here blocks a merge —
+# and a repository with nothing pending passes quietly. It exists so that
+# "ready but untagged" is visible rather than discovered weeks later, which is
+# how acemq-java-amqp-spring-boot-starter sat on a fix for a library five minor
+# versions old.
+#
+# No token and no cross-repository access: each repository asks about itself,
+# using the same script the hook runs.
+name: release-readiness
+
+on:
+  schedule:
+    - cron: '56 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ready:
+    name: is anything waiting to be released
+    runs-on: ubuntu-latest
+    steps:
+      # Full history: the preflight compares against tags, and a shallow clone
+      # has none of them.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ask the preflight
+        run: |
+          # The newest numbered heading in the changelog is what this repository
+          # says it is releasing next. [Unreleased] is skipped, and so are the
+          # path-prefixed headings Go uses for its nested modules.
+          version=$(grep -oE '^## \[[0-9]+\.[0-9]+\.[0-9]+\]' CHANGELOG.md \
+                    | head -1 | tr -d '#[] ')
+          if [ -z "$version" ]; then
+            echo "no numbered version in CHANGELOG.md, so there is nothing to be ready for"
+            exit 0
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null 2>&1; then
+            echo "$version is already released; nothing is waiting"
+            exit 0
+          fi
+
+          echo "$version is in the changelog and is not tagged. Checking whether it would ship."
+          echo
+          # Whichever directory this repository keeps its scripts in.
+          for candidate in etc/release-preflight.sh scripts/release-preflight.sh; do
+            if [ -x "$candidate" ]; then preflight="$candidate"; break; fi
+          done
+          if [ -z "${preflight:-}" ]; then
+            echo "::warning::no release-preflight.sh in this repository, so readiness cannot be checked"
+            exit 0
+          fi
+
+          # A failure here is a real defect in a release somebody intends to
+          # cut -- a version source that disagrees, a changelog heading with no
+          # date, a previous release never rolled. Better said now than at the
+          # moment somebody is trying to tag.
+          if "$preflight" "$version"; then
+            echo
+            echo "::notice::$version is ready to tag"
+          else
+            echo
+            echo "::error::$version is in the changelog but would not ship cleanly. See above."
+            exit 1
+          fi
