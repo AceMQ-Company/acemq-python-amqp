@@ -8,6 +8,28 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-09-21
+
+### Changed
+
+- **RabbitMQ 3.13 is now tested rather than assumed.** CI runs the integration
+  suite twice on every push, once against 4.x and once against 3.13, each with
+  the same two brokers - one speaking plaintext and TLS, one demanding a client
+  certificate. Nothing in the library changed: the same sixty tests pass on
+  both, including the four that read the negotiated protocol, the cipher and the
+  presented chain off the socket, which is the broker's Erlang and therefore
+  where a change of broker major would surface first. `README.md` now says 3.13
+  or 4.x under Requirements, because a version nothing runs against is a version
+  nobody has checked.
+
+### Fixed
+
+- The broker readiness loop bounded `docker logs` with a `date -u` timestamp and
+  no zone. Docker reads a naked timestamp as host-local, so anywhere west of UTC
+  `--since` hid the very line being waited for and the loop reported a broker
+  that had started normally as one that never came up. It worked in CI only
+  because runners are UTC.
+
 ## [0.7.0] - 2026-09-20
 
 ### Added

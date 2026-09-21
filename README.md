@@ -877,7 +877,8 @@ upsert and is not claimed.
 
 ## Requirements
 
-Python 3.10 or newer, and RabbitMQ for the transport.
+Python 3.10 or newer, and RabbitMQ for the transport — **3.13 or 4.x**. CI runs
+the whole broker suite against both on every push, so neither is an assumption.
 
 ## Development
 
