@@ -62,10 +62,18 @@ SELF_EXCLUDES=(
 # the message scans were not, so "Generated with ..." in a file passed while the
 # identical text in a commit message was caught. The words being forbidden are
 # ordinary English that tools capitalise however they like.
+# Build output and generated material are excluded because a hit there is never
+# something anybody wrote: compiled assemblies embed tool names, and a generated
+# certificate embeds whatever its generator was called. bin, obj, packages and
+# certs were added to five repository copies as each one met the problem, and
+# this master copy never got them -- so reinstalling from here would have
+# silently removed the exclusions those repositories depend on. Kept in step
+# now; change this copy first and redistribute with install-git-hooks.sh.
 tree_hits="$(grep -rIilE "$PATTERN" . \
   --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=target \
   --exclude-dir=build --exclude-dir=vendor --exclude-dir=site \
-  --exclude-dir=.githooks \
+  --exclude-dir=.githooks --exclude-dir=bin --exclude-dir=obj \
+  --exclude-dir=packages --exclude-dir=certs \
   "${SELF_EXCLUDES[@]}" 2>/dev/null || true)"
 
 if [ -n "$tree_hits" ] && [ -f .attribution-guard-ignore ]; then

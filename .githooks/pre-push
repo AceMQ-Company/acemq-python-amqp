@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Last line of defence before anything leaves the machine.
 set -euo pipefail
+
 range="origin/$(git rev-parse --abbrev-ref HEAD)..HEAD"
 git rev-parse --verify -q "${range%%..*}" >/dev/null || range="HEAD"
 if git log --format='%B%n%an%n%ae%n%cn%n%ce' "$range" \
@@ -8,3 +9,36 @@ if git log --format='%B%n%an%n%ae%n%cn%n%ce' "$range" \
   echo "ERROR: AI attribution found in commits about to be pushed." >&2
   exit 1
 fi
+
+# A version tag is the one irreversible thing anyone does here: Go's module
+# proxy caches a version for ever, and the package feeds are public the moment
+# the release job pushes. The checks that would have caught a bad release all
+# existed already -- inside the release workflow, which runs *after* the tag
+# exists and so can only report the damage.
+#
+# This is the last moment they can still prevent it. Refusing a push costs
+# seconds; a spent version number cannot be recovered, and three Go releases
+# were burned discovering exactly that.
+#
+# git feeds pre-push one line per ref on stdin:  <local ref> <local sha> <remote ref> <remote sha>
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+  case "$remote_ref" in
+    refs/tags/v[0-9]*)
+      version="${remote_ref#refs/tags/v}"
+      if [ -x ./scripts/release-preflight.sh ]; then
+        echo "pre-push: checking $version before the tag leaves this machine"
+        if ! ./scripts/release-preflight.sh "$version"; then
+          echo "" >&2
+          echo "ERROR: refusing to push v$version. Fix the above, or pass --no-verify if" >&2
+          echo "you are certain -- but a pushed tag cannot be withdrawn." >&2
+          exit 1
+        fi
+      else
+        # Said out loud rather than passed over. A repository without the script
+        # is one where nothing is checking, and the person pushing should know
+        # that rather than assume the silence means everything is fine.
+        echo "pre-push: no scripts/release-preflight.sh here, so v$version is unchecked" >&2
+      fi
+      ;;
+  esac
+done
