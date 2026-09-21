@@ -44,7 +44,7 @@ esac
 if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null 2>&1; then
   note "v$VERSION already exists locally (expected if you are pushing the tag you just made)"
 fi
-if git ls-remote --exit-code --tags origin "v$VERSION" >/dev/null 2>&1; then
+if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null 2>&1; then
   bad "v$VERSION already exists on the remote; a version is never reissued"
 else
   ok "v$VERSION is not on the remote yet"
@@ -154,7 +154,7 @@ if [ -f go.mod ]; then
     [ -n "$module" ] || continue
     required=$(grep -oE 'github.com/AceMQ-Company/[a-z-]+ v[0-9][^ ]*' "$module/go.mod" 2>/dev/null | awk '{print $2}' | head -1 || true)
     [ "$required" = "v$VERSION" ] || wrong+=("$module wants ${required:-nothing}")
-    git ls-remote --exit-code --tags origin "$module/v$VERSION" >/dev/null 2>&1 || missing+=("$module")
+    git ls-remote --exit-code --tags origin "refs/tags/$module/v$VERSION" >/dev/null 2>&1 || missing+=("$module")
   done <<< "$(find . -mindepth 2 -name go.mod -not -path './.git/*' | sed -e 's|^\./||' -e 's|/go.mod$||' | sort)"
 
   if [ ${#wrong[@]} -gt 0 ]; then
