@@ -350,11 +350,18 @@ jobs:
         # The index is only real if pip can resolve from it. GitHub Pages takes
         # a moment to serve a new commit, so this retries rather than racing the
         # deploy.
+        #
+        # Twenty minutes, not five. Pages usually serves a new commit within
+        # seconds, but on 21 September 2026 the same site took twenty-five
+        # minutes, and a sibling repository's five-minute wait announced a
+        # release that was on its feed and installable as one that had not
+        # finished. The wait costs nothing on a normal day and the whole point
+        # of it is the abnormal one.
         env:
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
           python -m venv "$RUNNER_TEMP/verify"
-          for attempt in $(seq 1 20); do
+          for attempt in $(seq 1 40); do
             if "$RUNNER_TEMP/verify/bin/pip" install --quiet --no-deps \
                  --index-url https://acemq.org/pypi/simple/ \
                  "acemq-amqp==$VERSION" 2>/dev/null; then
@@ -363,9 +370,9 @@ jobs:
               echo "installed acemq-amqp $VERSION from the index"
               exit 0
             fi
-            sleep 15
+            sleep 30
           done
-          echo "::error::the index did not serve acemq-amqp $VERSION within five minutes"
+          echo "::error::the index did not serve acemq-amqp $VERSION within twenty minutes"
           exit 1
 
   # The releases page. The index has been correct for six minor versions while
