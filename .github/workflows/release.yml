@@ -23,10 +23,12 @@
 # rather than a token because a token carries its owner's reach across every
 # repository they can see, and this job needs exactly one.
 #
-# # No notification
+# # Notification
 #
-# This workflow tells nobody. A release that is not on a public index is not
-# news to announce, and the run itself is the record.
+# This workflow sends nothing itself. Its last job creates the GitHub release,
+# and `release-notify.yml` takes it from there — which is the event that
+# workflow was written for and had never once seen, because nothing here
+# created a release for it to hear about.
 name: release
 
 on:
@@ -288,6 +290,11 @@ jobs:
     # short of publishing, which is what makes this workflow safe to try out.
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    outputs:
+      # Whether anything reached the index. False for every failure before the
+      # push, which is most of them. The announce job reads it rather than the
+      # job's result, so a release page can never name a version pip cannot get.
+      published: ${{ steps.push.outputs.published }}
     environment:
       name: pypi-feed
       url: https://acemq.org/pypi/
@@ -318,6 +325,7 @@ jobs:
       # there". Everything before this leaves the index untouched; everything
       # after operates on a version pip can already resolve.
       - name: Commit and push
+        id: push
         working-directory: package-index
         env:
           VERSION: ${{ needs.verify.outputs.version }}
@@ -326,11 +334,17 @@ jobs:
           git config user.email "noreply@acemq.org"
           if [ -z "$(git status --porcelain)" ]; then
             echo "nothing to publish; $VERSION may already be in the index"
+            # Already there, so from pip's point of view this version is
+            # published. Saying otherwise would make a re-run of a good release
+            # look like a release that never happened, and would leave it
+            # without the release page it is owed.
+            echo "published=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           git add -A
           git commit -m "Publish acemq-amqp $VERSION"
           git push origin HEAD
+          echo "published=true" >> "$GITHUB_OUTPUT"
 
       - name: Install it back out of the index
         # The index is only real if pip can resolve from it. GitHub Pages takes
@@ -353,3 +367,54 @@ jobs:
           done
           echo "::error::the index did not serve acemq-amqp $VERSION within five minutes"
           exit 1
+
+  # The releases page. The index has been correct for six minor versions while
+  # this page told every visitor the newest release was 0.1.0 — the one release
+  # anybody ever created by hand. A page that is wrong is worse than a page that
+  # is empty, because it is read as current and nothing about it looks stale.
+  #
+  # Keyed on the push having happened rather than on the job having got this far.
+  # A release object naming a version the index never received sends a reader to
+  # a pip command that resolves nothing, and pip's message will point them at
+  # their own index configuration rather than at us.
+  #
+  # The wheel and the sdist are attached. They are the same two files the index
+  # serves — built once by `verify`, checked by twine there, and not rebuilt here
+  # — and they are the only way to install this behind a proxy that will not
+  # reach acemq.org. A wheel is worth a download; a source zip of a repository
+  # anyone can clone is not, which is why nothing else goes up.
+  announce:
+    needs: [verify, publish]
+    if: needs.publish.outputs.published == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          gh release create "v$VERSION" dist/* \
+            --title "v$VERSION" \
+            --notes "AceMQ for Python $VERSION.
+
+          \`\`\`bash
+          pip install --index-url https://acemq.org/pypi/simple/ \"acemq-amqp==$VERSION\"
+          pip install --index-url https://acemq.org/pypi/simple/ \"acemq-amqp[rabbitmq]==$VERSION\"
+          \`\`\`
+
+          The index is a static PEP 503 tree served over GitHub Pages, so it needs no credentials. The transport is an extra because reading an AceMQ envelope should not require installing a broker client; \`[prometheus]\`, \`[crypto]\`, \`[yaml]\`, \`[toml]\`, \`[protobuf]\` and \`[avro]\` go the same way.
+
+          The wheel and the sdist attached below are the same files the index serves, for an install that cannot reach it.
+
+          Documentation: https://acemq.org/acemq-python-amqp/
+          Changelog: https://github.com/AceMQ-Company/acemq-python-amqp/blob/v$VERSION/CHANGELOG.md" \
+            || echo "release v$VERSION already exists"
