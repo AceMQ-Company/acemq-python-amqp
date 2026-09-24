@@ -2,8 +2,32 @@
 # Last line of defence before anything leaves the machine.
 set -euo pipefail
 
-range="origin/$(git rev-parse --abbrev-ref HEAD)..HEAD"
-git rev-parse --verify -q "${range%%..*}" >/dev/null || range="HEAD"
+# What is about to be pushed — which, for a branch the remote has never seen, is not
+# the whole of history.
+#
+# The fallback used to be "HEAD" whenever `origin/<branch>` was missing, and that is
+# every new branch. It scans every commit ever made here, including those already on
+# main, and one of those is a commit about the attribution guard — whose message has
+# to name the words the guard forbids, because it is about the guard. So no new
+# branch could be pushed from this repository at all, whatever it contained, and the
+# refusal said "found in commits about to be pushed" about a commit pushed weeks
+# earlier.
+#
+# A new branch is compared against the default branch instead, which is what the
+# workflow already does with a pull request's base — the same range, so a clean local
+# check and a clean CI check cannot disagree. HEAD remains the last resort for a
+# repository with no remote branches at all, where scanning everything is the only
+# option and there is no accepted history to trip over.
+branch="$(git rev-parse --abbrev-ref HEAD)"
+if git rev-parse --verify -q "origin/$branch" >/dev/null; then
+  range="origin/$branch..HEAD"
+elif git rev-parse --verify -q origin/HEAD >/dev/null; then
+  range="origin/HEAD..HEAD"
+elif git rev-parse --verify -q origin/main >/dev/null; then
+  range="origin/main..HEAD"
+else
+  range="HEAD"
+fi
 if git log --format='%B%n%an%n%ae%n%cn%n%ce' "$range" \
    | grep -qiE 'claude|anthropic|co-authored-by[[:space:]]*:|\bgenerated with\b|🤖'; then
   echo "ERROR: AI attribution found in commits about to be pushed." >&2
