@@ -8,6 +8,39 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-09-27
+
+### Fixed
+
+- **A broker refusing a message is now heard.** A nack came back as
+  `PublishResult.confirmed = False` and raised nothing, and no code in this library
+  ever read that field except a telemetry label — so a caller who did not inspect
+  the result carried on believing the message had gone somewhere. Java, .NET, Go and
+  Ruby all raise on a nack; this one did not.
+
+- **The outbox no longer deletes a record for a message the broker refused.** This
+  is the same defect where it costs most. `OutboxRelay.sweep` removes a record once
+  the publish returns without raising, which is correct — and a nack raised nothing,
+  so the record was deleted for a message the broker had declined to keep.
+  At-most-once, in the one pattern whose entire purpose is that a message survives a
+  failure. The relay needed no change: the nack raising is the whole fix, and the
+  sweep's existing "a relay that fails loses nothing" behaviour then does the right
+  thing.
+
+  The check went into `publish_raw`, which is the one place every publish in the
+  library passes through — a `Publisher`, a retry rung, a dead letter, a replay, the
+  outbox — so anything that settles or deletes on the strength of a publish returning
+  now hears the refusal.
+
+### Changed
+
+- **A correction to 0.5.0's note about `confirm_timeout`.** It said the setting was
+  "the same as Java's `confirmTimeout`", which it is not: Java's bounds the wait for
+  the confirm itself, and this one bounds only the wait for an outstanding-publish
+  permit. The confirm is bounded by the transport, not by this setting. The
+  cross-language equivalence has been removed rather than corrected in place, because
+  there is no single setting here that means what Java's means.
+
 ## [0.7.1] - 2026-09-21
 
 ### Changed
@@ -387,8 +420,8 @@ While the version is `0.x` the public API may change in any release.
   get round it.
 
   **Exhausting it is an error rather than a stall.** `confirm_timeout` — ten
-  seconds by default, the same as Java's `confirmTimeout` — bounds the wait for a
-  permit, and reaching it raises `PublishError` saying which situation this is:
+  seconds by default — bounds the wait for a permit, and reaching it raises
+  `PublishError` saying which situation this is:
 
   ```
   1000 publishes are already waiting for a confirm and none completed within

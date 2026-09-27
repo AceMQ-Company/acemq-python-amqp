@@ -1694,10 +1694,43 @@ class Connection:
 
         self._in_flight_publishes += 1
         try:
-            return await self._transport.publish(exchange, routing_key, message)
+            result = await self._transport.publish(exchange, routing_key, message)
         finally:
             self._in_flight_publishes -= 1
             self._outstanding.release()
+
+        # A nack is the broker declining to keep a message it was asked to take, and
+        # it is raised here rather than returned.
+        #
+        # It used to be returned, and `confirmed` was read nowhere in this library
+        # except a telemetry label -- so a caller who did not inspect the result
+        # carried on believing the message had gone somewhere, and Java, .NET, Go and
+        # Ruby all raised on the same event. Worse than the wrong belief: the outbox
+        # relay removes a record because the publish did not raise, so a nack deleted
+        # a record for a message the broker had refused. At-most-once, in the pattern
+        # whose whole purpose is not losing anything.
+        #
+        # Checked here because this is the one place every publish in the library
+        # comes through -- a Publisher, a retry rung, a dead letter, a replay, the
+        # outbox -- so one check covers all of them, and anything that settles or
+        # deletes on the strength of a publish returning now hears the refusal.
+        #
+        # Distinct from unroutable, which the Publisher path reports separately and
+        # which sets `unroutable`: the broker could route this one and would not keep
+        # it, and the two want different responses.
+        if not result.confirmed:
+            raise PublishError(
+                message.message_id,
+                exchange,
+                routing_key,
+                (
+                    "the broker refused to confirm it. The message reached the broker "
+                    "and the broker has not taken responsibility for it, so it must be "
+                    "treated as not sent"
+                ),
+            )
+
+        return result
 
     async def pull(self, queue: str) -> Delivery | None:
         """Takes one message off a queue, or ``None`` when there is none waiting.

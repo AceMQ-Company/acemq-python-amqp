@@ -31,7 +31,8 @@ coroutine there would suggest it did.
 ```python
 result = await orders.send({"orderId": "o-1", "totalCents": 4250})
 result.message_id   # the envelope's id, which is also the AMQP message id
-result.confirmed    # the broker acknowledged it
+result.confirmed    # the broker acknowledged it, and is always true here:
+                    # a refusal raises rather than coming back as a field
 result.routed       # it reached at least one queue
 ```
 
@@ -306,6 +307,23 @@ acknowledged the message, and `result.confirmed` says so. That is a round trip
 per message, which is the cost of knowing; a service that publishes in bulk
 should pipeline — [`send_all`](#several-at-once) — rather than turning confirms
 off, because there is no way to turn them off here.
+
+**A refusal raises.** If the broker declines to keep a message — a nack, which is
+different from an unroutable one — `PublishError` is raised:
+
+```
+cannot publish message o-1 to exchange "orders-events" with key "order.placed":
+the broker refused to confirm it. The message reached the broker and the broker
+has not taken responsibility for it, so it must be treated as not sent
+```
+
+So `result.confirmed` is always true on a result you are holding; a false one
+never reaches you. That is deliberate, and it was not always so. Until 0.7.2 a
+nack came back as `confirmed=False` and raised nothing, which meant a caller who
+did not inspect the field carried on believing the message had gone — and the
+outbox relay, which removes a record when the publish does not raise, deleted
+records for messages the broker had refused. Every other library in this family
+raises on a nack; now so does this one.
 
 For the stronger guarantee — that a message and the database row it describes
 either both happen or neither does — see
