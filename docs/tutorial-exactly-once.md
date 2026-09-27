@@ -292,7 +292,7 @@ does, and the gap in step 2's docstring closes with it.
 |---|---|
 | `acemq.outbox.lag` | **the one to graph.** How long a record waited between being committed and being published. A committed and unpublished row appears in no queue depth anywhere, so every broker metric reads as a service with nothing to send |
 | `acemq.outbox.total{outcome="published"}` at a rate of zero | a relay that has **stopped**, which records no lag at all — the series goes quiet rather than rising, so the lag histogram alone will not show it |
-| `acemq.outbox.total{outcome="failed"}` climbing | the relay is running and the broker is refusing |
+| `acemq.outbox.total{outcome="failed"}` climbing | the relay is running and the broker is refusing. After ten failures a record stops being offered so the rest can go out — `await outbox.retired()` lists the ones nobody could publish, with the reason on each |
 | Idempotency table size | should plateau. Growing forever means nothing is calling `purge_expired` |
 | `first_time` returning `False` | your actual duplicate rate. Zero forever means either nothing retries or the store is not wired in |
 

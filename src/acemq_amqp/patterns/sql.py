@@ -80,6 +80,14 @@ DEFAULT_IDEMPOTENCY_TABLE = "acemq_idempotency"
 #: Where an outbox keeps its rows unless it is told otherwise.
 DEFAULT_OUTBOX_TABLE = "acemq_outbox"
 
+#: Failures before a record stops being offered to the relay.
+#:
+#: Ten, which is what Ruby's SQL outbox uses, so a record that is stuck is stuck
+#: after the same number of tries in both. The bound exists because the relay
+#: publishes in written order and stops at the first failure: without it, one record
+#: the broker will never take holds up everything written after it indefinitely.
+DEFAULT_OUTBOX_MAX_ATTEMPTS = 10
+
 #: Where a schema registry keeps its rows unless it is told otherwise. The
 #: counter lives in the same name with ``_seq`` on the end.
 DEFAULT_REGISTRY_TABLE = "acemq_schema_registry"
@@ -380,7 +388,9 @@ _OUTBOX_DDL = (
         body          %BLOB%       NOT NULL,
         content_type  VARCHAR(255) NOT NULL,
         headers       TEXT         NOT NULL,
-        created_at    BIGINT       NOT NULL
+        created_at    BIGINT       NOT NULL,
+        attempts      INTEGER      NOT NULL DEFAULT 0,
+        last_error    TEXT
     )
     """,
     # The relay's only query is "oldest first", so that is what is indexed.
@@ -712,10 +722,14 @@ class SqlOutboxStore:
         transaction: Connections | None = None,
         table: str = DEFAULT_OUTBOX_TABLE,
         paramstyle: str = "qmark",
+        max_attempts: int = DEFAULT_OUTBOX_MAX_ATTEMPTS,
     ) -> None:
+        if max_attempts < 1:
+            raise ValueError("acemq: max_attempts must be at least 1")
         self._sql = _Sql(table, paramstyle)
         self._relay = _Work(connections)
         self._transaction = transaction
+        self._max_attempts = max_attempts
 
     @property
     def table(self) -> str:
@@ -796,18 +810,70 @@ class SqlOutboxStore:
         """
 
         def statements(cursor: DbCursor) -> list[OutboxRecord]:
+            # `attempts < ?` is what keeps the relay moving. It publishes in the
+            # order records were written and stops at the first failure, so a record
+            # the broker will never take is retried on every sweep and holds up
+            # everything behind it -- for ever, until it stops being offered.
             statement = (
                 "SELECT id, exchange_name, routing_key, body, content_type, headers, "
-                "created_at FROM {table} ORDER BY created_at, id"
+                "created_at, attempts, last_error FROM {table} "
+                "WHERE attempts < ? ORDER BY created_at, id"
             )
             if limit > 0:
-                cursor.execute(self._sql(statement + " LIMIT ?"), (limit,))
+                cursor.execute(self._sql(statement + " LIMIT ?"), (self._max_attempts, limit))
             else:
-                cursor.execute(self._sql(statement))
+                cursor.execute(self._sql(statement), (self._max_attempts,))
             return [_record_from(row) for row in cursor.fetchall()]
 
         waiting = await _off_loop(self._relay, connection, statements)
         return list(waiting)
+
+    async def record_failure(
+        self, entry_id: str, error: str, *, connection: DbConnection | None = None
+    ) -> None:
+        """Counts a failed publish against the record, and says why.
+
+        The record is kept. One nothing could publish is evidence: somebody has to
+        read it, fix whatever refuses it and release it by resetting ``attempts``,
+        and deleting it would be the silent loss this pattern exists to prevent
+        arrived at from another direction.
+
+        Once ``attempts`` reaches ``max_attempts`` the record stops being offered by
+        :meth:`pending`, which is what lets the relay past it.
+        """
+
+        def statements(cursor: DbCursor) -> None:
+            cursor.execute(
+                self._sql(
+                    "UPDATE {table} SET attempts = attempts + 1, last_error = ? "
+                    "WHERE id = ?"
+                ),
+                (error[:1000], entry_id),
+            )
+
+        await _off_loop(self._relay, connection, statements)
+
+    async def retired(
+        self, *, connection: DbConnection | None = None
+    ) -> Sequence[OutboxRecord]:
+        """Records the relay has stopped trying.
+
+        Nothing else surfaces them: :meth:`pending` exists to skip them, so without
+        this they are invisible to everything but a hand-written query.
+        """
+
+        def statements(cursor: DbCursor) -> list[OutboxRecord]:
+            cursor.execute(
+                self._sql(
+                    "SELECT id, exchange_name, routing_key, body, content_type, "
+                    "headers, created_at, attempts, last_error FROM {table} "
+                    "WHERE attempts >= ? ORDER BY created_at, id"
+                ),
+                (self._max_attempts,),
+            )
+            return [_record_from(row) for row in cursor.fetchall()]
+
+        return list(await _off_loop(self._relay, connection, statements))
 
     async def mark_published(
         self, entry_id: str, *, connection: DbConnection | None = None
@@ -843,6 +909,8 @@ def _record_from(row: Sequence[Any]) -> OutboxRecord:
         content_type=str(row[4]),
         headers=headers,
         created_at=_from_ms(int(row[6])),
+        attempts=int(row[7]) if len(row) > 7 and row[7] is not None else 0,
+        last_error=str(row[8]) if len(row) > 8 and row[8] is not None else "",
     )
 
 

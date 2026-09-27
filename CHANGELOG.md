@@ -8,6 +8,54 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-09-27
+
+### Fixed
+
+- **One record the broker will never take no longer stops the whole outbox.** This
+  is the other half of 0.7.2. Making a nack raise turned a silent loss into a
+  head-of-line block: the relay publishes in the order records were written and
+  stops at the first failure — correct, because the writer chose that order — and
+  nothing bounded how long it would keep stopping at the same record. An exchange
+  somebody deleted, or a payload a policy will always refuse, held up every message
+  written after it indefinitely.
+
+  A failed publish is now counted against the record. `OutboxRecord` carries
+  `attempts` and `last_error`; once `attempts` reaches `max_attempts` — ten by
+  default, which is what Ruby's outbox uses — `pending` stops offering that record
+  and everything behind it goes out.
+
+  The record is **kept, not deleted**. One nothing could publish is evidence:
+  somebody has to read it, fix whatever refuses it, and release it by setting
+  `attempts` back to zero. Deleting it would be the same silent loss by another
+  route. `store.retired()` lists them, on both stores, because `pending` exists to
+  skip them and nothing else would surface them.
+
+### Added
+
+- `InMemoryOutboxStore(max_attempts=...)` and `SqlOutboxStore(max_attempts=...)`,
+  plus `record_failure()` and `retired()` on both, and
+  `DEFAULT_OUTBOX_MAX_ATTEMPTS`.
+
+### Changed
+
+- **The outbox table has two new columns.** `create_schema` writes them for a new
+  table. An existing one needs a migration, and `pending` fails until it has run:
+
+  ```sql
+  ALTER TABLE acemq_outbox ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE acemq_outbox ADD COLUMN last_error TEXT;
+  ```
+
+  Both are additive with a default, so the old code is unaffected by them: run the
+  migration before deploying this version.
+
+- `record_failure` is deliberately **not** part of the `OutboxStore` protocol. A
+  store written against the older shape keeps working and keeps the old behaviour —
+  the relay calls the method only when the store has it — rather than breaking on an
+  attribute it has never heard of. A custom store should add
+  `record_failure(entry_id, error)` and exclude records at the limit from `pending`.
+
 ## [0.7.2] - 2026-09-27
 
 ### Fixed

@@ -560,3 +560,72 @@ async def test_tables_can_be_named(tmp_path: Path) -> None:
 
     assert store.table == "shipping_outbox"
     assert await store.count() == 1
+
+
+async def test_a_record_that_keeps_failing_stops_being_offered(
+    database: Path, connections: Callable[[], sqlite3.Connection]
+) -> None:
+    """The bound that keeps the relay moving past a record nothing can publish.
+
+    The relay publishes in written order and stops at the first failure, which is
+    what the writer asked for. Without a bound it stops at the *same* record on
+    every sweep and everything behind it waits indefinitely -- which is what one
+    permanently refused record used to cause, once a nack started raising instead
+    of being silently swallowed and the record deleted.
+    """
+    store = SqlOutboxStore(connections, max_attempts=3)
+
+    # add() does not commit -- it is the caller's transaction -- so commit here the
+    # way a caller would.
+    opened = connections()
+    try:
+        await store.add(an_order("poison"), connection=opened)
+        opened.commit()
+    finally:
+        opened.close()
+
+    assert [record.id for record in await store.pending(10)] == ["poison"]
+
+    for expected in (1, 2):
+        await store.record_failure("poison", "the broker refused it")
+        held = await store.pending(10)
+        assert [record.id for record in held] == ["poison"]
+        assert held[0].attempts == expected
+
+    # The third failure reaches the limit, and the relay is not offered it again.
+    await store.record_failure("poison", "the broker refused it")
+    assert await store.pending(10) == []
+
+    retired = await store.retired()
+    assert [record.id for record in retired] == ["poison"]
+    assert retired[0].attempts == 3
+    assert retired[0].last_error == "the broker refused it"
+
+
+async def test_a_retired_record_is_still_in_the_table(
+    database: Path, connections: Callable[[], sqlite3.Connection]
+) -> None:
+    """Left alone, not deleted.
+
+    A record nothing could publish is evidence. Somebody has to read it, fix
+    whatever refuses it, and release it by resetting attempts -- and deleting it
+    would be the silent loss this pattern exists to prevent, reached another way.
+    """
+    store = SqlOutboxStore(connections, max_attempts=1)
+
+    opened = connections()
+    try:
+        await store.add(an_order("poison"), connection=opened)
+        opened.commit()
+    finally:
+        opened.close()
+
+    await store.record_failure("poison", "nothing is bound to receive it")
+    assert await store.pending(10) == []
+
+    counted = connections()
+    try:
+        rows = counted.execute("SELECT COUNT(*) FROM acemq_outbox").fetchone()[0]
+    finally:
+        counted.close()
+    assert rows == 1, "the record the broker refused was deleted"

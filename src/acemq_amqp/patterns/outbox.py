@@ -42,7 +42,7 @@ import asyncio
 import logging
 import threading
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol, runtime_checkable
 
@@ -84,6 +84,13 @@ class OutboxRecord:
     :param headers: the envelope, rendered
     :param created_at: when it was written, which is the order the relay
         publishes in
+    :param attempts: how many times publishing this record has failed. A record
+        the broker will never take would otherwise be retried on every sweep and
+        block everything written after it, because the relay publishes in order
+        and stops at the first failure
+    :param last_error: what went wrong the last time, so an operator finding a
+        stuck record can read the reason off the record instead of correlating a
+        log line from ten sweeps ago
     """
 
     id: str
@@ -93,6 +100,8 @@ class OutboxRecord:
     content_type: str = ""
     headers: Mapping[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    attempts: int = 0
+    last_error: str = ""
 
 
 @runtime_checkable
@@ -120,6 +129,22 @@ class OutboxStore(Protocol):
     async def mark_published(self, entry_id: str) -> None:
         """Removes a record, once the broker has confirmed the message."""
 
+    # record_failure is deliberately not part of this Protocol.
+    #
+    # A store that does not implement it keeps the behaviour every store had
+    # before: a record the broker will never take is retried on every sweep and
+    # holds up everything behind it. That is not good, but it is what a custom
+    # store written against the old shape already does, and breaking every one of
+    # them to fix it is the more expensive answer. The relay calls it when it is
+    # there, and both stores shipped here have it.
+    #
+    # A custom store should implement it:
+    #
+    #     async def record_failure(self, entry_id: str, error: str) -> None:
+    #         """Counts a failed publish against the record, and says why."""
+    #
+    # and exclude records whose attempts have reached the limit from `pending`.
+
 
 class InMemoryOutboxStore:
     """An outbox in this process.
@@ -131,7 +156,14 @@ class InMemoryOutboxStore:
     version that matters.
     """
 
-    def __init__(self) -> None:
+    #: Failures before a record is left alone. The same ten Ruby's SQL outbox uses,
+    #: so a record that is stuck is stuck after the same number of tries in both.
+    DEFAULT_MAX_ATTEMPTS = 10
+
+    def __init__(self, max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> None:
+        if max_attempts < 1:
+            raise ValueError("acemq: max_attempts must be at least 1")
+        self._max_attempts = max_attempts
         self._records: dict[str, OutboxRecord] = {}
         # A plain lock, as in the idempotency store: it is held for a dictionary
         # operation and never across an await, so a store written to from the
@@ -148,15 +180,51 @@ class InMemoryOutboxStore:
 
     async def pending(self, limit: int) -> Sequence[OutboxRecord]:
         with self._lock:
-            waiting = sorted(self._records.values(), key=lambda entry: entry.created_at)
+            waiting = sorted(
+                (
+                    entry
+                    for entry in self._records.values()
+                    if entry.attempts < self._max_attempts
+                ),
+                key=lambda entry: entry.created_at,
+            )
         return waiting[:limit] if limit > 0 else waiting
 
     async def mark_published(self, entry_id: str) -> None:
         with self._lock:
             self._records.pop(entry_id, None)
 
+    async def record_failure(self, entry_id: str, error: str) -> None:
+        """Counts a failed publish against the record, and says why.
+
+        The record is kept either way. One nothing could publish is evidence:
+        somebody has to be able to read it, fix whatever refuses it and release it,
+        and deleting it would be the silent loss this pattern exists to prevent
+        arrived at by a different route.
+        """
+        with self._lock:
+            entry = self._records.get(entry_id)
+            if entry is None:
+                return
+            self._records[entry_id] = replace(
+                entry, attempts=entry.attempts + 1, last_error=error
+            )
+
+    def retired(self) -> Sequence[OutboxRecord]:
+        """Records left alone because publishing them kept failing.
+
+        For an operator, and for a test: these are the ones the relay has stopped
+        trying, and nothing else will surface them.
+        """
+        with self._lock:
+            return [
+                entry
+                for entry in self._records.values()
+                if entry.attempts >= self._max_attempts
+            ]
+
     def __len__(self) -> int:
-        """How many records are waiting."""
+        """How many records are held, retired ones included."""
         with self._lock:
             return len(self._records)
 
@@ -320,7 +388,7 @@ class OutboxRelay:
                         persistent=True,
                     ),
                 )
-            except Exception:
+            except Exception as failure:
                 # Counted and re-raised. The record is still in the outbox, and
                 # stopping here rather than carrying on to the next one keeps
                 # the order the records were written in, which is what the
@@ -328,6 +396,19 @@ class OutboxRelay:
                 observer.count(
                     METRIC_OUTBOX_TOTAL, 1, {**labels, TAG_OUTCOME: OUTCOME_FAILED}
                 )
+                # Counted against the record too, so stopping here is bounded.
+                # Without this the sweep stops at the same record on every tick and
+                # everything written after it waits for ever -- which is what a
+                # record the broker will never take used to cause, once a nack
+                # started raising instead of being silently swallowed.
+                #
+                # Optional on the store, so a custom one written against the older
+                # shape keeps working rather than breaking on an attribute it has
+                # never heard of. It also keeps the old blocking behaviour, which is
+                # stated in the protocol's own comment.
+                recorder = getattr(self._store, "record_failure", None)
+                if recorder is not None:
+                    await recorder(entry.id, str(failure) or failure.__class__.__name__)
                 raise
 
             # Counted here rather than after the record has been removed,

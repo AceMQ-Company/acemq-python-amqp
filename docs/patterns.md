@@ -191,6 +191,40 @@ in the outbox, which is the entire point.
 
 `OutboxRelay` is an async context manager too.
 
+### A record the broker will never take
+
+A sweep stops at the first record that fails and leaves it in the outbox. That is
+right — the writer chose the order, and skipping ahead would deliver a later
+message before an earlier one — but it means a record that can *never* be
+published blocks everything behind it on every tick, for ever. An exchange
+somebody deleted, a payload a policy will always refuse: one row, and the outbox
+stops.
+
+So a failure is counted against the record. Both stores keep an `attempts` and a
+`last_error` on it, and once `attempts` reaches `max_attempts` — ten by default,
+the same ten Ruby uses — `pending` stops offering the record and the queue behind
+it moves again.
+
+```python
+store = SqlOutboxStore(connections, max_attempts=10)
+...
+for stuck in await store.retired():
+    log.error("nobody could publish %s: %s", stuck.id, stuck.last_error)
+```
+
+The record is **kept, not deleted**. One nothing could publish is evidence:
+somebody has to read it, fix whatever refuses it, and release it by setting
+`attempts` back to zero. Deleting it would be the silent loss this pattern exists
+to prevent, reached from another direction. Nothing but `retired()` will show you
+these rows, because `pending` exists to skip them — so graph
+`acemq.outbox.total{outcome="failed"}` and read `retired()` when it climbs.
+
+`record_failure` is deliberately **not** part of the `OutboxStore` protocol. A
+custom store written before this release keeps working and keeps the old
+behaviour: the relay calls the method only if the store has it, so a store without
+one still blocks at a permanently failing record. If you wrote your own store, add
+`record_failure(entry_id, error)` and exclude records at the limit from `pending`.
+
 ### Watching a relay that has stopped
 
 A relay that has stopped is invisible from outside. A committed, unpublished row
@@ -1035,6 +1069,21 @@ for statement in schema_ddl(dialect="postgres"):
 Table names are constructor arguments, and are checked rather than trusted: a
 table name reaches SQL by concatenation because no database binds one as a
 parameter, so anything that is not a plain identifier is refused.
+
+**Upgrading an outbox table created before 0.7.3.** Two columns were added, for
+[the record the broker will never take](#a-record-the-broker-will-never-take).
+`create_schema` writes them for a new table; an existing one needs the migration,
+and `pending` will fail on `attempts` until it has run:
+
+```sql
+ALTER TABLE acemq_outbox ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE acemq_outbox ADD COLUMN last_error TEXT;
+```
+
+Both are additive and take a default, so a running relay on the old code is
+unaffected by them and the migration can go out before the deployment does — which
+is the order to do it in, since the new code needs the columns and the old code
+does not mind them.
 
 Times are stored as **epoch milliseconds** in a `BIGINT` — the same units as
 `x-acemq-first-seen` on the envelope, and the one representation of an instant
