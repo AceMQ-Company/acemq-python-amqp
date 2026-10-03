@@ -50,7 +50,7 @@ from .ack import (
 )
 from .codec import Codec, JsonCodec
 from .envelope import Envelope
-from .errors import AceMQError, PublishError
+from .errors import AceMQError, PublishError, PublishingPausedError
 from .interceptors import (
     ConsumeContext,
     ConsumeInterceptor,
@@ -1661,9 +1661,29 @@ class Connection:
         :param routing_key: what to publish under
         :param message: the message, encoded
         :returns: what the broker said
+        :raises PublishingPausedError: when the broker has blocked this
+            connection. Nothing was sent; retry once it unblocks
         :raises PublishError: when every permit is taken and none came free
             within :attr:`confirm_timeout`
         """
+        # Refused rather than queued, before a permit or a byte is spent. A
+        # blocked broker stops reading the socket, so a publish sent now sits in
+        # the client's write buffer with no confirm coming until the alarm
+        # clears, then times out as a failure that may or may not have arrived.
+        # Go and .NET refuse at the same point for the same reason. ``None``
+        # means the state could not be read and is not treated as blocked.
+        if self.blocked is True:
+            reason = self.blocked_reason
+            raise PublishingPausedError(
+                message.message_id,
+                exchange,
+                routing_key,
+                (
+                    f"{self._blocked_detail(reason)}. Nothing was sent; back off and "
+                    "retry once the broker unblocks"
+                ),
+            )
+
         # Taken before the message is written and not after, which is the whole
         # point: a bound applied afterwards has already let the message into
         # memory. The permit is given back in the ``finally`` below on every

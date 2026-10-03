@@ -88,3 +88,24 @@ class PublishError(AceMQError):
             )
         else:
             super().__init__(f"acemq: cannot publish message {message_id} to {where}: {reason}")
+
+
+class PublishingPausedError(PublishError):
+    """A publish refused because the broker has blocked this connection.
+
+    Declined, not lost. RabbitMQ blocks a connection when it is low on memory
+    or disk and stops reading the socket until the alarm clears; this library
+    refuses the publish at once rather than queueing a frame behind a broker
+    that has said it cannot take it. **Nothing was sent**, so retrying once the
+    broker unblocks cannot duplicate the message — which is what tells this
+    apart from every other :class:`PublishError`, where the message may or may
+    not have arrived.
+
+    A subclass, so an existing ``except PublishError`` still catches it. Catch
+    this one first to back off, shed load or buffer instead of counting a loss.
+    It is Go's ``PublishingPausedError``, .NET's ``ConnectionBlockedException``
+    and the refusal Java's standing load counts as ``refused``.
+
+    ``reason`` is the broker's words when the transport kept them; the RabbitMQ
+    transport cannot (see :attr:`acemq_amqp.Connection.blocked_reason`).
+    """

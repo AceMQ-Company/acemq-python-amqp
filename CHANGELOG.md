@@ -8,6 +8,21 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Added
+
+- **`PublishingPausedError`: a publish refused for back pressure is told apart
+  from one that failed.** A publish made while the broker has blocked the
+  connection (a memory or disk alarm) is now refused at once, before a permit is
+  taken or a byte written, instead of being queued behind a broker that is not
+  reading and timing out later as a failure that may or may not have arrived.
+  Nothing was sent, so retrying once the broker unblocks cannot duplicate the
+  message. It subclasses `PublishError`, so existing `except PublishError`
+  clauses keep working; catch it first to back off rather than count a loss.
+  A nack, an unroutable mandatory message and the outstanding-publish deadline
+  remain plain `PublishError`. This matches Go's `PublishingPausedError` and
+  .NET's `ConnectionBlockedException`, and gives a load something to count as
+  `refused` rather than `failed`, as Java's does.
+
 ## [0.7.3] - 2026-09-27
 
 ### Fixed

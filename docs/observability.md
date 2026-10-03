@@ -306,8 +306,10 @@ readiness probe and let the probe's interval decide how often.
 ### A blocked connection is up, with the reason
 
 RabbitMQ blocks a connection when it is low on disk or memory, and while the
-alarm lasts it stops reading that connection's socket: a publish, a declaration
-and the health probe all wait rather than fail.
+alarm lasts it stops reading that connection's socket: a declaration and the
+health probe would wait rather than fail. A publish does not wait: it is refused
+at once with `PublishingPausedError` — see
+[Publishing](publishing.md#a-blocked-broker-refused-not-failed).
 
 That is reported **up**, and `parts["blocked"]` says so:
 

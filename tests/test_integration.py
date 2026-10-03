@@ -73,6 +73,7 @@ from acemq_amqp import (
     Metrics,
     Outbound,
     PublishContext,
+    PublishingPausedError,
     PublishNext,
     PublishResult,
     RetryPolicy,
@@ -975,6 +976,13 @@ async def test_a_broker_that_has_blocked_this_connection_is_reported_up() -> Non
         # did not keep it. If this ever reads as a string, a client release has
         # started keeping it and the transport should hand it over.
         assert connection.blocked_reason is None
+
+        # The next publish is refused at once rather than queued behind a broker
+        # that is not reading: declined, not lost, and its own type to say so.
+        started = time.monotonic()
+        with pytest.raises(PublishingPausedError):
+            await connection.publisher(routing_key=queue).send({"id": "8"})
+        assert time.monotonic() - started < 1.0
 
         started = time.monotonic()
         report = await connection.health()

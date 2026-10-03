@@ -70,7 +70,7 @@ from .connection import (
     connect,
 )
 from .envelope import Envelope
-from .errors import AceMQError, PublishError, SecurityError
+from .errors import AceMQError, PublishError, PublishingPausedError, SecurityError
 from .interceptors import (
     ConsumeContext,
     ConsumeInterceptor,
@@ -226,6 +226,7 @@ __all__ = [
     "PublishNext",
     "PublishResult",
     "Publisher",
+    "PublishingPausedError",
     "QueueSpec",
     "RetryPolicy",
     "Security",

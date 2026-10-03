@@ -230,6 +230,38 @@ Java spells the setting `maxOutstandingPublishes` and .NET
 `MaxOutstandingPublishes`, both with the same default of a thousand. Java bounds
 its wait with `confirmTimeout`; .NET waits without one.
 
+### A blocked broker: refused, not failed
+
+When RabbitMQ is low on memory or disk it blocks the connection and stops reading
+the socket until the alarm clears. A publish made while `mq.blocked` is `True` is
+**refused at once** with `PublishingPausedError`, before a permit is taken or a
+byte is written:
+
+```python
+from acemq_amqp import PublishError, PublishingPausedError
+
+try:
+    await publisher.send(order)
+except PublishingPausedError:
+    # Declined, not lost: nothing was sent, so a retry cannot duplicate it.
+    await asyncio.sleep(1)       # back off, shed load, or buffer
+except PublishError:
+    # Failed: the message may or may not have reached the broker.
+    raise
+```
+
+It subclasses `PublishError`, so an existing `except PublishError` still catches
+it; catch it first to tell back pressure from a loss. Every other `PublishError`
+— a nack, an unroutable mandatory message, the permit deadline above — means the
+message may have been lost, and none of them is a `PublishingPausedError`. The
+permit deadline stays a failure on purpose: a broker that stopped confirming may
+be dead rather than busy, and Java, .NET and Go call it a failure too.
+
+`blocked` being `None` — the state could not be read — is not treated as blocked.
+Go returns `PublishingPausedError` at the same point, .NET throws
+`ConnectionBlockedException`, and Java's standing load counts the same event as
+`refused` rather than `failed`.
+
 ## Durability
 
 ```python
@@ -292,12 +324,13 @@ its codec by reading that. See [codecs](serialization.md).
 | An interceptor refused | whatever it raised, reaching the caller. Nothing is published — that is the point of intercepting rather than observing |
 | The broker rejected the publish | the transport's exception, unwrapped. `acemq.publish.total` is counted with `outcome="failed"` |
 | Nothing was bound to receive it | `PublishError` when `mandatory=True`; `result.routed` is `False` either way |
+| The broker has blocked the connection | `PublishingPausedError`, a `PublishError`. Nothing is published; retry once it unblocks |
 
 Most of what goes wrong with a broker is the broker's own exception, and this
 library does not wrap every one of them in a class of its own: that would hide
 the detail somebody actually needs while adding a name they then have to learn.
-The exceptions it does define are `AceMQError`, `PublishError` and
-`SecurityError`, plus `FatalError`, which is a statement about a message rather
+The exceptions it does define are `AceMQError`, `PublishError`,
+`PublishingPausedError` and `SecurityError`, plus `FatalError`, which is a statement about a message rather
 than about the library.
 
 ## Publisher confirms
