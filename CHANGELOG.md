@@ -8,6 +8,8 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.7.4] - 2026-10-03
+
 ### Added
 
 - **`PublishingPausedError`: a publish refused for back pressure is told apart
