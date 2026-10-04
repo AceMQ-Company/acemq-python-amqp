@@ -31,6 +31,7 @@ from typing import Any
 
 import pytest
 from fake_transport import FakeTransport
+from fake_transport import Settlement as Outcome
 
 from acemq_amqp import (
     METRIC_CONSUME_TOTAL,
@@ -63,7 +64,7 @@ from acemq_amqp.topology import (
     Topology,
     rung_args,
 )
-from acemq_amqp.transport import QueueSpec
+from acemq_amqp.transport import Delivery, QueueSpec
 
 QUEUE = "orders.new"
 DLQ = "orders.new.dlq"
@@ -565,3 +566,142 @@ async def test_closing_still_reports_a_worker_that_failed() -> None:
 
     with pytest.raises(RuntimeError, match="the worker died"):
         await consumer.close()
+
+
+class Stuck:
+    """Handlers that start, say so, and then never finish on their own."""
+
+    def __init__(self) -> None:
+        self.started = 0
+        self.cut_off = 0
+        self._release = asyncio.Event()
+
+    async def handler(self, message: Message) -> Ack:
+        self.started += 1
+        try:
+            await self._release.wait()
+        except asyncio.CancelledError:
+            self.cut_off += 1
+            raise
+        return accept()
+
+    def release(self) -> None:
+        self._release.set()
+
+
+async def hand_over(transport: FakeTransport, count: int) -> list[Outcome]:
+    """Delivers messages without waiting for them to be settled, which
+    :meth:`FakeTransport.deliver` would."""
+    settlements = [Outcome() for _ in range(count)]
+    for settlement in settlements:
+
+        async def ack(settlement: Outcome = settlement) -> None:
+            settlement.acked = True
+
+        async def nack(requeue: bool, settlement: Outcome = settlement) -> None:
+            settlement.nacked = True
+            settlement.requeued = requeue
+
+        await transport.consumers[QUEUE](
+            Delivery(
+                body=b"{}",
+                content_type="application/json",
+                routing_key=QUEUE,
+                message_id="",
+                headers=wire(Envelope()),
+                redelivered=False,
+                ack=ack,
+                nack=nack,
+            )
+        )
+    return settlements
+
+
+async def until(condition: Any, timeout: float = 2.0) -> None:
+    async def poll() -> None:
+        while not condition():
+            await asyncio.sleep(0.005)
+
+    await asyncio.wait_for(poll(), timeout)
+
+
+async def test_a_caller_that_gives_up_on_closing_is_told_so() -> None:
+    # wait_for cancels close() when its time is up. Swallowing that cancellation
+    # turns a drain that was cut off into one that looks as though it finished,
+    # and the caller never sees the TimeoutError it asked for.
+    transport = FakeTransport()
+    connection = Connection(transport)
+    stuck = Stuck()
+    await connection.consume(QUEUE, stuck.handler)
+    settlements = await hand_over(transport, 1)
+    await until(lambda: stuck.started == 1)
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(connection.close(timeout=None), 0.1)
+
+    assert transport.closed is True
+    assert stuck.cut_off == 1
+    assert settlements[0] == Outcome()
+
+
+async def test_the_drain_bound_covers_every_handler_at_once() -> None:
+    transport = FakeTransport()
+    connection = Connection(transport)
+    stuck = Stuck()
+    await connection.consume(QUEUE, stuck.handler, concurrency=3)
+    settlements = await hand_over(transport, 3)
+    await until(lambda: stuck.started == 3)
+
+    started = asyncio.get_running_loop().time()
+    drained = await connection.close(timeout=0.2)
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert drained is False
+    assert elapsed < 1.0
+    assert stuck.cut_off == 3
+    # Cut off is not settled: neither acknowledged nor rejected, so the broker
+    # hands every one of them out again once the channel goes.
+    assert settlements == [Outcome()] * 3
+    assert transport.closed is True
+
+
+async def test_a_drain_that_finishes_says_so() -> None:
+    transport = FakeTransport()
+    connection = Connection(transport)
+    stuck = Stuck()
+    consumer = await connection.consume(QUEUE, stuck.handler, concurrency=2)
+    settlements = await hand_over(transport, 2)
+    await until(lambda: stuck.started == 2)
+
+    asyncio.get_running_loop().call_later(0.05, stuck.release)
+
+    assert await consumer.close(timeout=5.0) is True
+    assert [settlement.acked for settlement in settlements] == [True, True]
+    assert await connection.close() is True
+
+
+async def test_a_consumer_drain_that_is_cut_off_says_so() -> None:
+    transport = FakeTransport()
+    connection = Connection(transport)
+    stuck = Stuck()
+    consumer = await connection.consume(QUEUE, stuck.handler)
+    settlements = await hand_over(transport, 1)
+    await until(lambda: stuck.started == 1)
+
+    assert await consumer.close(timeout=0.05) is False
+    assert stuck.cut_off == 1
+    assert settlements == [Outcome()]
+    await connection.close()
+
+
+async def test_leaving_a_consumer_block_does_not_swallow_the_exception() -> None:
+    # __aexit__ drains like close(), but must not hand close()'s True back to
+    # the interpreter, which would read it as "the exception was handled".
+    transport = FakeTransport()
+    connection = Connection(transport)
+    with pytest.raises(RuntimeError, match="kept"):
+        async with await connection.consume(QUEUE, always(accept())):
+            raise RuntimeError("kept")
+    with pytest.raises(RuntimeError, match="kept"):
+        async with connection:
+            raise RuntimeError("kept")

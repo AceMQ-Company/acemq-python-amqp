@@ -323,13 +323,13 @@ jobs:
         # than hiding.
         #
         # The count is checked as well, which the job above does not do, because
-        # a skip guard alone passes a run that tested nothing. The floor is 60,
-        # the same number the 4.x job runs, because it is the same run: sixty on
-        # rabbitmq:3.13-management, sixty on rabbitmq:4-alpine, the same sixty by
+        # a skip guard alone passes a run that tested nothing. The floor is 61,
+        # the same number the 4.x job runs, because it is the same run: sixty-one on
+        # rabbitmq:3.13-management, sixty-one on rabbitmq:4-alpine, the same sixty-one by
         # name, none skipped and none failing on either. That was measured on a
         # real 3.13.7 container before this job was written, not assumed from
         # the other job's number. Keeping the two equal is the point. The day
-        # 3.13 can only manage fifty-nine, the honest answer is to work out
+        # 3.13 can only manage sixty, the honest answer is to work out
         # which test that is and write down why, not to lower this line until
         # the job goes green again.
         run: |
@@ -343,8 +343,8 @@ jobs:
             echo "::error::pytest printed no summary line; the run did not finish"
             exit 1
           fi
-          if [ "$passed" -lt 60 ]; then
-            echo "::error::only $passed integration tests ran on RabbitMQ 3.13; this suite has 60"
+          if [ "$passed" -lt 61 ]; then
+            echo "::error::only $passed integration tests ran on RabbitMQ 3.13; this suite has 61"
             exit 1
           fi
           echo "$passed integration tests ran on RabbitMQ 3.13, none skipped"

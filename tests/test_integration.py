@@ -2399,3 +2399,29 @@ async def test_a_trace_joins_a_publisher_and_a_consumer_through_the_broker(
     assert process.parent.span_id == publish.context.span_id
     assert publish.attributes["messaging.acemq.outcome"] == "confirmed"
     assert process.attributes["messaging.acemq.outcome"] == "acked"
+
+
+async def test_a_handler_cut_off_by_the_drain_bound_is_redelivered_not_lost(
+    mq: Connection, workspace: Workspace
+) -> None:
+    # Closing stops waiting at its deadline and cancels the handler. The message
+    # it was holding is neither acknowledged nor rejected, so the broker hands
+    # it out again: shutdown must never be how a message is lost or dead-lettered.
+    queue = await workspace.queue("cut-off")
+    started = asyncio.Event()
+
+    async def stuck(message: Message) -> Ack:
+        started.set()
+        await asyncio.Event().wait()
+        return accept()
+
+    consumer = await mq.consume(queue, stuck, concurrency=3)
+    await mq.publisher(routing_key=queue, mandatory=True).send({"id": "7"})
+    await asyncio.wait_for(started.wait(), 10)
+
+    assert await consumer.close(timeout=0.2) is False
+
+    again = (await collect(mq, queue))[0]
+    assert again.payload == {"id": "7"}
+    assert again.redelivered is True
+    assert await mq.message_count(dead_letter_queue(queue)) == 0

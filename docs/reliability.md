@@ -401,7 +401,14 @@ async with await connect(url) as mq:
 ```
 
 `close` on a consumer unsubscribes first, then waits for the handlers already
-running to finish **and settle**. A message that had been delivered but not
+running to finish **and settle** — for up to twenty seconds by default, the
+figure the rest of the family uses, or whatever `timeout` says. On a connection
+that is one deadline for every handler of every consumer. A handler still
+running at the deadline is cancelled and its message left unsettled, so the
+broker redelivers it rather than it being lost or dead-lettered; `close` returns
+`False` when that happened and `True` when everything finished. A caller that
+cancels closing, `asyncio.wait_for` included, gets the same treatment and its
+cancellation back. A message that had been delivered but not
 started is given back to the broker rather than held: it is the broker's to hand
 to another consumer, and working through a retry delay for it would make closing
 take as long as the schedule.

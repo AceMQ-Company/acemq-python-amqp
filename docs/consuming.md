@@ -258,21 +258,41 @@ async with await mq.consume("shipping.orders", ship):
 ```
 
 `close` unsubscribes, then waits for the handlers already running to finish and
-settle. A message that had been delivered but not started is **given back** to
+settle — for up to `timeout` seconds, twenty by default, the same figure Java,
+.NET and Ruby use (`DEFAULT_DRAIN_TIMEOUT`; `None` waits for as long as they
+take). A message that had been delivered but not started is **given back** to
 the broker rather than held: it is the broker's to hand to another consumer, and
 working through a retry delay for it would make closing take as long as the
 schedule.
 
-Closing the connection closes every consumer on it first, so a service that
-exits its `async with await connect(...)` block has already drained.
+A handler still running when the time is up is cancelled, and its message is
+left **unsettled** — neither acknowledged nor rejected — so the broker redelivers
+it once the channel goes. Shutdown is never the reason a message is lost or
+dead-lettered. `close` says which way it went:
 
-Closing is not itself a cancellation. A shutdown that cancelled the tasks on the
-loop before closing the connection leaves workers that are already cancelled, and
-waiting on one of those raises `CancelledError`; closing swallows it rather than
-letting it out, because a caller who is merely shutting down should not be told
-that *they* were cancelled — which is what anything reading `task.exception()`
-afterwards would be handed. A worker that failed on its own is still reported:
-the guard is on cancellation and nothing else.
+```python
+if not await mq.close(timeout=10):
+    log.warning("shutdown cut handlers off; their messages will be redelivered")
+```
+
+`True` means every handler finished, `False` that some were cut off. Ignoring
+the answer is fine: the consumer is stopped either way.
+
+Closing the connection closes every consumer on it first, so a service that
+exits its `async with await connect(...)` block has already drained. The bound
+is one deadline for every handler of every consumer together, not one each. The
+`async with` exit uses the default.
+
+A caller that gives up on closing — `asyncio.wait_for(mq.close(), 5)`, or a
+task that is cancelled — is told so: the running handlers are cancelled the same
+way, the connection is still released, and the cancellation (or the
+`TimeoutError`) is raised again.
+
+Closing is not itself a cancellation, though. A shutdown that cancelled the
+tasks on the loop before closing the connection leaves workers that are already
+cancelled; closing does not report those, because a caller who is merely
+shutting down should not be told that *they* were cancelled. A worker that
+failed on its own is still reported.
 
 ## What the consumer will tell you
 

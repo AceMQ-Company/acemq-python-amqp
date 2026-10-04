@@ -59,6 +59,7 @@ from .codec import (
 )
 from .connection import (
     BLOCKED_DETAIL,
+    DEFAULT_DRAIN_TIMEOUT,
     DEFAULT_HEALTH_TIMEOUT,
     AsyncHandler,
     BrokerHealth,
@@ -165,6 +166,7 @@ __all__ = [
     "BYTES_CONTENT_TYPE",
     "DEAD_LETTER_EXCHANGE",
     "DEFAULT_BROKER_WAIT_THRESHOLD",
+    "DEFAULT_DRAIN_TIMEOUT",
     "DEFAULT_HEALTH_TIMEOUT",
     "DEVELOPMENT_MARKER",
     "JSON_CONTENT_TYPE",

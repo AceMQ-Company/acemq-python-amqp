@@ -131,6 +131,13 @@ DEFAULT_CONFIRM_TIMEOUT = timedelta(seconds=10)
 #: anything to report.
 DEFAULT_HEALTH_TIMEOUT = 3.0
 
+#: How long, in seconds, closing waits for handlers that are already running
+#: before it stops waiting. Twenty, which is the figure Java, .NET and Ruby use:
+#: long enough for an ordinary handler to finish, and inside the thirty seconds
+#: an orchestrator usually allows between asking a process to stop and killing
+#: it, so the connection is closed cleanly rather than torn down from outside.
+DEFAULT_DRAIN_TIMEOUT = 20.0
+
 #: What a health report says about a connection the broker has blocked. It is
 #: reported **up**, which is the one place this disagrees with a naive reading of
 #: the state: a blocked connection is the broker protecting itself from a disk or
@@ -1059,8 +1066,9 @@ class Consumer:
         )
         return result.routed
 
-    async def close(self) -> None:
-        """Stops the consumer and waits for the handlers already running.
+    async def close(self, *, timeout: float | None = DEFAULT_DRAIN_TIMEOUT) -> bool:
+        """Stops the consumer and waits, for up to ``timeout``, for the handlers
+        already running.
 
         A message being worked on when this is called is finished and settled,
         rather than abandoned for the broker to hand to somebody else. A message
@@ -1068,47 +1076,73 @@ class Consumer:
         broker's to hand to another consumer, and holding it here only to work
         through a retry delay would make closing take as long as the schedule.
 
+        A handler still running when the time is up is cancelled, and its message
+        is left unsettled — neither acknowledged nor rejected — so the broker
+        hands it out again once the channel goes. Shutdown is never the reason a
+        message is lost or dead-lettered. The same happens when the caller
+        cancels closing, ``asyncio.wait_for`` included, and that cancellation is
+        raised again once the consumer has been cleaned up.
+
         The subscription is released last, after everything has been settled,
         because a settlement travels on the channel its delivery arrived on.
+
+        :param timeout: seconds to wait for every running handler together;
+            ``None`` waits for as long as they take
+        :returns: ``True`` if every handler finished, ``False`` if the time ran
+            out first and some were cut off — the consumer is stopped either way
         """
         if self._closed:
-            return
+            return True
         self._closed = True
 
-        if self._subscription is not None:
-            await self._subscription.stop()
+        running: set[asyncio.Task[None]] = set()
+        try:
+            if self._subscription is not None:
+                await self._subscription.stop()
 
-        while True:
-            try:
-                pending = self._work.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            if pending is not None:
-                await pending.nack(True)
+            while True:
+                try:
+                    pending = self._work.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if pending is not None:
+                    await pending.nack(True)
 
-        for _ in self._workers:
-            self._work.put_nowait(None)
+            for _ in self._workers:
+                self._work.put_nowait(None)
+            if self._workers:
+                _, running = await asyncio.wait(self._workers, timeout=timeout)
+        finally:
+            # Reached with workers still running for two reasons: the deadline
+            # passed, or the caller cancelled us. Either way they are cancelled
+            # before the channel goes, so nothing settles a message on a channel
+            # that is closing — and a cancellation that came from the caller is
+            # not caught here, so it carries on out once this has run.
+            stragglers = [worker for worker in self._workers if not worker.done()]
+            for worker in stragglers:
+                worker.cancel()
+            if stragglers:
+                await asyncio.wait(stragglers)
+            if self._subscription is not None:
+                await self._subscription.close()
+            self._connection._untrack(self)
+
         for worker in self._workers:
-            try:
-                await worker
-            except asyncio.CancelledError:
-                # A worker that was already cancelled — a task group unwinding,
-                # a shutdown that cancelled the loop's tasks before closing the
-                # connection — is not news to report to a caller who is merely
-                # closing. Re-raising it here makes closing look like the
-                # *caller* was cancelled, which is what anything inspecting
-                # ``task.exception()`` afterwards would be told.
-                if not worker.cancelled():
-                    raise
-
-        if self._subscription is not None:
-            await self._subscription.close()
-        self._connection._untrack(self)
+            # A worker that was already cancelled — a task group unwinding, a
+            # shutdown that cancelled the loop's tasks before closing the
+            # connection — is not news to report to a caller who is merely
+            # closing. One that died of its own accord is.
+            failure = None if worker.cancelled() else worker.exception()
+            if failure is not None:
+                raise failure
+        return not running
 
     async def __aenter__(self) -> Consumer:
         return self
 
     async def __aexit__(self, *_: object) -> None:
+        # Not returned: a true value from here tells the interpreter that the
+        # exception leaving the block was handled.
         await self.close()
 
 
@@ -1799,19 +1833,39 @@ class Connection:
         if consumer in self._consumers:
             self._consumers.remove(consumer)
 
-    async def close(self) -> None:
+    async def close(self, *, timeout: float | None = DEFAULT_DRAIN_TIMEOUT) -> bool:
         """Stops every consumer on this connection and releases it.
 
-        Consumers first, and their handlers allowed to finish, so a message
-        being worked on when this is called is settled rather than returned to
-        the queue for somebody else to redo.
+        Consumers first, and their handlers given up to ``timeout`` to finish,
+        so a message being worked on when this is called is settled rather than
+        returned to the queue for somebody else to redo. The bound is one
+        deadline for every handler of every consumer, not one each: they are
+        all drained at once. A handler still running at the deadline is
+        cancelled and its message left unsettled, for the broker to redeliver —
+        see :meth:`Consumer.close`.
+
+        The connection is released whatever happens, including when the caller
+        cancels closing; that cancellation is raised again afterwards.
+
+        :param timeout: seconds to wait for the running handlers; ``None``
+            waits for as long as they take
+        :returns: ``True`` if every handler finished, ``False`` if the time ran
+            out first
         """
         if self._closed:
-            return
+            return True
         self._closed = True
-        for consumer in list(self._consumers):
-            await consumer.close()
-        await self._transport.close()
+        try:
+            drained = await asyncio.gather(
+                *(consumer.close(timeout=timeout) for consumer in list(self._consumers)),
+                return_exceptions=True,
+            )
+        finally:
+            await self._transport.close()
+        for outcome in drained:
+            if isinstance(outcome, BaseException):
+                raise outcome
+        return all(drained)
 
     async def __aenter__(self) -> Connection:
         return self

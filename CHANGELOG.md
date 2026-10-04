@@ -8,6 +8,34 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Closing no longer swallows the caller's cancellation.** `Consumer.close()`
+  and `Connection.close()` caught the `CancelledError` meant for the caller
+  whenever it landed while a worker was being awaited, so
+  `asyncio.wait_for(mq.close(), t)` returned normally at its deadline instead of
+  raising `TimeoutError`, and a drain that had been cut off looked clean. A
+  cancelled `close()` now cancels the running handlers, releases the
+  subscription and the connection, and raises the cancellation again. Workers
+  that something else had already cancelled are still not reported.
+- **A deadline on closing reaches every handler.** An outside bound only reached
+  the one worker being awaited, so with `concurrency` above one the other
+  handlers ran on past it.
+
+### Changed
+
+- **Closing drains for up to twenty seconds, then stops waiting and says so.**
+  `Consumer.close()` and `Connection.close()` take a keyword `timeout` (seconds;
+  default `DEFAULT_DRAIN_TIMEOUT`, 20.0, the figure Java, .NET and Ruby use;
+  `None` waits as long as the handlers take) and return `True` if every running
+  handler finished, `False` if the deadline passed first — the shape of Java's
+  `drain(Duration)` and .NET's `DrainConsumersAsync`. On a connection it is one
+  deadline for every handler of every consumer together. A handler still running
+  at the deadline is cancelled and its message left unsettled, so the broker
+  redelivers it; nothing is acknowledged, rejected or dead-lettered because
+  shutdown cut it off. Previously closing waited for running handlers forever.
+  Code that ignores the return value is unaffected.
+
 ## [0.7.4] - 2026-10-03
 
 ### Added
