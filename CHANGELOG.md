@@ -8,7 +8,7 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
-## [0.7.5] - 2026-10-04
+## [0.7.5] - 2026-10-03
 
 ### Fixed
 
