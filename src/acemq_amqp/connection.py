@@ -74,6 +74,7 @@ from .telemetry import (
     METRIC_SET_ASIDE_FAILED,
     OUTCOME_CONFIRMED,
     OUTCOME_FAILED,
+    OUTCOME_REFUSED,
     OUTCOME_UNROUTABLE,
     TAG_EXCHANGE,
     TAG_OUTCOME,
@@ -414,6 +415,11 @@ class Publisher:
                     mandatory=context.mandatory,
                 ),
             )
+        except PublishingPausedError:
+            # Declined before anything was written: nothing lost, so not
+            # ``failed``, which is the outcome an alert on loss watches.
+            record(OUTCOME_REFUSED)
+            raise
         except Exception:
             record(OUTCOME_FAILED)
             raise

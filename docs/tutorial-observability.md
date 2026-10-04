@@ -96,7 +96,7 @@ library reads against another.
 
 | | |
 |---|---|
-| `acemq.publish.total` | publishes, labelled `exchange`, `routing.key` and `outcome`: `confirmed`, `unroutable`, `failed` |
+| `acemq.publish.total` | publishes, labelled `exchange`, `routing.key` and `outcome`: `confirmed`, `unroutable`, `failed`, `refused` (blocked broker, nothing sent) |
 | `acemq.consume.total` | deliveries settled, labelled `queue` and `outcome`: `acked`, `retried`, `rejected`, `dead_lettered`, `parked` |
 | `acemq.consume.duration` | seconds, timed around the interceptors as well as the handler, carrying the same `outcome` |
 | `acemq.consume.in.flight` | a gauge: how many are being handled right now |

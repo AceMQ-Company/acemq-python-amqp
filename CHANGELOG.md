@@ -8,6 +8,21 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Added
+
+- **A `refused` outcome on publish telemetry.** A publish the library declined
+  before writing anything — `PublishingPausedError`, raised while the broker has
+  blocked the connection — is now counted as
+  `acemq.publish.total{outcome="refused"}` (and timed on
+  `acemq.publish.duration` with the same label), and its publish span carries
+  `messaging.acemq.outcome = "refused"`. It used to be `failed`. `failed` now
+  means only what it says — the message may have been lost: a nack, no confirm
+  in time, an unconfirmed I/O failure — so an alert on it no longer pages for a
+  broker alarm that lost nothing. Additive: no existing value changed meaning
+  for any other publish, and the span is still `ERROR` by its exception. The
+  same word in all five libraries; the constant is
+  `acemq_amqp.telemetry.OUTCOME_REFUSED`.
+
 ## [0.7.5] - 2026-10-03
 
 ### Fixed

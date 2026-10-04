@@ -659,7 +659,7 @@ dashboard built against one library reads against another:
 
 | Metric | |
 |---|---|
-| `acemq.publish.total` | Publishes. Labelled `exchange`, `routing.key` and `outcome`: `confirmed`, `unroutable`, `failed` |
+| `acemq.publish.total` | Publishes. Labelled `exchange`, `routing.key` and `outcome`: `confirmed`, `unroutable`, `failed` (may have been lost: a nack, no confirm in time, an I/O error), `refused` (declined before anything was sent — a `PublishingPausedError` while the broker has blocked the connection; nothing lost, safe to retry) |
 | `acemq.consume.total` | Deliveries settled. Labelled `queue` and `outcome`: `acked`, `retried`, `rejected`, `dead_lettered`, `parked` |
 | `acemq.consume.duration` | Seconds, timed around the interceptors as well as the handler, carrying the same `outcome` |
 | `acemq.consume.in.flight` | Being handled right now |
@@ -772,7 +772,8 @@ the same two.
 | `<destination> request` | `CLIENT` — because that one *waits*, so its duration measures a responder rather than a broker |
 
 `unroutable`, `failed` and `dead_lettered` set the span status to `ERROR`; the
-others, `retried` and `parked` included, do not — a retry is the system working,
+others, `retried` and `parked` included, do not (a `refused` publish is red by
+its exception, not its outcome) — a retry is the system working,
 a park is a decision a handler made on purpose, and a wall of red traces that
 turned out fine is how people learn to ignore the colour.
 

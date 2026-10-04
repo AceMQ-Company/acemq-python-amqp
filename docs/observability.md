@@ -118,7 +118,7 @@ another. Java publishes them through Micrometer and .NET through
 
 | Metric | |
 |---|---|
-| `acemq.publish.total` | Publishes. Labelled `exchange`, `routing.key` and `outcome`: `confirmed`, `unroutable`, `failed` |
+| `acemq.publish.total` | Publishes. Labelled `exchange`, `routing.key` and `outcome`: `confirmed`, `unroutable`, `failed` (may have been lost: a nack, no confirm in time, an I/O error), `refused` (declined before anything was sent — a `PublishingPausedError` while the broker has blocked the connection; nothing lost, safe to retry) |
 | `acemq.publish.duration` | Seconds, from calling `send` to the broker answering, carrying the same labels. Recorded for a publish that failed and one that reached no queue as well |
 | `acemq.consume.total` | Deliveries settled. Labelled `queue` and `outcome`: `acked`, `retried`, `rejected`, `dead_lettered`, `parked` |
 | `acemq.consume.duration` | Seconds, timed around the interceptors as well as the handler, and carrying the same `outcome` |
@@ -529,7 +529,9 @@ the queue itself. A `timed_out`
 request
 is red too, but by its exception rather than by its outcome: the outcome list is
 Java's, character for character, and a round trip that never got its answer is
-still a failure from where the caller is standing.
+still a failure from where the caller is standing. A `refused` publish — declined
+with `PublishingPausedError` before anything was written — is red the same way,
+by the exception it raised.
 
 Spans are recorded under the instrumentation scope `org.acemq.amqp` — the
 reverse-domain name, not a Python module path, and the same one Java, Ruby, Go

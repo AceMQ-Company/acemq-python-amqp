@@ -256,8 +256,17 @@ OUTCOME_PUBLISHED = "published"
 #: has, and the reason ``mandatory`` is worth setting.
 OUTCOME_UNROUTABLE = "unroutable"
 
-#: A publish that did not get to the broker at all.
+#: A publish that may have been lost: the broker nacked it, the confirm never
+#: came, or the connection failed partway. The message may or may not be on the
+#: broker, which is what makes this the outcome worth alerting on.
 OUTCOME_FAILED = "failed"
+
+#: A publish this library declined before writing anything to the wire — today
+#: a :class:`~acemq_amqp.PublishingPausedError`, raised while the broker has
+#: blocked the connection. Nothing was sent, so nothing was lost and retrying
+#: cannot duplicate it. Kept apart from :data:`OUTCOME_FAILED` so a broker
+#: alarm does not read as message loss; the same word in all five libraries.
+OUTCOME_REFUSED = "refused"
 
 #: A request that got its reply.
 OUTCOME_ANSWERED = "answered"

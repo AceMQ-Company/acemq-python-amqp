@@ -26,9 +26,23 @@ from datetime import timedelta
 
 import pytest
 from fake_transport import FakeTransport
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
 
-from acemq_amqp import Outbound, PublishError, PublishingPausedError, PublishResult
+from acemq_amqp import (
+    METRIC_PUBLISH_DURATION,
+    METRIC_PUBLISH_TOTAL,
+    Metrics,
+    Outbound,
+    PublishError,
+    PublishingPausedError,
+    PublishResult,
+)
 from acemq_amqp.connection import Connection
+from acemq_amqp.telemetry import OUTCOME_FAILED, OUTCOME_REFUSED, metric_key
+from acemq_amqp.tracing import ATTR_OUTCOME, OpenTelemetryTracing
 
 
 async def test_a_blocked_connection_refuses_the_publish_and_sends_nothing() -> None:
@@ -140,3 +154,64 @@ async def test_running_out_of_permits_is_a_failure_not_a_refusal() -> None:
     first.cancel()
 
     assert not isinstance(failed.value, PublishingPausedError)
+
+
+# -------------------------------------------------------------- telemetry
+#
+# ``refused`` is the outcome for a publish the library declined before writing
+# anything; ``failed`` keeps meaning "may have been lost". The same contract in
+# all five libraries, so a dashboard can alert on ``failed`` without paging
+# for a broker alarm that lost nothing.
+
+WHERE = {"exchange": "", "routing.key": "orders.new"}
+
+
+def test_the_refused_outcome_is_the_word_the_other_libraries_tag_with() -> None:
+    assert OUTCOME_REFUSED == "refused"
+
+
+async def test_a_refused_publish_is_counted_as_refused_not_failed() -> None:
+    transport = FakeTransport()
+    transport.blocked = True
+    metrics = Metrics()
+    connection = Connection(transport, observer=metrics)
+
+    with pytest.raises(PublishingPausedError):
+        await connection.publisher(routing_key="orders.new").send({"id": "1"})
+
+    refused = {**WHERE, "outcome": OUTCOME_REFUSED}
+    assert metrics.counts[metric_key(METRIC_PUBLISH_TOTAL, refused)] == 1
+    assert metrics.durations[metric_key(METRIC_PUBLISH_DURATION, refused)].count == 1
+    failed = metric_key(METRIC_PUBLISH_TOTAL, {**WHERE, "outcome": OUTCOME_FAILED})
+    assert failed not in metrics.counts
+
+
+async def test_a_nack_is_still_counted_as_failed() -> None:
+    metrics = Metrics()
+    connection = Connection(NackingTransport(), observer=metrics)
+
+    with pytest.raises(PublishError):
+        await connection.publisher(routing_key="orders.new").send({"id": "1"})
+
+    failed = {**WHERE, "outcome": OUTCOME_FAILED}
+    assert metrics.counts[metric_key(METRIC_PUBLISH_TOTAL, failed)] == 1
+
+
+async def test_a_refused_publish_span_says_refused() -> None:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracing = OpenTelemetryTracing(tracer_provider=provider)
+    transport = FakeTransport()
+    transport.blocked = True
+    connection = Connection(transport)
+    connection.intercept_publish(tracing.publish_interceptor())
+
+    with pytest.raises(PublishingPausedError):
+        await connection.publisher(routing_key="orders.new").send({"id": "1"})
+
+    (span,) = exporter.get_finished_spans()
+    assert span.attributes is not None
+    assert span.attributes[ATTR_OUTCOME] == OUTCOME_REFUSED
+    # Still red: the caller's publish did not happen and it raised.
+    assert span.status.status_code is StatusCode.ERROR

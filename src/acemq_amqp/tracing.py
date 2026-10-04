@@ -116,7 +116,7 @@ from .ack import (
     Settlement,
 )
 from .envelope import Envelope
-from .errors import AceMQError
+from .errors import AceMQError, PublishingPausedError
 from .headers import TRACEPARENT, TRACESTATE
 from .interceptors import (
     ConsumeContext,
@@ -132,6 +132,7 @@ from .telemetry import (
     OUTCOME_CONFIRMED,
     OUTCOME_FAILED,
     OUTCOME_PUBLISHED,
+    OUTCOME_REFUSED,
     OUTCOME_TIMED_OUT,
     OUTCOME_UNROUTABLE,
 )
@@ -187,8 +188,8 @@ ATTR_STEP = "step"
 ATTR_PIPELINE_OUTCOME = "outcome"
 
 # The words a publish or a request can end in — ``confirmed``, ``published``,
-# ``unroutable``, ``failed``, ``answered`` and ``timed_out`` — are defined in
-# :mod:`acemq_amqp.telemetry` beside the metrics that are tagged with them, and
+# ``unroutable``, ``failed``, ``refused``, ``answered`` and ``timed_out`` — are
+# defined in :mod:`acemq_amqp.telemetry` beside the metrics that are tagged with them, and
 # re-exported here: a span and a counter describing the same publish have to say
 # the same word, and the only way to be sure of that is for there to be one
 # word. ``tracing.OUTCOME_CONFIRMED`` still resolves, and is the same string.
@@ -207,12 +208,12 @@ ATTR_PIPELINE_OUTCOME = "outcome"
 #: rejection is a decision the handler made on purpose. What is left is the three
 #: that mean a message did not get where it was going.
 #:
-#: ``timed_out`` is absent for a different reason. It is not the outcome that
-#: makes that span red, the exception is: a request which reached its deadline
-#: raised, and :meth:`~OpenTelemetryTracing.request_span` records that exception
-#: and sets the error status from it. Same colour, with the deadline in the
-#: description rather than the bare word — and the set stays character-identical
-#: to Java's.
+#: ``timed_out`` and ``refused`` are absent for a different reason. It is not
+#: the outcome that makes those spans red, the exception is: a request which
+#: reached its deadline raised, as did a publish refused while the broker had
+#: blocked the connection, and the adapter records that exception and sets the
+#: error status from it. Same colour, with the cause in the description rather
+#: than the bare word — and the set stays character-identical to Java's.
 #:
 #: ``parked`` is absent for the same reason ``rejected`` is: a handler that
 #: parks a message decided to, on purpose, having read it. The ``parked`` outcome
@@ -327,7 +328,12 @@ class OpenTelemetryTracing:
                     # same way — ``Scope.failed`` records the exception and the
                     # status, and the caller, which knows what kind of operation
                     # this was, says the word.
-                    self._outcome(span, OUTCOME_FAILED)
+                    self._outcome(
+                        span,
+                        OUTCOME_REFUSED
+                        if isinstance(failure, PublishingPausedError)
+                        else OUTCOME_FAILED,
+                    )
                     self._failed(span, failure)
                     raise
                 self._outcome(
