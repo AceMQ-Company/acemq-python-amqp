@@ -8,6 +8,8 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.7.6] - 2026-10-04
+
 ### Fixed
 
 - **Closing the blocking API is bounded.** `SyncConsumer.close()` and
