@@ -45,6 +45,7 @@ from .ack import Ack
 from .codec import Codec
 from .connection import (
     DEFAULT_CONFIRM_TIMEOUT,
+    DEFAULT_DRAIN_TIMEOUT,
     DEFAULT_MAX_OUTSTANDING_PUBLISHES,
     DEFAULT_PREFETCH,
     Connection,
@@ -156,10 +157,40 @@ class SyncConsumer:
         """The queue this consumer reads."""
         return self._consumer.queue
 
-    def close(self) -> None:
-        """Stops the consumer and waits for the handlers already running."""
-        self._connection._loop.run(self._consumer.close())
-        self._workers.shutdown(wait=True)
+    def close(self, *, timeout: float | None = DEFAULT_DRAIN_TIMEOUT) -> bool:
+        """Stops the consumer and waits, for up to ``timeout``, for the handlers
+        already running.
+
+        Delivery stops first, and a message that had been delivered but not
+        started is given back to the broker. A handler that finishes in time is
+        settled as usual — see :meth:`acemq_amqp.Consumer.close`.
+
+        **A handler still running at the deadline is abandoned, not stopped.**
+        Python cannot cancel a thread, so it keeps running until the handler
+        returns of its own accord, and whatever it returns is thrown away. Its
+        message is left unsettled — never acknowledged, never rejected, never
+        dead-lettered — so the broker hands it out again once the channel goes:
+        a handler that was cut off may have done its work, and the message may
+        be handled twice, which is the at-least-once promise and not a loss.
+        The settlement belongs to the consumer, not to the thread, so a thread
+        that finishes late has nothing to acknowledge with and cannot settle a
+        message on a channel that has closed or been replaced.
+
+        The abandoned thread is a normal, non-daemon thread: the interpreter
+        waits for it at exit. A handler that can hang should carry its own
+        timeout.
+
+        :param timeout: seconds to wait for every running handler together;
+            ``None`` waits for as long as they take
+        :returns: ``True`` if every handler finished, ``False`` if the time ran
+            out first and some were abandoned — the consumer is stopped either way
+        """
+        try:
+            return self._connection._loop.run(self._consumer.close(timeout=timeout))
+        finally:
+            # Not waited for: a thread still running here is one the deadline
+            # has already given up on.
+            self._workers.shutdown(wait=False, cancel_futures=True)
 
     def __enter__(self) -> SyncConsumer:
         return self
@@ -180,6 +211,7 @@ class SyncConnection:
         self._loop = loop
         self._connection = connection
         self._closed = False
+        self._workers: list[ThreadPoolExecutor] = []
 
     @property
     def connection(self) -> Connection:
@@ -247,6 +279,7 @@ class SyncConnection:
         workers = ThreadPoolExecutor(
             max_workers=concurrency, thread_name_prefix=f"acemq-{queue}"
         )
+        self._workers.append(workers)
 
         async def run_on_a_thread(message: Message) -> Ack:
             loop = asyncio.get_running_loop()
@@ -279,15 +312,29 @@ class SyncConnection:
         """Removes a queue and every message still on it."""
         self._loop.run(self._connection.delete_queue(queue))
 
-    def close(self) -> None:
-        """Stops every consumer, releases the connection and stops the loop."""
+    def close(self, *, timeout: float | None = DEFAULT_DRAIN_TIMEOUT) -> bool:
+        """Stops every consumer, releases the connection and stops the loop.
+
+        Every consumer's running handlers share one deadline, ``timeout``. A
+        handler still running at it is abandoned exactly as
+        :meth:`SyncConsumer.close` describes: its thread keeps running, its
+        result is discarded and its message is left unsettled for the broker
+        to redeliver.
+
+        :param timeout: seconds to wait for the running handlers; ``None``
+            waits for as long as they take
+        :returns: ``True`` if every handler finished, ``False`` if the time ran
+            out first. Closing again returns ``True``
+        """
         if self._closed:
-            return
+            return True
         self._closed = True
         try:
-            self._loop.run(self._connection.close())
+            return self._loop.run(self._connection.close(timeout=timeout))
         finally:
             self._loop.stop()
+            for workers in self._workers:
+                workers.shutdown(wait=False, cancel_futures=True)
 
     def __enter__(self) -> SyncConnection:
         return self

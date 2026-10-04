@@ -288,6 +288,16 @@ task that is cancelled — is told so: the running handlers are cancelled the sa
 way, the connection is still released, and the cancellation (or the
 `TimeoutError`) is raised again.
 
+The blocking API takes the same `timeout` and returns the same answer —
+`SyncConsumer.close(timeout=...)` and `SyncConnection.close(timeout=...)` — with
+one difference a thread forces on it: **a handler still running at the deadline
+is abandoned, not stopped.** Python cannot cancel a thread, so it carries on
+until the handler returns by itself, and whatever it returns is discarded. Its
+message is left unsettled exactly as above and redelivered; a thread that
+finishes late cannot settle anything, because the settlement is the consumer's
+and the consumer has gone. The thread is not a daemon, so the interpreter waits
+for it at exit — a handler that can hang should carry its own timeout.
+
 Closing is not itself a cancellation, though. A shutdown that cancelled the
 tasks on the loop before closing the connection leaves workers that are already
 cancelled; closing does not report those, because a caller who is merely

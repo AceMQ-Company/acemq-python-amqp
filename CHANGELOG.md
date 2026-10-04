@@ -8,6 +8,22 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Closing the blocking API is bounded.** `SyncConsumer.close()` and
+  `SyncConnection.close()` waited on their handler threads with no limit; they
+  now take the same `timeout` keyword as the async `close` (default
+  `DEFAULT_DRAIN_TIMEOUT`, twenty seconds; `None` waits as long as it takes) and
+  return `True` if every handler finished, `False` if the deadline cut some off.
+  Delivery stops first and unstarted deliveries are given back. A thread cannot
+  be cancelled, so a handler still running at the deadline is **abandoned, not
+  stopped**: its thread keeps running, its result is discarded, and its message
+  is left unsettled — never acknowledged, rejected or dead-lettered — for the
+  broker to redeliver. A thread that finishes late cannot settle anything,
+  because the settlement belongs to the consumer, which has gone. The thread is
+  not a daemon, so the interpreter still waits for it at exit. The same
+  semantics as Ruby 0.7.6.
+
 ### Added
 
 - **A `refused` outcome on publish telemetry.** A publish the library declined

@@ -1703,6 +1703,56 @@ def test_the_blocking_api_publishes_and_consumes(blocking: sync.SyncConnection) 
                 blocking.delete_queue(name)
 
 
+def test_a_blocking_handler_cut_off_by_the_drain_bound_is_redelivered_not_lost(
+    blocking: sync.SyncConnection,
+) -> None:
+    # A thread cannot be cancelled, so closing abandons it at the deadline. Its
+    # message must stay unsettled for the broker to redeliver, and the thread
+    # finishing afterwards must not settle it on a channel that has gone.
+    queue = f"{PREFIX}{uuid.uuid4().hex[:8]}.blocking-cut-off"
+    blocking.declare(Topology().queue(queue, dead_letter=True))
+    try:
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def stuck(message: Message) -> Ack:
+            started.set()
+            release.wait(20)
+            finished.set()
+            return accept()
+
+        consumer = blocking.consume(queue, stuck)
+        blocking.publisher(routing_key=queue, mandatory=True).send({"id": "7"})
+        assert started.wait(20.0) is True
+
+        began = time.monotonic()
+        assert consumer.close(timeout=0.2) is False
+        assert time.monotonic() - began < 5.0
+        assert not finished.is_set()
+
+        release.set()
+        assert finished.wait(5.0) is True
+
+        got: list[Message] = []
+        arrived = threading.Event()
+
+        def again(message: Message) -> Ack:
+            got.append(message)
+            arrived.set()
+            return accept()
+
+        with blocking.consume(queue, again):
+            assert arrived.wait(20.0) is True
+        assert got[0].payload == {"id": "7"}
+        assert got[0].redelivered is True
+        assert blocking.message_count(dead_letter_queue(queue)) == 0
+    finally:
+        for name in (queue, dead_letter_queue(queue), parked_queue(queue)):
+            with contextlib.suppress(Exception):
+                blocking.delete_queue(name)
+
+
 # --------------------------------------------------------------------------
 # Reaching the broker safely.
 #
