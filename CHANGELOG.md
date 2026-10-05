@@ -8,6 +8,8 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.7.7] - 2026-10-05
+
 ### Fixed
 
 - **A redelivery that finds its idempotency claim still held is put back, not
