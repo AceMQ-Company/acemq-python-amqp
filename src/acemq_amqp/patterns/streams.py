@@ -131,7 +131,7 @@ def _refusing_retries(stream: str, handler: Handler) -> AsyncHandler:
     async def read(message: Message) -> Ack:
         returned = handler(message)
         decision: Ack = await returned if inspect.isawaitable(returned) else returned
-        if isinstance(decision, Ack) and decision.action is Action.RETRY:
+        if isinstance(decision, Ack) and decision.action in (Action.RETRY, Action.IN_PROGRESS):
             # Logged here as well as carried on the dead letter, because the two
             # reach different people. Whoever drains ``{stream}.dlq`` finds the
             # reason on the message; whoever wrote the handler is reading logs.

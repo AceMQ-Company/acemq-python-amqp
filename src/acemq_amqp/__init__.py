@@ -42,7 +42,7 @@ that a password never has to be written into a connection string.
 from __future__ import annotations
 
 from . import headers
-from .ack import Ack, Action, FatalError, Settlement, accept, park, reject
+from .ack import Ack, Action, FatalError, Settlement, accept, in_progress, park, reject
 from .ack import retry as _retry
 from .codec import (
     BYTES_CONTENT_TYPE,
@@ -254,6 +254,7 @@ __all__ = [
     "exponential_retry",
     "fixed_retry",
     "headers",
+    "in_progress",
     "is_development_certificate",
     "no_retry",
     "park",

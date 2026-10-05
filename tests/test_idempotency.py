@@ -19,8 +19,8 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 
-from acemq_amqp import Ack, Envelope, Message, accept, reject, retry
-from acemq_amqp.patterns import InMemoryIdempotencyStore, idempotent
+from acemq_amqp import Ack, Action, Envelope, Message, accept, in_progress, reject, retry
+from acemq_amqp.patterns import Claim, InMemoryIdempotencyStore, idempotent
 
 CONTENT_TYPE = "application/json"
 
@@ -230,3 +230,88 @@ async def test_a_confirmation_that_fails_does_not_undo_the_handler() -> None:
 
     assert await idempotent(store, handler)(message("order-1")) == accept()
     assert store.confirmed == []
+
+
+async def test_a_redelivery_while_the_first_is_still_working_is_put_back_not_accepted() -> (
+    None
+):
+    """Accepting it would lose the message if the first handler then died."""
+    store = InMemoryIdempotencyStore()
+    started, release = asyncio.Event(), asyncio.Event()
+    ran: list[str] = []
+
+    async def handler(incoming: Message) -> Ack:
+        ran.append(incoming.envelope.id)
+        started.set()
+        await release.wait()
+        return accept()
+
+    guarded = idempotent(store, handler)
+    first = asyncio.ensure_future(guarded(message("order-1")))
+    await started.wait()
+
+    second = await guarded(message("order-1"))
+
+    assert second.action is Action.IN_PROGRESS
+    assert ran == ["order-1"]
+    release.set()
+    assert await first == accept()
+    # Once the first has finished, a redelivery is an ordinary duplicate.
+    assert await guarded(message("order-1")) == accept()
+    assert ran == ["order-1"]
+
+
+async def test_a_failed_handler_whose_release_failed_is_put_back_not_accepted() -> None:
+    """The bug: the claim outlived the failure, and the retry was acknowledged
+    as a duplicate of work that never happened."""
+
+    class Sticky(InMemoryIdempotencyStore):
+        async def forget(self, key: str) -> None:
+            raise ConnectionError("the store is not answering")
+
+    ran: list[str] = []
+
+    async def handler(incoming: Message) -> Ack:
+        ran.append(incoming.envelope.id)
+        return retry(RuntimeError("died mid-work"))
+
+    guarded = idempotent(Sticky(), handler)
+    assert (await guarded(message("order-1"))).action is Action.RETRY
+
+    again = await guarded(message("order-1"))
+
+    assert again.action is Action.IN_PROGRESS
+    assert ran == ["order-1"]
+
+
+async def test_the_in_progress_wait_is_the_one_asked_for() -> None:
+    store = InMemoryIdempotencyStore()
+    await store.claim("order-1")
+
+    async def handler(incoming: Message) -> Ack:
+        raise AssertionError("the handler should not have been reached")
+
+    decision = await idempotent(store, handler, in_progress_delay=timedelta(seconds=3))(
+        message("order-1")
+    )
+
+    assert decision == in_progress(timedelta(seconds=3))
+
+
+async def test_the_memory_store_tells_a_claim_from_a_duplicate_from_work_in_progress() -> (
+    None
+):
+    store = InMemoryIdempotencyStore(ttl=timedelta(milliseconds=30))
+
+    assert await store.claim("order-1") is Claim.CLAIMED
+    assert await store.claim("order-1") is Claim.IN_PROGRESS
+    await store.confirm("order-1")
+    assert await store.claim("order-1") is Claim.DUPLICATE
+    # first_time keeps its old answer: only a fresh claim is a first time.
+    assert await store.first_time("order-1") is False
+
+    await asyncio.sleep(0.05)
+    # A claim nobody confirmed is a lease the window ends, and then it is retaken.
+    await store.claim("order-2")
+    await asyncio.sleep(0.05)
+    assert await store.claim("order-2") is Claim.CLAIMED

@@ -30,9 +30,10 @@ from pathlib import Path
 
 import pytest
 
-from acemq_amqp import Ack, Action, Envelope, Message, accept
+from acemq_amqp import Ack, Action, Envelope, Message, accept, retry
 from acemq_amqp.errors import AceMQError
 from acemq_amqp.patterns import (
+    Claim,
     IdempotencyStore,
     OutboxRecord,
     OutboxStore,
@@ -346,6 +347,69 @@ async def test_an_expired_hold_can_be_taken_over(
 
     assert await alive.first_time("order-1") is True
     assert await alive.size() == 1
+
+
+async def test_a_claim_says_whether_it_was_taken_is_a_duplicate_or_is_in_progress(
+    connections: Callable[[], sqlite3.Connection],
+) -> None:
+    mine = SqlIdempotencyStore(connections)
+    theirs = SqlIdempotencyStore(connections)
+
+    assert await mine.claim("order-1") is Claim.CLAIMED
+    # Live and unconfirmed: somebody is working on it, which is not the same as
+    # it having been done.
+    assert await theirs.claim("order-1") is Claim.IN_PROGRESS
+    assert await mine.claim("order-1") is Claim.IN_PROGRESS
+    await mine.confirm("order-1")
+    assert await theirs.claim("order-1") is Claim.DUPLICATE
+
+
+async def test_an_expired_claim_is_retaken_through_claim_too(
+    connections: Callable[[], sqlite3.Connection],
+) -> None:
+    died = SqlIdempotencyStore(connections, claim_timeout=timedelta(milliseconds=1))
+    alive = SqlIdempotencyStore(connections)
+
+    assert await died.claim("order-1") is Claim.CLAIMED
+    await asyncio.sleep(0.01)
+
+    assert await alive.claim("order-1") is Claim.CLAIMED
+
+
+async def test_a_retry_whose_release_failed_waits_for_the_lease_and_then_runs(
+    connections: Callable[[], sqlite3.Connection],
+) -> None:
+    """Handler died, forget failed: the redelivery is put back, never accepted,
+    and the message is handled once the lease has run out."""
+
+    class Sticky(SqlIdempotencyStore):
+        async def forget(self, key: str, *, connection: object = None) -> None:
+            raise ConnectionError("the store is not answering")
+
+    store = Sticky(connections, claim_timeout=timedelta(milliseconds=50))
+    outcomes: list[str] = []
+
+    async def handler(message: Message) -> Ack:
+        outcomes.append("ran")
+        return retry(RuntimeError("died mid-work")) if len(outcomes) == 1 else accept()
+
+    guarded = idempotent(store, handler)
+    incoming = Message(
+        payload={},
+        envelope=Envelope(id="order-1"),
+        routing_key="orders",
+        content_type="application/json",
+        redelivered=False,
+        body=b"{}",
+    )
+
+    assert (await guarded(incoming)).action is Action.RETRY
+    assert (await guarded(incoming)).action is Action.IN_PROGRESS
+    await asyncio.sleep(0.1)
+    assert await guarded(incoming) == accept()
+    assert await guarded(incoming) == accept()
+    assert outcomes == ["ran", "ran"]
+    assert await store.is_confirmed("order-1") is True
 
 
 async def test_a_confirmation_outlives_a_lease(

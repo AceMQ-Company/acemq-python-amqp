@@ -40,6 +40,7 @@ from . import naming
 from .ack import (
     OUTCOME_ACKED,
     OUTCOME_DEAD_LETTERED,
+    OUTCOME_IN_PROGRESS,
     OUTCOME_PARKED,
     OUTCOME_REJECTED,
     OUTCOME_RETRIED,
@@ -767,6 +768,13 @@ class Consumer:
                 None,
             )
 
+        if decision.action is Action.IN_PROGRESS:
+            # Somebody else holds the message. Not a failure of this one, so the
+            # retry policy is not asked: it can neither spend an attempt nor run
+            # out and dead-letter a message nobody has failed to handle.
+            delay = decision.delay if decision.delay is not None else ZERO
+            return Settlement(OUTCOME_IN_PROGRESS, delay=delay), Wait(delay, in_broker=False)
+
         if isinstance(decision.error, FatalError):
             # The handler asked for a retry but marked the reason as one that
             # will not change. Honouring the mark rather than the request is the
@@ -836,6 +844,10 @@ class Consumer:
 
         if wait is None:
             await self._dead_letter(delivery, envelope, settlement.reason or "")
+            return
+
+        if settlement.outcome == OUTCOME_IN_PROGRESS:
+            await self._put_back(delivery, envelope, wait.delay)
             return
 
         if wait.in_broker and await self._retry_in_broker(delivery, envelope, wait.delay):
@@ -975,6 +987,26 @@ class Consumer:
             delay,
         )
         await delivery.ack()
+
+    async def _put_back(
+        self, delivery: Delivery, envelope: Envelope, delay: timedelta
+    ) -> None:
+        """Returns a message somebody else is working on, attempt unchanged.
+
+        :meth:`_retry_again` without the increment: the attempt counts this
+        message's failures, and a claim held elsewhere is not one of them.
+        """
+        if delay > ZERO:
+            await asyncio.sleep(delay.total_seconds())
+        if await self._republish(delivery, self._queue, envelope):
+            await delivery.ack()
+            return
+        log.error(
+            "acemq: cannot put %s back onto %s; returning it to the broker",
+            envelope.id,
+            self._queue,
+        )
+        await delivery.nack(True)
 
     async def _park(self, delivery: Delivery, envelope: Envelope, reason: str) -> None:
         """Sends the message to ``{queue}.parked`` with the reason attached.

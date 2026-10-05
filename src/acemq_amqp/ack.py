@@ -47,14 +47,23 @@ OUTCOME_DEAD_LETTERED = "dead_lettered"
 #: used for a body that would not decode.
 OUTCOME_PARKED = "parked"
 
+#: Somebody else holds a live claim on the message and has not finished, so it
+#: was put back to be looked at again later — without spending an attempt, and
+#: never dead-lettered for it. See :func:`in_progress`.
+OUTCOME_IN_PROGRESS = "in_progress"
+
+#: How long a message found in progress waits before it is looked at again.
+DEFAULT_IN_PROGRESS_DELAY = timedelta(seconds=5)
+
 
 class Action(Enum):
-    """The four things that can be done with a delivered message."""
+    """The things that can be done with a delivered message."""
 
     ACCEPT = "accept"
     RETRY = "retry"
     REJECT = "reject"
     PARK = "park"
+    IN_PROGRESS = "in_progress"
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +79,9 @@ class Ack:
 
     action: Action
     error: BaseException | None = None
+    #: How long to wait before the message is looked at again. Read for
+    #: :attr:`Action.IN_PROGRESS` only; a retry's wait is the policy's.
+    delay: timedelta | None = None
 
     def __str__(self) -> str:
         return self.action.value
@@ -161,6 +173,26 @@ def park(error: BaseException | None = None) -> Ack:
     has to sort them by hand to find the producer that is emitting rubbish.
     """
     return Ack(Action.PARK, error)
+
+
+def in_progress(delay: timedelta = DEFAULT_IN_PROGRESS_DELAY) -> Ack:
+    """Puts the message back because somebody else is still working on it.
+
+    What :func:`~acemq_amqp.patterns.idempotent` answers when a redelivery finds
+    a claim that is live but not yet confirmed. Accepting it would lose the
+    message if that other handler then died; running it would do the work
+    twice. So it goes back on its own queue after ``delay``, with its attempt
+    **unchanged**: a claim held elsewhere says nothing about whether this
+    message can be handled, so it neither spends a retry nor can exhaust the
+    policy and be dead-lettered. When the claim is confirmed the next look is a
+    duplicate and is accepted; when its lease runs out, it is taken over.
+
+    The wait is spent in the consumer, holding the delivery, as a short retry's
+    is; keep it short beside the store's claim timeout.
+
+    :param delay: how long until the message is looked at again
+    """
+    return Ack(Action.IN_PROGRESS, delay=delay)
 
 
 class FatalError(Exception):

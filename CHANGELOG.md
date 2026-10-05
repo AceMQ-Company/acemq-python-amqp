@@ -8,6 +8,31 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A redelivery that finds its idempotency claim still held is put back, not
+  acknowledged.** `idempotent()` used to treat a live but unconfirmed claim as a
+  duplicate and accept the message; if the first handler had failed and its
+  `forget` failed too (only logged), the message was lost. Now a confirmed claim
+  is still a duplicate (accepted, handler not run), an expired claim is still
+  taken over and run, and a **live unconfirmed** claim is *in progress*: the
+  handler is not run and the message goes back on its own queue after
+  `in_progress_delay` (default five seconds) **with its attempt unchanged** — it
+  spends no retry and is never dead-lettered for it. Counted as
+  `acemq.consume.total{outcome="in_progress"}`; the span outcome is the same.
+  The same contract in all five libraries.
+
+### Added
+
+- `Claim` (`CLAIMED`, `DUPLICATE`, `IN_PROGRESS`) and `claim(key) -> Claim` on
+  `SqlIdempotencyStore` and `InMemoryIdempotencyStore`; `first_time` keeps its
+  signature and is `claim(key) is Claim.CLAIMED`. A custom store with only
+  `first_time` still works, without the in-progress answer.
+  `InMemoryIdempotencyStore` gains `confirm`; its `ttl` is also the claim's lease.
+- `in_progress(delay)`, `Action.IN_PROGRESS`, `OUTCOME_IN_PROGRESS`, an optional
+  `Ack.delay`, and `idempotent(..., in_progress_delay=...)`. A stream reader
+  refuses `in_progress` as it refuses `retry`.
+
 ## [0.7.6] - 2026-10-04
 
 ### Fixed

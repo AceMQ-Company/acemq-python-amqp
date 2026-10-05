@@ -120,7 +120,7 @@ another. Java publishes them through Micrometer and .NET through
 |---|---|
 | `acemq.publish.total` | Publishes. Labelled `exchange`, `routing.key` and `outcome`: `confirmed`, `unroutable`, `failed` (may have been lost: a nack, no confirm in time, an I/O error), `refused` (declined before anything was sent — a `PublishingPausedError` while the broker has blocked the connection; nothing lost, safe to retry) |
 | `acemq.publish.duration` | Seconds, from calling `send` to the broker answering, carrying the same labels. Recorded for a publish that failed and one that reached no queue as well |
-| `acemq.consume.total` | Deliveries settled. Labelled `queue` and `outcome`: `acked`, `retried`, `rejected`, `dead_lettered`, `parked` |
+| `acemq.consume.total` | Deliveries settled. Labelled `queue` and `outcome`: `acked`, `retried`, `rejected`, `dead_lettered`, `parked`, `in_progress` (put back because another consumer holds a live idempotency claim; no attempt spent) |
 | `acemq.consume.duration` | Seconds, timed around the interceptors as well as the handler, and carrying the same `outcome` |
 | `acemq.consume.attempts` | Which attempt a delivery was on when it arrived. A distribution rather than a duration — see [the one metric that is not seconds](#the-one-metric-that-is-not-seconds) |
 | `acemq.consume.in.flight` | A gauge: how many are being handled right now |
@@ -228,6 +228,7 @@ together:
 | `rejected` | `acemq.consume.total{outcome="rejected"}`, and `acemq.messages.dead.lettered.total{outcome="dead_lettered"}` because that is where it went |
 | `dead_lettered` | `acemq.consume.total{outcome="dead_lettered"}`, and `acemq.messages.dead.lettered.total{outcome="dead_lettered"}` |
 | `parked` | `acemq.consume.total{outcome="parked"}`, and `acemq.messages.dead.lettered.total{outcome="parked"}` — the same counter as a dead letter, told apart by the outcome and still a different queue |
+| `in_progress` | `acemq.consume.total{outcome="in_progress"}` only — put back on its own queue with the attempt unchanged, so not a retry |
 
 The standalone `retried` and `dead.lettered` counters are not a redundancy, and
 Java keeps them for the same reason: the outcome says what was decided about a
@@ -574,6 +575,7 @@ waits for the consumer's decision, and takes its outcome from that:
 | the handler rejected it | `rejected` | `message.dead_lettered` | |
 | it ran out of attempts, aged out, or was fatal | `dead_lettered` | `message.dead_lettered`, with the reason | `ERROR` |
 | the handler parked it | `parked` | — | |
+| another consumer holds it (`in_progress()`) | `in_progress` | — | |
 
 The retry delay is the one thing about a retry nobody can reconstruct
 afterwards — it comes from the policy, the attempt and, where there is jitter, a

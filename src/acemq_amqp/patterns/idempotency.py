@@ -27,9 +27,19 @@ import logging
 import threading
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from typing import Protocol, runtime_checkable
 
-from ..ack import Ack, Action, FatalError, accept, reject, retry
+from ..ack import (
+    DEFAULT_IN_PROGRESS_DELAY,
+    Ack,
+    Action,
+    FatalError,
+    accept,
+    in_progress,
+    reject,
+    retry,
+)
 from ..connection import AsyncHandler, Handler, Message
 from ._support import decide
 
@@ -37,6 +47,18 @@ log = logging.getLogger("acemq")
 
 #: How long the in-memory store remembers a key when nothing says otherwise.
 DEFAULT_MEMORY = timedelta(hours=1)
+
+
+class Claim(Enum):
+    """What a store found when it was asked to claim a message."""
+
+    #: Nobody had it, or the last holder's lease had run out: it is ours to run.
+    CLAIMED = "claimed"
+    #: It was handled and confirmed. Accept it without running anything.
+    DUPLICATE = "duplicate"
+    #: Somebody holds a live claim and has not confirmed. Neither run it nor
+    #: accept it: put it back and look again later.
+    IN_PROGRESS = "in_progress"
 
 
 @runtime_checkable
@@ -81,20 +103,36 @@ class InMemoryIdempotencyStore:
         if ttl <= timedelta(0):
             raise ValueError(f"acemq: an idempotency window must be positive, got {ttl}")
         self._ttl = ttl
-        self._seen: dict[str, datetime] = {}
+        # When the key was claimed, and whether that claim became a fact. The
+        # window is also the lease: an unconfirmed claim is "in progress" until
+        # it ages out, and then the key is free again.
+        self._seen: dict[str, tuple[datetime, bool]] = {}
         # A plain lock rather than an asyncio one: it is held for a dictionary
         # operation and never across an await, and this way a store shared by
         # the blocking API's worker threads is safe too.
         self._lock = threading.Lock()
 
-    async def first_time(self, key: str) -> bool:
+    async def claim(self, key: str) -> Claim:
+        """Claims a key, or says why not: done already, or still being done."""
         now = datetime.now(timezone.utc)
         with self._lock:
             self._sweep(now)
-            if key in self._seen:
-                return False
-            self._seen[key] = now
-            return True
+            held = self._seen.get(key)
+            if held is None:
+                self._seen[key] = (now, False)
+                return Claim.CLAIMED
+            return Claim.DUPLICATE if held[1] else Claim.IN_PROGRESS
+
+    async def first_time(self, key: str) -> bool:
+        return await self.claim(key) is Claim.CLAIMED
+
+    async def confirm(self, key: str) -> None:
+        """Records that the claimed message really was handled."""
+        with self._lock:
+            held = self._seen.get(key)
+            if held is not None:
+                # In place, so insertion order — which the sweep relies on — holds.
+                self._seen[key] = (held[0], True)
 
     async def forget(self, key: str) -> None:
         with self._lock:
@@ -111,7 +149,7 @@ class InMemoryIdempotencyStore:
         cutoff = now - self._ttl
         while self._seen:
             oldest = next(iter(self._seen))
-            if self._seen[oldest] > cutoff:
+            if self._seen[oldest][0] > cutoff:
                 return
             del self._seen[oldest]
 
@@ -127,6 +165,7 @@ def idempotent(
     handler: Handler,
     *,
     key: Callable[[Message], str] | None = None,
+    in_progress_delay: timedelta = DEFAULT_IN_PROGRESS_DELAY,
 ) -> AsyncHandler:
     """Wraps a handler so a message already handled is accepted, not redone::
 
@@ -143,6 +182,16 @@ def idempotent(
     to be told when the lease becomes a fact. A store without one, such as
     :class:`InMemoryIdempotencyStore`, is unaffected.
 
+    A redelivery that finds the message **in progress** — claimed by a handler
+    that is still running, or by one that failed and could not release its
+    claim — is neither run nor accepted: it is answered with
+    :func:`~acemq_amqp.in_progress`, which puts it back after
+    ``in_progress_delay`` without spending a retry attempt. Accepting it would
+    lose the message if that claim never became a fact. A store with a
+    ``claim`` method (both shipped stores) is asked for this three-way answer;
+    one with only ``first_time`` cannot tell in-progress from done and is
+    treated as before.
+
     That ordering is what makes this a guard against duplicates
     rather than a promise of exactly-once: between the handler finishing and the
     acknowledgement reaching the broker there is still a gap where a crash leaves
@@ -156,6 +205,8 @@ def idempotent(
         Use it where the natural key is in the payload — an order identifier two
         different messages both carry, where handling either twice is the thing
         to prevent
+    :param in_progress_delay: how long a message found in progress waits before
+        it is looked at again. Keep it well under the store's claim timeout
     :returns: the wrapped handler
     """
 
@@ -172,14 +223,16 @@ def idempotent(
             )
 
         try:
-            first = await store.first_time(identity)
+            claimed = await _claim(store, identity)
         except Exception as failure:
             # The store is what is broken, not the message. Retrying is right;
             # carrying on and risking a duplicate is not.
             return retry(failure)
 
-        if not first:
+        if claimed is Claim.DUPLICATE:
             return accept()
+        if claimed is Claim.IN_PROGRESS:
+            return in_progress(in_progress_delay)
 
         decision = await decide(handler, message)
         if decision.action is not Action.ACCEPT:
@@ -191,6 +244,19 @@ def idempotent(
         return decision
 
     return guarded
+
+
+async def _claim(store: IdempotencyStore, key: str) -> Claim:
+    """Asks for the three-way answer, from a store that can give it.
+
+    Duck-typed for the same reason ``confirm`` is: a store written against the
+    two-method protocol keeps working, and can only say claimed or duplicate.
+    """
+    claim = getattr(store, "claim", None)
+    if claim is not None:
+        answer: Claim = await claim(key)
+        return answer
+    return Claim.CLAIMED if await store.first_time(key) else Claim.DUPLICATE
 
 
 async def _confirm_quietly(store: IdempotencyStore, key: str) -> None:
@@ -230,8 +296,8 @@ async def _forget_quietly(store: IdempotencyStore, key: str) -> None:
 
     The handler has already decided and its reason is the one worth carrying, so
     this failure is logged rather than raised. It is worth logging loudly: a key
-    that could not be forgotten turns every remaining attempt at that message
-    into a silent no-op.
+    that could not be forgotten leaves the message *in progress* until the
+    claim runs out, so every redelivery until then is put back rather than run.
     """
     try:
         await store.forget(key)

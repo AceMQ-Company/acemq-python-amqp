@@ -118,6 +118,23 @@ A duplicate is **accepted**, not rejected. The work was done, so the message has
 been handled, and dead-lettering it would raise an alarm about something that
 went right.
 
+A redelivery that finds the message **in progress** — claimed, not yet
+confirmed, and the claim still live — is neither run nor accepted. Accepting it
+was how a message could be lost: if the first handler failed and its claim could
+not be released, the retry looked like a duplicate. Instead the wrapper answers
+`in_progress(delay)` and the consumer puts the message back on its own queue
+after `in_progress_delay` (five seconds by default) **with its attempt
+unchanged**: it does not spend a retry and can never be dead-lettered for it.
+Once the claim is confirmed the next look is a duplicate; once its lease runs out
+the message is taken over and run. It shows as `outcome="in_progress"` on
+`acemq.consume.total`.
+
+| the store says | the wrapper |
+|---|---|
+| `Claim.CLAIMED` — no claim, or its lease ran out | runs the handler |
+| `Claim.DUPLICATE` — confirmed | `accept()`, handler not run |
+| `Claim.IN_PROGRESS` — live, unconfirmed | `in_progress(...)`, handler not run |
+
 When the handler does *not* accept, the key is forgotten so the retry can
 actually run. That ordering is what makes this a guard against duplicates rather
 than a promise of exactly-once: between the handler finishing and the
@@ -131,6 +148,12 @@ class IdempotencyStore(Protocol):
     async def first_time(self, key: str) -> bool: ...
     async def forget(self, key: str) -> None: ...
 ```
+
+Give your store `async def claim(self, key) -> Claim` (and `confirm`) to get the
+three-way answer; both shipped stores have them, and `first_time` stays as
+`claim(key) is Claim.CLAIMED`. A store with only `first_time` cannot tell work
+in progress from work done, and is treated as before. In
+`InMemoryIdempotencyStore` the window (`ttl`) is also the lease.
 
 Where the natural key is in the payload rather than the envelope — an order
 identifier that two different messages both carry, where handling either twice

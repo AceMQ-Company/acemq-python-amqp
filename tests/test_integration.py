@@ -116,6 +116,7 @@ from acemq_amqp.patterns import (
     ResponderError,
     RoutingSlip,
     Scheduler,
+    SqlIdempotencyStore,
     SqlOutboxStore,
     StreamRetention,
     claim_key_of,
@@ -1298,6 +1299,55 @@ async def test_a_duplicate_is_accepted_without_running_the_handler_again(
     assert ran == ["order-1"]
     # Accepted, not dead-lettered: the work was done, so the message has been
     # handled and nothing should be raising an alarm about it.
+    assert await mq.message_count(dead_letter_queue(queue)) == 0
+
+
+async def test_a_handler_that_died_with_its_claim_held_is_handled_exactly_once_later(
+    mq: Connection, workspace: Workspace, tmp_path: Path
+) -> None:
+    """The handler fails mid-work and its claim cannot be released. The retry
+    finds the claim live and unconfirmed: it used to be acknowledged as a
+    duplicate, losing the message. Now it is put back, without spending an
+    attempt, until the lease runs out — and then it is handled, once."""
+    database = tmp_path / "idempotency.db"
+    setting_up = sqlite3.connect(database)
+    try:
+        create_schema(setting_up, outbox=None, registry=None)
+    finally:
+        setting_up.close()
+
+    class Sticky(SqlIdempotencyStore):
+        async def forget(self, key: str, *, connection: Any = None) -> None:
+            raise ConnectionError("the store is not answering")
+
+    store = Sticky(lambda: sqlite3.connect(database), claim_timeout=timedelta(seconds=2))
+    queue = await workspace.queue("died-holding")
+    attempts: list[int] = []
+    done = asyncio.Event()
+
+    async def handler(message: Message) -> Ack:
+        attempts.append(message.envelope.attempt)
+        if len(attempts) == 1:
+            raise RuntimeError("died mid-work")
+        done.set()
+        return accept()
+
+    # Two attempts in all: anything that spent one on the in-progress wait would
+    # dead-letter the message instead of handling it.
+    guarded = idempotent(store, handler, in_progress_delay=timedelta(milliseconds=200))
+    consumer = await mq.consume(queue, guarded, retry=fixed_retry(2, timedelta(0)))
+    try:
+        await mq.publisher(routing_key=queue, mandatory=True).send(
+            {"id": "7"}, envelope=Envelope(id="order-died")
+        )
+        await asyncio.wait_for(done.wait(), 20.0)
+        await until(lambda: _count(mq, queue, 0), "the message was settled")
+        await asyncio.sleep(1.0)
+    finally:
+        await consumer.close()
+
+    assert attempts == [1, 2]
+    assert await store.is_confirmed("order-died") is True
     assert await mq.message_count(dead_letter_queue(queue)) == 0
 
 

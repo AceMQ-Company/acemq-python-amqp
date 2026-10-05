@@ -45,6 +45,7 @@ from .claimcheck import (
 from .consumergroup import ConsumerGroup
 from .idempotency import (
     DEFAULT_MEMORY,
+    Claim,
     IdempotencyStore,
     InMemoryIdempotencyStore,
     idempotent,
@@ -191,6 +192,7 @@ __all__ = [
     "SCHEDULE_DUE",
     "SCHEDULE_EXCHANGE",
     "SCHEDULE_RUNGS",
+    "Claim",
     "ClaimCheckCodec",
     "ClaimCheckStore",
     "ConsumerGroup",

@@ -71,6 +71,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol, runtime_checkable
 
 from ..errors import AceMQError
+from .idempotency import Claim
 from .outbox import OutboxRecord
 from .schema import SchemaDefinition, SchemaNotFoundError, fingerprint
 
@@ -510,11 +511,27 @@ class SqlIdempotencyStore:
             becomes durable exactly when your work does
         :returns: whether this is the first time
         """
+        return await self.claim(key, connection=connection) is Claim.CLAIMED
+
+    async def claim(self, key: str, *, connection: DbConnection | None = None) -> Claim:
+        """Claims a message, or says why not.
+
+        :attr:`~Claim.CLAIMED` when there was no row or its lease had run out;
+        :attr:`~Claim.DUPLICATE` when the row is confirmed;
+        :attr:`~Claim.IN_PROGRESS` when somebody holds a live, unconfirmed claim
+        — still working, or failed without releasing it. The difference between
+        the last two is the difference between done and maybe-never-done, which
+        is why :func:`~acemq_amqp.patterns.idempotent` accepts one and puts the
+        other back.
+
+        :param key: what identifies the message
+        :param connection: as for :meth:`first_time`
+        """
         if not key:
             raise ValueError("acemq: an idempotency key cannot be empty")
         now = _now_ms()
 
-        def statements(cursor: DbCursor) -> bool:
+        def statements(cursor: DbCursor) -> Claim:
             # The insert is the claim, and the primary key is what makes it
             # atomic. ON CONFLICT DO NOTHING rather than catching the driver's
             # integrity error, because every driver spells that differently and
@@ -528,7 +545,7 @@ class SqlIdempotencyStore:
                 (key, _CLAIMED, self._node, now, now + _ms(self._claim_timeout)),
             )
             if cursor.rowcount == 1:
-                return True
+                return Claim.CLAIMED
 
             # Somebody already has a row. Taking it over is allowed only if
             # their hold has run out, and the guard lives in the WHERE clause so
@@ -549,10 +566,23 @@ class SqlIdempotencyStore:
                     now,
                 ),
             )
-            return cursor.rowcount == 1
+            if cursor.rowcount == 1:
+                return Claim.CLAIMED
 
-        answer = await _off_loop(self._work, connection, statements)
-        return bool(answer)
+            cursor.execute(
+                self._sql("SELECT state FROM {table} WHERE message_id = ?"), (key,)
+            )
+            row = cursor.fetchone()
+            # No row means it was released or purged between the two
+            # statements: in progress is the answer that cannot lose it.
+            return (
+                Claim.DUPLICATE
+                if row is not None and row[0] == _CONFIRMED
+                else Claim.IN_PROGRESS
+            )
+
+        answer: Claim = await _off_loop(self._work, connection, statements)
+        return answer
 
     async def confirm(self, key: str, *, connection: DbConnection | None = None) -> None:
         """Records that the message really was handled.

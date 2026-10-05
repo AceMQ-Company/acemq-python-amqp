@@ -48,12 +48,13 @@ from acemq_amqp import (
     accept,
     fixed_retry,
     headers,
+    in_progress,
     no_retry,
     park,
     reject,
     retry,
 )
-from acemq_amqp.ack import OUTCOME_PARKED
+from acemq_amqp.ack import OUTCOME_IN_PROGRESS, OUTCOME_PARKED
 from acemq_amqp.codec import Codec
 from acemq_amqp.connection import Connection, Handler
 from acemq_amqp.interceptors import ConsumeContext, ConsumeInterceptor, ConsumeNext
@@ -362,6 +363,43 @@ async def test_a_missing_rung_is_waited_out_here_rather_than_losing_the_message(
 
     assert transport.sent_to(QUEUE)[0].headers[headers.ATTEMPT] == 2
     assert settlement.acked is True
+
+
+async def test_work_in_progress_goes_back_without_spending_an_attempt() -> None:
+    # On the last attempt and with no retry policy at all: anything that counted
+    # as a retry would dead-letter here, and a claim somebody else holds is not
+    # a reason to give up on a message.
+    metrics = Metrics()
+    async with running(
+        always(in_progress(timedelta(0))), observer=metrics
+    ) as transport:
+        settlement = await transport.deliver(
+            QUEUE, b'{"id": "7"}', headers=wire(Envelope(id="abc", attempt=1))
+        )
+
+    again = transport.sent_to(QUEUE)
+    assert len(again) == 1
+    assert again[0].headers[headers.ATTEMPT] == 1
+    assert again[0].headers[headers.ID] == "abc"
+    assert again[0].message.body == b'{"id": "7"}'
+    assert settlement.acked is True
+    assert transport.sent_to(DLQ) == []
+    labels = {"queue": QUEUE, "outcome": OUTCOME_IN_PROGRESS}
+    assert metrics.counts[metric_key(METRIC_CONSUME_TOTAL, labels)] == 1
+
+
+async def test_work_in_progress_says_so_on_its_settlement() -> None:
+    seen: list[Settlement] = []
+
+    async def watching(context: ConsumeContext, call_next: ConsumeNext) -> Ack:
+        context.when_settled(seen.append)
+        return await call_next(context)
+
+    async with running(always(in_progress(timedelta(0))), interceptor=watching) as transport:
+        await transport.deliver(QUEUE, b"{}", headers=wire(Envelope()))
+
+    assert [settlement.outcome for settlement in seen] == ["in_progress"]
+    assert seen[0].dead_lettered is False
 
 
 async def test_the_last_attempt_dead_letters_rather_than_retrying_again() -> None:
