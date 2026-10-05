@@ -32,6 +32,8 @@ While the version is `0.x` the public API may change in any release.
 - `in_progress(delay)`, `Action.IN_PROGRESS`, `OUTCOME_IN_PROGRESS`, an optional
   `Ack.delay`, and `idempotent(..., in_progress_delay=...)`. A stream reader
   refuses `in_progress` as it refuses `retry`.
+- The text codec is also registered as `string`, the name .NET and Ruby use, so
+  `codec_by_name("string")` and `codec_by_name("text")` build the same codec.
 
 ## [0.7.6] - 2026-10-04
 

@@ -340,3 +340,5 @@ def codec_names() -> list[str]:
 register_codec("json", JsonCodec)
 register_codec("bytes", BytesCodec)
 register_codec("text", TextCodec)
+# The name .NET and Ruby register it under, so shared configuration works in all.
+register_codec("string", TextCodec)

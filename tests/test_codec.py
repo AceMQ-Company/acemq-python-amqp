@@ -163,6 +163,14 @@ def test_the_registry_builds_a_codec_by_name() -> None:
     assert isinstance(codec_by_name("json"), JsonCodec)
 
 
+def test_the_text_codec_answers_to_string_as_well() -> None:
+    # "string" is what .NET and Ruby call it; configuration shared between
+    # services in different languages should not have to know which is which.
+    assert {"string", "text"} <= set(codec_names())
+    assert isinstance(codec_by_name("string"), TextCodec)
+    assert isinstance(codec_by_name("text"), TextCodec)
+
+
 def test_an_unknown_codec_name_says_which_ones_there_are() -> None:
     with pytest.raises(KeyError, match="json"):
         codec_by_name("nothing-is-registered-under-this")

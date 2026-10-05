@@ -533,7 +533,8 @@ codec = codec_by_name(config.codec)
 
 So that configuration can name a format without the code that reads the
 configuration importing every format it might name. `json`, `bytes` and `text`
-are registered by the library; importing `acemq_amqp.codecs.yaml`,
+are registered by the library, and `text` also answers to `string` — the name
+.NET and Ruby use — so configuration shared across languages works in all of them; importing `acemq_amqp.codecs.yaml`,
 `.toml` or `.xml` adds `yaml`, `toml` and `xml`, which is how Go's `init()`
 does it.
 
