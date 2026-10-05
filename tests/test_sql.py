@@ -30,6 +30,7 @@ from pathlib import Path
 
 import pytest
 
+from acemq_amqp import Ack, Action, Envelope, Message, accept
 from acemq_amqp.errors import AceMQError
 from acemq_amqp.patterns import (
     IdempotencyStore,
@@ -42,6 +43,7 @@ from acemq_amqp.patterns import (
     SqlSchemaRegistry,
     create_schema,
     fingerprint,
+    idempotent,
     schema_ddl,
 )
 
@@ -629,3 +631,108 @@ async def test_a_retired_record_is_still_in_the_table(
     finally:
         counted.close()
     assert rows == 1, "the record the broker refused was deleted"
+
+
+# --------------------------------------------------------------------------
+# A failed write is a failure, not an answer
+#
+# .NET's store once read every error from the claim INSERT as "duplicate key",
+# so a lock timeout said "already claimed" and the consumer acknowledged a
+# message nothing had handled. These pin that a database error which is not a
+# duplicate comes out as an error, all the way up to the consumer's decision.
+# --------------------------------------------------------------------------
+
+
+def refuse_inserts(database: Path, table: str, reason: str = "database is locked") -> None:
+    """A trigger that fails every insert into ``table`` with something that is
+    not a uniqueness violation, although sqlite3 still raises IntegrityError."""
+    opened = sqlite3.connect(database)
+    try:
+        opened.execute(
+            f"CREATE TRIGGER refuse_{table} BEFORE INSERT ON {table} "
+            f"BEGIN SELECT RAISE(ABORT, '{reason}'); END"
+        )
+        opened.commit()
+    finally:
+        opened.close()
+
+
+async def test_a_failed_claim_insert_is_raised_rather_than_read_as_a_duplicate(
+    database: Path, connections: Callable[[], sqlite3.Connection]
+) -> None:
+    refuse_inserts(database, "acemq_idempotency")
+    store = SqlIdempotencyStore(connections)
+
+    with pytest.raises(sqlite3.DatabaseError, match="database is locked"):
+        await store.first_time("order-1")
+    assert await store.size() == 0
+
+
+async def test_a_locked_database_is_raised_rather_than_read_as_a_duplicate(
+    database: Path,
+) -> None:
+    """The real thing rather than a trigger: another connection holds the write
+    lock and ours gives up at once."""
+    holder = sqlite3.connect(database)
+    holder.execute("BEGIN EXCLUSIVE")
+    try:
+        store = SqlIdempotencyStore(lambda: sqlite3.connect(database, timeout=0))
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            await store.first_time("order-1")
+    finally:
+        holder.rollback()
+        holder.close()
+
+
+async def test_a_consumer_retries_a_message_whose_claim_failed(
+    database: Path, connections: Callable[[], sqlite3.Connection]
+) -> None:
+    """End to end through :func:`idempotent`: requeued, never acknowledged,
+    and the handler did not run."""
+    refuse_inserts(database, "acemq_idempotency")
+    ran: list[str] = []
+
+    async def handler(incoming: Message) -> Ack:
+        ran.append(incoming.envelope.id)
+        return accept()
+
+    guarded = idempotent(SqlIdempotencyStore(connections), handler)
+    decision = await guarded(
+        Message(
+            payload={},
+            envelope=Envelope(id="order-1"),
+            routing_key="orders.new",
+            content_type="application/json",
+            redelivered=False,
+            body=b"{}",
+        )
+    )
+
+    assert decision.action is Action.RETRY
+    assert ran == []
+
+
+async def test_a_failed_outbox_insert_is_raised_rather_than_read_as_a_duplicate(
+    database: Path, connections: Callable[[], sqlite3.Connection]
+) -> None:
+    refuse_inserts(database, "acemq_outbox")
+    store = SqlOutboxStore(connections)
+    transaction = connections()
+    try:
+        with pytest.raises(sqlite3.DatabaseError, match="database is locked"):
+            await store.add(an_order(), connection=transaction)
+    finally:
+        transaction.close()
+
+
+async def test_a_registry_insert_that_keeps_failing_is_raised_not_answered(
+    database: Path, connections: Callable[[], sqlite3.Connection]
+) -> None:
+    """The registry retries a failed insert, because the usual cause is a race
+    it lost; one that is not a race runs out of attempts and is raised."""
+    refuse_inserts(database, "acemq_schema_registry")
+    registry = SqlSchemaRegistry(connections)
+
+    with pytest.raises(sqlite3.DatabaseError, match="database is locked"):
+        await registry.register("orders", "avro", '{"type": "string"}')
+    assert await registry.versions("orders") == []
