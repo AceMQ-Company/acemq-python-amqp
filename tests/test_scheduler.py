@@ -29,7 +29,7 @@ from typing import Any
 import pytest
 from fake_transport import FakeTransport, Sent
 
-from acemq_amqp import Connection, Envelope, headers
+from acemq_amqp import Connection, Envelope, PublishError, headers
 from acemq_amqp.patterns import (
     DEFAULT_SCHEDULE_PREFETCH,
     HEADER_SCHEDULE_CONTENT_TYPE,
@@ -476,3 +476,59 @@ async def test_closing_a_scheduler_stops_the_consumer_and_deletes_nothing() -> N
         assert set(transport.queues) == {*RUNG_QUEUES, SCHEDULE_DUE}
     finally:
         await mq.close()
+
+
+# --- a destination nothing is bound to -----------------------------------------
+
+
+async def test_a_due_message_nothing_is_bound_to_is_not_acknowledged() -> None:
+    """The scheduler's last hop is the one that matters, and it is the library's.
+
+    Published without ``mandatory``, a due message for a queue that is not there
+    is confirmed and dropped by the broker, the control message is acknowledged
+    as delivered, and the scheduled message is gone with nothing reporting it.
+    """
+    transport = FakeTransport()
+    mq, scheduler = await running(transport)
+    try:
+        settlement = await transport.deliver(
+            SCHEDULE_DUE,
+            b"{}",
+            headers=scheduled_headers(
+                int(now().timestamp() * 1000) - 5_000,
+                exchange="",
+                routing_key="nobody-is-bound-here",
+            ),
+        )
+    finally:
+        await scheduler.close()
+        await mq.close()
+
+    assert published_to(transport, "", "nobody-is-bound-here")[0].message.mandatory
+    assert not settlement.acked, "an unroutable scheduled message was acknowledged"
+
+
+async def test_scheduling_for_now_to_a_queue_that_is_not_there_says_so() -> None:
+    transport = FakeTransport()
+    mq, scheduler = await running(transport)
+    try:
+        with pytest.raises(PublishError) as raised:
+            await scheduler.after(timedelta(0), "", "nobody-is-bound-here", {"n": 1})
+    finally:
+        await scheduler.close()
+        await mq.close()
+
+    assert raised.value.unroutable
+
+
+async def test_a_hop_down_a_rung_is_mandatory() -> None:
+    """A rung deleted under a running scheduler is an error, not a silence."""
+    transport = FakeTransport()
+    mq, scheduler = await running(transport)
+    try:
+        await scheduler.after(timedelta(minutes=5), "billing", "invoice.due", {"n": 1})
+    finally:
+        await scheduler.close()
+        await mq.close()
+
+    assert published_to(transport, SCHEDULE_EXCHANGE, "acemq.schedule.1m")[0].message.mandatory

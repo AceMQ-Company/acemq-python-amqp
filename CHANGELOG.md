@@ -19,6 +19,29 @@ While the version is `0.x` the public API may change in any release.
   `InMemoryIdempotencyStore`, the claim timeout for `SqlIdempotencyStore`. The
   retry ladder and the dead-letter queue were never reached in that time. Java
   releases the claim on an exception, and so does this now.
+- **The outbox relay no longer deletes a record nothing is bound to.** It
+  published without `mandatory`, so a record whose exchange had no matching
+  binding was confirmed by the broker, dropped, and then marked published: the
+  message was gone, `max_attempts` never applied and nothing reported it. The
+  relay now always publishes mandatory, and an unroutable record is a failed
+  publish like any other: it stays in the outbox, the store counts the attempt
+  and retires it after `max_attempts` with `last_error` kept, `sweep()` raises a
+  `PublishError` with `unroutable` set, and `acemq.outbox.total` counts it as
+  `failed`. Java's, .NET's and Ruby's relays already behaved this way. The
+  default `mandatory` for an ordinary `Publisher` is unchanged.
+- **The other places the library publishes for you and then treats the work as
+  done are mandatory too.** A routing slip's hop to its next stop (the step now
+  retries rather than accepting), the scheduler's hop down a rung and its final
+  delivery (the control message is no longer acknowledged), and `replay()` (the
+  message stays on the queue it was being recovered from, and the replay stops
+  with a `ReplayError`). Each would otherwise lose a message whose destination
+  had no queue bound to it.
+- **A returned message is reported as unroutable, not as refused.** Against a
+  real broker the RabbitMQ transport reported a `Basic.Return` as unconfirmed,
+  and `publish_raw` raised that as a nack before anything could read `routed`.
+  A mandatory `Publisher` therefore said "refused to confirm" with `unroutable`
+  false and was counted `failed` rather than `unroutable`, and the retry and
+  dead-letter hops never reached the fallbacks written for a missing queue.
 
 ## [0.7.8] - 2026-10-07
 

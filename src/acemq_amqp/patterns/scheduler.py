@@ -408,8 +408,14 @@ class Scheduler:
             SCHEDULE_RUNGS[-1],
         )
         self._hops += 1
+        # Mandatory here and in _deliver, because the control message is
+        # acknowledged as soon as this returns: a rung that has been deleted or
+        # a destination nothing is bound to is confirmed and dropped by the
+        # broker, and without the return the scheduled message would be gone
+        # with nothing reporting it. Raised instead, so the control consumer's
+        # retry policy has it.
         await self._connection.publisher(
-            SCHEDULE_EXCHANGE, schedule_rung_name(rung), codec=BytesCodec()
+            SCHEDULE_EXCHANGE, schedule_rung_name(rung), codec=BytesCodec(), mandatory=True
         ).send(body, envelope=Envelope(type=SCHEDULED_TYPE, headers=headers))
 
     async def _deliver(self, body: bytes, headers: dict[str, Any]) -> None:
@@ -423,7 +429,7 @@ class Scheduler:
         # and a consumer that started depending on them would be depending on
         # how a message got to it.
         await self._connection.publisher(
-            exchange, routing_key, codec=_Verbatim(content_type)
+            exchange, routing_key, codec=_Verbatim(content_type), mandatory=True
         ).send(body, envelope=Envelope(type=SCHEDULED_TYPE))
 
     async def close(self) -> None:

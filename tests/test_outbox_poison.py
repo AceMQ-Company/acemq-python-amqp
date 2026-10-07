@@ -146,3 +146,37 @@ async def test_a_record_that_succeeds_is_not_counted_against_its_attempts() -> N
 
     assert await relay.sweep() == 1
     assert len(store) == 0
+
+
+async def test_a_record_nothing_is_bound_to_stays_in_the_outbox() -> None:
+    """Unroutable is a failed publish, not a published one.
+
+    The broker confirms a message no queue is bound to receive and then drops it.
+    A relay that publishes without ``mandatory`` takes that confirm as success,
+    marks the record published, and the message is gone with nothing anywhere
+    saying so. Ruby's relay did exactly this until it started publishing
+    mandatory; Java's and .NET's always have.
+    """
+    transport = FakeTransport()
+    mq = Connection(transport, origin="checkout@pod-7")
+    store = InMemoryOutboxStore(max_attempts=2)
+
+    # The default exchange with a queue nobody declared: nothing will receive it.
+    await store.add(record(mq, "", "nobody-is-bound-here", {"n": 1}))
+    relay = OutboxRelay(mq, store)
+
+    with pytest.raises(PublishError) as raised:
+        await relay.sweep()
+
+    assert raised.value.unroutable
+    assert transport.sent[0].message.mandatory, "the relay published without mandatory"
+    assert len(store) == 1, "an unroutable record was marked published and lost"
+
+    # Counted against the record like any other failure, so it retires rather
+    # than blocking everything behind it for ever -- and is kept when it does.
+    with pytest.raises(PublishError):
+        await relay.sweep()
+    assert await relay.sweep() == 0
+    retired = store.retired()
+    assert [entry.attempts for entry in retired] == [2]
+    assert "reached no queue" in retired[0].last_error

@@ -537,3 +537,21 @@ async def test_a_declared_route_is_counted_under_the_pipeline_it_was_given() -> 
         TAG_OUTCOME: OUTCOME_COMPLETED,
     }
     assert metrics.counts[metric_key(METRIC_PIPELINE_RUN_TOTAL, labels)] == 1
+
+
+async def test_a_next_stop_nothing_is_bound_to_retries_this_step() -> None:
+    """Forwarded without ``mandatory``, a next stop whose queue is not there is
+    confirmed and dropped by the broker, the step accepts, and the message is
+    gone half way along its itinerary with nothing reporting it."""
+    transport = FakeTransport()
+    mq = Connection(transport)
+    slip = RoutingSlip().then("", "charge").then("", "nobody-is-bound-here")
+
+    async def charge(message: Message) -> Any:
+        return message.payload
+
+    decision = await follow_slip(mq, charge)(arriving(slip))
+
+    assert transport.sent[0].message.mandatory
+    assert decision.action.value == "retry"
+    assert "reached no queue" in str(decision.error)

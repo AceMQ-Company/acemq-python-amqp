@@ -35,7 +35,7 @@ from typing import Any, TypeAlias
 
 from ..connection import Connection
 from ..envelope import Envelope
-from ..errors import AceMQError
+from ..errors import AceMQError, PublishError
 from ..transport import Delivery, Outbound
 
 log = logging.getLogger("acemq")
@@ -219,7 +219,11 @@ async def _move(
     headers[HEADER_REPLAY_COUNT] = _replays_so_far(envelope) + 1
 
     try:
-        await connection.publish_raw(
+        # Mandatory, because the original is acknowledged as soon as this
+        # returns: a destination nothing is bound to is confirmed and dropped by
+        # the broker, and without the return the replay would delete the last
+        # copy of a message it was asked to recover.
+        result = await connection.publish_raw(
             exchange,
             key,
             Outbound(
@@ -228,8 +232,17 @@ async def _move(
                 message_id=going_back.id,
                 headers=headers,
                 persistent=True,
+                mandatory=True,
             ),
         )
+        if not result.routed:
+            raise PublishError(
+                going_back.id,
+                exchange,
+                key,
+                result.return_reason or "no queue is bound to receive it",
+                unroutable=True,
+            )
     except Exception:
         # Returned rather than dropped, and the replay stops. A replay that
         # loses messages is worse than one that stops early.

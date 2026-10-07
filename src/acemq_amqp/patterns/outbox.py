@@ -49,6 +49,7 @@ from typing import Any, Protocol, runtime_checkable
 from ..codec import Codec
 from ..connection import Connection
 from ..envelope import Envelope
+from ..errors import PublishError
 from ..telemetry import (
     METRIC_OUTBOX_LAG,
     METRIC_OUTBOX_TOTAL,
@@ -377,7 +378,15 @@ class OutboxRelay:
                 TAG_ROUTING_KEY: entry.routing_key,
             }
             try:
-                await self._connection.publish_raw(
+                # Mandatory, whatever an ordinary publisher defaults to. A confirm
+                # says the broker has the message, not that it reached a queue: a
+                # record whose binding nobody made is confirmed and dropped in the
+                # same breath, and reading that confirm as success would mark it
+                # published with the message gone and nothing anywhere saying so.
+                # Unroutable is therefore a failed publish like any other -- the
+                # record stays, the store counts the attempt -- which is what
+                # Java's, .NET's and Ruby's relays do.
+                result = await self._connection.publish_raw(
                     entry.exchange,
                     entry.routing_key,
                     Outbound(
@@ -386,8 +395,17 @@ class OutboxRelay:
                         message_id=entry.id,
                         headers=entry.headers,
                         persistent=True,
+                        mandatory=True,
                     ),
                 )
+                if not result.routed:
+                    raise PublishError(
+                        entry.id,
+                        entry.exchange,
+                        entry.routing_key,
+                        result.return_reason or "no queue is bound to receive it",
+                        unroutable=True,
+                    )
             except Exception as failure:
                 # Counted and re-raised. The record is still in the outbox, and
                 # stopping here rather than carrying on to the next one keeps

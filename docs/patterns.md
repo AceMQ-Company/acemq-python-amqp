@@ -223,6 +223,13 @@ published blocks everything behind it on every tick, for ever. An exchange
 somebody deleted, a payload a policy will always refuse: one row, and the outbox
 stops.
 
+A record nothing is bound to is one of these. The relay always publishes
+`mandatory`, whatever an ordinary `Publisher` defaults to, because a confirm only
+says the broker has the message: an unroutable one is confirmed and dropped in the
+same breath, and without the broker's return the relay would delete the record as
+published. Instead `sweep()` raises a `PublishError` with `unroutable` set and the
+record stays.
+
 So a failure is counted against the record. Both stores keep an `attempts` and a
 `last_error` on it, and once `attempts` reaches `max_attempts` — ten by default,
 the same ten Ruby uses — `pending` stops offering the record and the queue behind

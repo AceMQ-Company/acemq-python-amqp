@@ -575,8 +575,12 @@ def follow_slip(
             )
 
         try:
+            # Mandatory, because accepting below is what makes this hop final:
+            # a next stop nothing is bound to is confirmed and dropped by the
+            # broker, and without the return this step would accept a message
+            # that is now nowhere.
             await connection.publisher(
-                onwards.exchange, onwards.routing_key, codec=codec
+                onwards.exchange, onwards.routing_key, codec=codec, mandatory=True
             ).send(payload, envelope=outgoing)
         except Exception as failure:
             return retry(

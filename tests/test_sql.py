@@ -29,13 +29,24 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from fake_transport import FakeTransport
 
-from acemq_amqp import Ack, Action, Envelope, Message, accept, retry
+from acemq_amqp import (
+    Ack,
+    Action,
+    Connection,
+    Envelope,
+    Message,
+    PublishError,
+    accept,
+    retry,
+)
 from acemq_amqp.errors import AceMQError
 from acemq_amqp.patterns import (
     Claim,
     IdempotencyStore,
     OutboxRecord,
+    OutboxRelay,
     OutboxStore,
     SchemaNotFoundError,
     SchemaRegistry,
@@ -695,6 +706,46 @@ async def test_a_retired_record_is_still_in_the_table(
     finally:
         counted.close()
     assert rows == 1, "the record the broker refused was deleted"
+
+
+async def test_an_unroutable_record_is_counted_and_retired_not_deleted(
+    database: Path, connections: Callable[[], sqlite3.Connection]
+) -> None:
+    """The relay and the SQL store together, for a record nothing is bound to.
+
+    The broker confirms an unroutable message and drops it. Unless the relay
+    publishes mandatory and treats the return as a failure, the row is deleted
+    as published and the message is lost. It has to be counted instead, retired
+    after ``max_attempts``, and kept with the reason.
+    """
+    store = SqlOutboxStore(connections, max_attempts=2)
+    lost = OutboxRecord(
+        id="lost",
+        exchange="",
+        routing_key="nobody-is-bound-here",
+        body=b'{"id": "o-1"}',
+        content_type="application/json",
+    )
+    opened = connections()
+    try:
+        await store.add(lost, connection=opened)
+        opened.commit()
+    finally:
+        opened.close()
+
+    relay = OutboxRelay(Connection(FakeTransport(), origin="checkout@pod-7"), store)
+    for expected in (1, 2):
+        with pytest.raises(PublishError) as raised:
+            await relay.sweep()
+        assert raised.value.unroutable
+        assert await store.count() == 1, "an unroutable record was deleted as published"
+        if expected == 1:
+            assert [entry.attempts for entry in await store.pending(10)] == [1]
+
+    assert await relay.sweep() == 0
+    retired = await store.retired()
+    assert [(entry.id, entry.attempts) for entry in retired] == [("lost", 2)]
+    assert "reached no queue" in retired[0].last_error
 
 
 # --------------------------------------------------------------------------

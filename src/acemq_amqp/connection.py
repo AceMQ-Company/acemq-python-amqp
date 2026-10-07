@@ -1810,7 +1810,14 @@ class Connection:
         # Distinct from unroutable, which the Publisher path reports separately and
         # which sets `unroutable`: the broker could route this one and would not keep
         # it, and the two want different responses.
-        if not result.confirmed:
+        #
+        # So a returned message is passed back rather than raised here. The
+        # RabbitMQ transport reports a Basic.Return as not confirmed as well as
+        # not routed, and raising it as a nack hid ``routed`` from every caller
+        # that reads it: a mandatory Publisher said "refused" rather than
+        # "reached no queue", and the retry and dead-letter hops never reached
+        # the fallbacks written for a queue that is not there.
+        if not result.confirmed and result.routed:
             raise PublishError(
                 message.message_id,
                 exchange,

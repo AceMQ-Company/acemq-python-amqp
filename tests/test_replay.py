@@ -21,7 +21,7 @@ from datetime import timedelta
 import pytest
 from fake_transport import FakeTransport
 
-from acemq_amqp import Connection, Envelope, Outbound, PublishResult, headers
+from acemq_amqp import Connection, Envelope, Outbound, PublishResult, QueueSpec, headers
 from acemq_amqp.patterns import (
     HEADER_REPLAY_COUNT,
     HEADER_REPLAYED_AT,
@@ -35,6 +35,9 @@ QUEUE = "orders.new"
 
 
 def stage(transport: FakeTransport, count: int, attempt: int = 1) -> None:
+    # Replay republishes mandatory, so the queue it puts messages back on has to
+    # be there; one that is not is a failure the replay reports.
+    transport.queues[QUEUE] = QueueSpec()
     for n in range(count):
         envelope = Envelope(
             id=f"order-{n}", error="the database timed out", attempt=attempt
@@ -48,6 +51,7 @@ def stage(transport: FakeTransport, count: int, attempt: int = 1) -> None:
 
 
 def dead(transport: FakeTransport, body: bytes, error: str) -> None:
+    transport.queues[QUEUE] = QueueSpec()
     transport.stage(
         DLQ, body, headers=Envelope(error=error).to_headers(), routing_key=QUEUE
     )
@@ -86,6 +90,7 @@ async def test_a_replayed_message_says_it_was_replayed() -> None:
 async def test_replaying_twice_counts_twice() -> None:
     transport = FakeTransport()
     mq = Connection(transport)
+    transport.queues[QUEUE] = QueueSpec()
     transport.stage(
         DLQ,
         b"{}",
@@ -170,6 +175,7 @@ async def test_a_routing_key_can_send_everything_somewhere_else() -> None:
     transport = FakeTransport()
     mq = Connection(transport)
     stage(transport, 2)
+    transport.queues["orders.quarantine"] = QueueSpec()
 
     await replay(mq, DLQ, routing_key="orders.quarantine")
 
@@ -203,3 +209,19 @@ async def test_a_replay_needs_a_queue_to_read_from() -> None:
     mq = Connection(FakeTransport())
     with pytest.raises(ValueError, match="needs a queue"):
         await replay(mq, "")
+
+
+async def test_a_message_replayed_to_a_queue_that_is_not_there_stays_on_the_queue() -> None:
+    """Republished without ``mandatory``, a message for a queue that has gone is
+    confirmed and dropped by the broker and then acknowledged off the dead-letter
+    queue: the one copy left is deleted by the tool meant to recover it."""
+    transport = FakeTransport()
+    mq = Connection(transport)
+    stage(transport, 2)
+
+    with pytest.raises(ReplayError, match="cannot republish") as failure:
+        await replay(mq, DLQ, routing_key="nobody-is-bound-here")
+
+    assert transport.sent[0].message.mandatory
+    assert failure.value.result.moved == 0
+    assert len(transport.waiting[DLQ]) == 2

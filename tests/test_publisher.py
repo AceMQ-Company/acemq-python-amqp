@@ -113,6 +113,42 @@ async def test_a_mandatory_message_that_reaches_no_queue_is_an_error() -> None:
     assert failure.value.routing_key == "nobody.listens"
 
 
+class ReturningTransport(FakeTransport):
+    """Reports an unroutable message the way the RabbitMQ transport does: a
+    Basic.Return arrives in place of the confirm, so it is neither confirmed nor
+    routed."""
+
+    async def publish(
+        self, exchange: str, routing_key: str, message: Outbound
+    ) -> PublishResult:
+        result = await super().publish(exchange, routing_key, message)
+        if result.routed:
+            return result
+        return PublishResult(
+            message_id=message.message_id,
+            confirmed=False,
+            routed=False,
+            return_reason="NO_ROUTE",
+        )
+
+
+async def test_a_returned_message_is_reported_as_unroutable_not_as_refused() -> None:
+    """A return is not a nack. Raising it as one hid ``routed`` from every caller
+    that reads it, so a mandatory publish against a real broker said "refused"
+    and the retry and dead-letter hops never reached their missing-queue paths."""
+    connection = Connection(ReturningTransport())
+
+    with pytest.raises(PublishError, match="reached no queue") as failure:
+        await connection.publisher(routing_key="nobody.listens", mandatory=True).send({})
+    assert failure.value.unroutable is True
+
+    result = await connection.publish_raw(
+        "", "nobody.listens", Outbound(body=b"{}", mandatory=True)
+    )
+    assert result.routed is False
+    assert result.return_reason == "NO_ROUTE"
+
+
 async def test_an_unroutable_message_is_only_an_error_when_it_was_mandatory() -> None:
     transport = FakeTransport()
     connection = Connection(transport)

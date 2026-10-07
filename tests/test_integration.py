@@ -73,6 +73,7 @@ from acemq_amqp import (
     Metrics,
     Outbound,
     PublishContext,
+    PublishError,
     PublishingPausedError,
     PublishNext,
     PublishResult,
@@ -1166,6 +1167,26 @@ async def test_an_outbox_relay_publishes_what_was_committed(
     assert got.payload == {"id": "7"}
     assert got.envelope.origin == "acemq-python-tests@ci"
     assert len(store) == 0
+
+
+async def test_an_outbox_record_nothing_is_bound_to_stays_in_the_outbox(
+    mq: Connection,
+) -> None:
+    """A real broker confirms an unroutable message and drops it.
+
+    Without ``mandatory`` the relay reads that confirm as success, marks the
+    record published, and the message is gone with nothing reporting it.
+    """
+    store = InMemoryOutboxStore(max_attempts=1)
+    await store.add(record(mq, "amq.direct", f"unbound-{uuid.uuid4().hex}", {"id": "7"}))
+    relay = OutboxRelay(mq, store)
+
+    with pytest.raises(PublishError) as raised:
+        await relay.sweep()
+
+    assert raised.value.unroutable
+    assert len(store) == 1, "the broker dropped the record and the relay deleted it"
+    assert [entry.attempts for entry in store.retired()] == [1]
 
 
 async def test_a_relay_publishes_what_a_transaction_committed_and_nothing_else(

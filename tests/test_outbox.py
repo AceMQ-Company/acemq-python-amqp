@@ -31,6 +31,7 @@ from acemq_amqp import (
     Metrics,
     Outbound,
     PublishResult,
+    QueueSpec,
     headers,
 )
 from acemq_amqp.patterns import (
@@ -42,8 +43,20 @@ from acemq_amqp.patterns import (
 from acemq_amqp.telemetry import metric_key
 
 
-def connection() -> tuple[Connection, FakeTransport]:
+def routing() -> FakeTransport:
+    """A broker with the queues these records go to.
+
+    The relay publishes mandatory, so a queue that does not exist is a failure it
+    reports rather than a success.
+    """
     transport = FakeTransport()
+    for queue in ("orders", "old", "recent"):
+        transport.queues[queue] = QueueSpec()
+    return transport
+
+
+def connection() -> tuple[Connection, FakeTransport]:
+    transport = routing()
     return Connection(transport, origin="checkout@pod-7"), transport
 
 
@@ -258,7 +271,7 @@ async def test_the_relay_counts_every_record_it_publishes() -> None:
     # has been committed and not published appears in no queue depth anywhere,
     # so a stopped relay is invisible until it says something itself.
     metrics = Metrics()
-    mq = Connection(FakeTransport(), observer=metrics)
+    mq = Connection(routing(), observer=metrics)
     store = InMemoryOutboxStore()
     for n in range(3):
         await store.add(record(mq, "orders-events", "order.placed", {"id": n}))
@@ -275,7 +288,7 @@ async def test_the_lag_is_measured_from_the_commit_and_not_from_the_sweep() -> N
     # milliseconds as one that is keeping up — which is the exact case the
     # metric exists to show.
     metrics = Metrics()
-    mq = Connection(FakeTransport(), observer=metrics)
+    mq = Connection(routing(), observer=metrics)
     store = InMemoryOutboxStore()
 
     await store.add(committed(mq, "old", ago=timedelta(hours=1)))
@@ -316,7 +329,7 @@ async def test_a_relay_left_running_reports_without_anybody_calling_sweep() -> N
     # The case the metrics are for. Nothing here holds a span, and nothing here
     # calls sweep() — the numbers still come out.
     metrics = Metrics()
-    mq = Connection(FakeTransport(), observer=metrics)
+    mq = Connection(routing(), observer=metrics)
     store = InMemoryOutboxStore()
 
     async with OutboxRelay(mq, store, interval=timedelta(milliseconds=10)):
@@ -335,7 +348,7 @@ async def test_a_commit_without_a_zone_is_read_as_utc_rather_than_raising() -> N
     # without a zone: subtracting one from an aware now() raises, and it would
     # raise on the publish path of a message that had already gone out.
     metrics = Metrics()
-    mq = Connection(FakeTransport(), observer=metrics)
+    mq = Connection(routing(), observer=metrics)
     store = InMemoryOutboxStore()
     entry = record(mq, "", "orders", {"id": "7"})
     await store.add(
@@ -359,7 +372,7 @@ async def test_a_commit_in_the_future_is_reported_as_no_lag_rather_than_a_negati
     # Clock skew between the process that wrote the row and the one sweeping
     # it. A negative duration is a number no histogram can hold.
     metrics = Metrics()
-    mq = Connection(FakeTransport(), observer=metrics)
+    mq = Connection(routing(), observer=metrics)
     store = InMemoryOutboxStore()
     await store.add(committed(mq, "orders", ago=timedelta(minutes=-5)))
 
