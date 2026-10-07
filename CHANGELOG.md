@@ -8,6 +8,8 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.7.9] - 2026-10-07
+
 ### Fixed
 
 - **A stream reader resumes where it was after a reconnection.** The robust
