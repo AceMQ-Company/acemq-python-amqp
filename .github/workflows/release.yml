@@ -425,3 +425,28 @@ jobs:
           Documentation: https://acemq.org/acemq-python-amqp/
           Changelog: https://github.com/AceMQ-Company/acemq-python-amqp/blob/v$VERSION/CHANGELOG.md" \
             || echo "release v$VERSION already exists"
+
+  # Says that the version is out. A job in this workflow rather than a workflow
+  # on `release: published`: the release above is created with GITHUB_TOKEN,
+  # and GitHub starts no workflow from an event that token caused, so
+  # release-notify.yml never ran for a tagged release (0.1.0 went out by hand).
+  notify:
+    needs: [publish, announce]
+    if: always() && needs.publish.outputs.published == 'true'
+    uses: AceMQ-Company/acemq-java-amqp/.github/workflows/slack-notify.yml@main
+    with:
+      status: ${{ needs.announce.result }}
+      # Both branches name an emoji: `a && '' || b` yields b in GitHub's
+      # expression language, so an empty success branch would announce every
+      # release with roadworks.
+      title: >-
+        ${{ needs.announce.result == 'success'
+            && format('AceMQ for Python {0} released', github.ref_name)
+            || format('AceMQ for Python {0} is published but the release did not finish', github.ref_name) }}
+      message: >-
+        ${{ needs.announce.result == 'success'
+            && 'On the acemq.org feed. Consumers need no credentials.'
+            || 'The package is on the acemq.org feed and consumers can install it, but the release page was not created. Check the run.' }}
+      icon: ${{ needs.announce.result == 'success' && ':white_check_mark:' || ':construction:' }}
+      url: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}
+    secrets: inherit
