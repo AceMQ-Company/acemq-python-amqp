@@ -234,7 +234,16 @@ def idempotent(
         if claimed is Claim.IN_PROGRESS:
             return in_progress(in_progress_delay)
 
-        decision = await decide(handler, message)
+        try:
+            decision = await decide(handler, message)
+        except BaseException:
+            # Raising is a failure like returning one, and the consumer turns it
+            # into a retry. Holding the claim would answer that retry "in
+            # progress" until the claim aged out, so the handler would not run
+            # again and the message would loop past its retry ladder. Java
+            # releases on an exception for the same reason.
+            await _forget_quietly(store, identity)
+            raise
         if decision.action is not Action.ACCEPT:
             # It did not work, so it has not been handled. Forgetting is what
             # lets the retry do anything at all.

@@ -85,6 +85,36 @@ async def test_a_rejection_is_forgotten_too() -> None:
     assert len(store) == 0
 
 
+async def test_a_handler_that_raised_is_run_again_next_time() -> None:
+    attempts: list[int] = []
+
+    async def handler(incoming: Message) -> Ack:
+        attempts.append(incoming.envelope.attempt)
+        if len(attempts) == 1:
+            # Raising is how most Python handlers fail. The consumer turns it
+            # into a retry, so the claim has to go exactly as it does for a
+            # handler that returned one.
+            raise RuntimeError("the database is down")
+        return accept()
+
+    store = InMemoryIdempotencyStore()
+    guarded = idempotent(store, handler)
+
+    try:
+        await guarded(message("order-1"))
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("the handler's exception was swallowed")
+    second = await guarded(message("order-1"))
+
+    # Held, the claim would answer the retry "in progress" until it aged out —
+    # an hour for this store — and the message would loop past its retry ladder
+    # without the handler ever running again.
+    assert len(attempts) == 2
+    assert second == accept()
+
+
 async def test_a_key_of_your_own_deduplicates_on_what_the_payload_says() -> None:
     ran: list[str] = []
 

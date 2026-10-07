@@ -8,6 +8,18 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A handler that raises inside `idempotent()` gives its claim back.** Only a
+  handler that *returned* a retry or a rejection released the key; one that
+  raised, which is how most Python handlers fail, left it claimed. The consumer
+  turned the exception into a retry, the retry found the claim "in progress",
+  and the message was put back again and again without the handler running and
+  without spending an attempt, until the claim aged out: an hour for
+  `InMemoryIdempotencyStore`, the claim timeout for `SqlIdempotencyStore`. The
+  retry ladder and the dead-letter queue were never reached in that time. Java
+  releases the claim on an exception, and so does this now.
+
 ## [0.7.8] - 2026-10-07
 
 ### Fixed
