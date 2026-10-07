@@ -8,6 +8,18 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A connection recovery no longer leaves one more channel behind.** aio-pika
+  reopens a robust connection's channels itself and reports each as closed
+  until it has; the publishing, declaring and pulling channels took that for
+  "dead" and opened a replacement, so every publish made during a recovery left
+  the old channel registered with the connection, which reopened it after every
+  later reconnection for the life of the process. One extra channel per
+  recovery, on the client and on the broker: 0.7.7 held 240 extra channels and
+  doubled its resident memory over the 240-recovery soak. A channel waiting to
+  be reopened is now waited for, and only one closed for good is replaced.
+
 ## [0.7.7] - 2026-10-05
 
 ### Fixed

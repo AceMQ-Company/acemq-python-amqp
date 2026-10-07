@@ -33,7 +33,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, cast
 
 import aio_pika
 from aio_pika.abc import (
@@ -172,8 +172,7 @@ class RabbitMQTransport:
         previous one.
         """
         async with self._lock:
-            if self._admin is None or self._admin.is_closed:
-                self._admin = await self._connection.channel()
+            self._admin = await _reusable(self._admin) or await self._connection.channel()
             return self._admin
 
     async def _publish_channel(self) -> AbstractChannel:
@@ -185,8 +184,9 @@ class RabbitMQTransport:
         it believes it sent.
         """
         async with self._lock:
-            if self._publishing is None or self._publishing.is_closed:
-                self._publishing = await self._connection.channel(publisher_confirms=True)
+            self._publishing = await _reusable(
+                self._publishing
+            ) or await self._connection.channel(publisher_confirms=True)
             return self._publishing
 
     @asynccontextmanager
@@ -323,8 +323,7 @@ class RabbitMQTransport:
         it declined unsettled until its pass is over.
         """
         async with self._lock:
-            if self._pulling is None or self._pulling.is_closed:
-                self._pulling = await self._connection.channel()
+            self._pulling = await _reusable(self._pulling) or await self._connection.channel()
             return self._pulling
 
     async def queue_exists(self, name: str) -> bool:
@@ -375,6 +374,26 @@ class _Subscription:
         """Drops the channel, once nothing on it is unsettled."""
         if not self._channel.is_closed:
             await self._channel.close()
+
+
+async def _reusable(channel: AbstractChannel | None) -> AbstractChannel | None:
+    """A channel this transport kept, once usable again, or ``None`` if it is gone.
+
+    A channel on a robust connection is never dead while the connection lives:
+    aio-pika reopens it after the connection drops and after the broker closes
+    it for a refused request, and until then ``is_closed`` is true. Opening a
+    replacement in that window -- which every publish made during a recovery
+    did -- left the old channel registered with the connection, which went on
+    reopening it after every reconnection for the life of the process: one more
+    channel, on the client and on the broker, per recovery. So a channel that
+    is only waiting to be reopened is waited for, and only one that was closed
+    for good is replaced.
+    """
+    if channel is None or cast("asyncio.Future[bool]", channel.closed()).done():
+        return None
+    if channel.is_closed:
+        await channel.ready()  # type: ignore[attr-defined]
+    return channel
 
 
 def _delivery(incoming: AbstractIncomingMessage) -> Delivery:
