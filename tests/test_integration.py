@@ -125,6 +125,7 @@ from acemq_amqp.patterns import (
     declare_stream,
     follow_slip,
     from_first,
+    from_next,
     idempotent,
     read_stream,
     record,
@@ -381,8 +382,9 @@ async def test_a_retry_really_comes_round_again_and_then_dead_letters(
     assert "RuntimeError: the database is down" in dead.envelope.error
 
 
-async def rabbitmqctl(*arguments: str) -> None:
-    """Runs one ``rabbitmqctl`` command against the broker under test.
+async def rabbitmqctl(*arguments: str) -> str:
+    """Runs one ``rabbitmqctl`` command against the broker under test, and
+    returns what it printed.
 
     Awaited rather than run inline, so that the connection being tested keeps
     reading frames while the broker is being reconfigured — the notification
@@ -398,6 +400,7 @@ async def rabbitmqctl(*arguments: str) -> None:
     assert process.returncode == 0, (
         f"{BROKER_CONTROL} {' '.join(arguments)} failed: {output.decode(errors='replace')}"
     )
+    return output.decode(errors="replace")
 
 
 async def until(check: Callable[[], Awaitable[bool]], what: str, timeout: float = 15.0) -> None:
@@ -1735,6 +1738,73 @@ async def test_a_failing_stream_handler_appends_nothing_to_the_log(
     reason = str(Envelope.from_headers(dead.headers, dlq).error)
     assert "asked to retry" in reason
     assert f"puts a copy in {name}.parked" in reason
+
+
+@needs_control_of_the_broker
+async def test_a_recovered_stream_reader_carries_on_where_it_was(
+    mq: Connection, workspace: Workspace
+) -> None:
+    """A reconnection neither replays a stream nor skips what it missed.
+
+    aio-pika consumes again after a recovery with the arguments it was first
+    given, and for a stream those name a starting point. 0.7.8 therefore handed
+    a reader that began at "first" the whole stream a second time, and moved one
+    that began at "next" past everything appended while it was away. Everything
+    here is settled before the connection is closed, so the right answer has no
+    duplicates in it at all.
+    """
+    name = workspace.name("events")
+    await declare_stream(mq, name, StreamRetention(max_age=timedelta(hours=1)))
+    workspace.register(name)
+    publisher = mq.publisher(routing_key=name, mandatory=True)
+    for n in range(30):
+        await publisher.send({"n": n})
+
+    # A connection of the readers' own, named so that it alone can be closed.
+    tag = f"{name}.readers"
+    readers = await connect(
+        f"{BROKER}{'&' if '?' in BROKER else '?'}name={tag}", origin="acemq-python-tests@ci"
+    )
+    seen: dict[str, list[int]] = {"first": [], "next": []}
+
+    def into(label: str) -> Callable[[Message], Awaitable[Ack]]:
+        async def handle(message: Message) -> Ack:
+            seen[label].append(message.payload["n"])
+            return accept()
+
+        return handle
+
+    async def has(label: str, count: int) -> bool:
+        return len(set(seen[label])) >= count
+
+    first = await read_stream(readers, name, into("first"), offset=from_first(), declare=False)
+    after = await read_stream(readers, name, into("next"), offset=from_next(), declare=False)
+    try:
+        await until(lambda: has("first", 30), "the reader from first read the stream")
+        for n in range(30, 40):
+            await publisher.send({"n": n})
+        await until(lambda: has("next", 10), "the reader from next read what was appended")
+        await asyncio.sleep(0.5)  # every handler has returned and acknowledged
+
+        listed = await rabbitmqctl("list_connections", "-q", "pid", "client_properties")
+        pids = [line.split()[0] for line in listed.splitlines() if tag in line]
+        assert len(pids) == 1, listed
+        await rabbitmqctl("close_connection", pids[0], "acemq stream recovery test")
+        # Appended while the readers are away: a robust connection waits seconds
+        # before it tries again.
+        for n in range(40, 50):
+            await publisher.send({"n": n})
+
+        await until(lambda: has("first", 50), "the reader from first recovered", 30.0)
+        await until(lambda: has("next", 20), "the reader from next recovered", 30.0)
+        await asyncio.sleep(1.0)  # long enough for a replay to show itself
+    finally:
+        await first.close()
+        await after.close()
+        await readers.close()
+
+    assert seen["first"] == list(range(50))
+    assert seen["next"] == list(range(30, 50))
 
 
 @pytest.fixture

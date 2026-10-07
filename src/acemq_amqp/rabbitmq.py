@@ -31,6 +31,7 @@ nothing to do with them.
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any, cast
@@ -294,14 +295,16 @@ class RabbitMQTransport:
         if spec.prefetch > 0:
             await channel.set_qos(prefetch_count=spec.prefetch)
         source = await channel.get_queue(queue)
+        arguments = dict(spec.args)
+        position = _StreamPosition(arguments) if _STREAM_OFFSET in arguments else None
 
         async def on_message(incoming: AbstractIncomingMessage) -> None:
-            await deliver(_delivery(incoming))
+            await deliver(_delivery(incoming, position))
 
         tag = await source.consume(
             on_message,
             consumer_tag=spec.tag or None,
-            arguments=dict(spec.args) or None,
+            arguments=arguments or None,
         )
         return _Subscription(channel, source, tag)
 
@@ -396,13 +399,64 @@ async def _reusable(channel: AbstractChannel | None) -> AbstractChannel | None:
     return channel
 
 
-def _delivery(incoming: AbstractIncomingMessage) -> Delivery:
+_STREAM_OFFSET = "x-stream-offset"
+
+
+class _StreamPosition:
+    """How far a stream subscription has got, kept where a recovery reads it.
+
+    A robust queue consumes again after a reconnection with the arguments it
+    recorded the first time -- the very dict :meth:`RabbitMQTransport.consume`
+    handed it. A queue forgets what it delivered, so that is right for a queue.
+    A stream forgets nothing and starts wherever ``x-stream-offset`` says, so
+    saying the original thing again replayed a reader that began at "first" from
+    the beginning and moved one that began at "next" past everything appended
+    while it was away. This keeps the offset in that dict at the oldest entry
+    delivered and not yet settled, or just after the newest settled: what a
+    queue would redeliver, and nothing it would not.
+    """
+
+    def __init__(self, arguments: dict[str, Any]) -> None:
+        self._arguments = arguments
+        self._pending: Counter[int] = Counter()
+        self._settled = -1
+
+    def delivered(self, offset: int) -> None:
+        self._pending[offset] += 1
+        self._move()
+
+    def settled(self, offset: int) -> None:
+        self._pending[offset] -= 1
+        if self._pending[offset] <= 0:
+            del self._pending[offset]
+        self._settled = max(self._settled, offset)
+        self._move()
+
+    def _move(self) -> None:
+        # ponytail: min() over what is held, which prefetch keeps small
+        self._arguments[_STREAM_OFFSET] = (
+            min(self._pending) if self._pending else self._settled + 1
+        )
+
+
+def _delivery(
+    incoming: AbstractIncomingMessage, position: _StreamPosition | None = None
+) -> Delivery:
     """Turns an aio-pika delivery into the transport's own shape."""
+    offset = (incoming.headers or {}).get(_STREAM_OFFSET)
+    settle: Callable[[], None] = lambda: None  # noqa: E731
+    if position is not None and isinstance(offset, int) and offset >= 0:
+        # Recorded before the handler sees it and settled before the broker is
+        # told, so a reconnection at any point finds it either pending or done.
+        position.delivered(offset)
+        settle = lambda: position.settled(offset)  # noqa: E731
 
     async def ack() -> None:
+        settle()
         await incoming.ack()
 
     async def nack(requeue: bool) -> None:
+        settle()
         await incoming.nack(requeue=requeue)
 
     return Delivery(

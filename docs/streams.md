@@ -262,6 +262,18 @@ offset yourself.
 
 ## Resuming where you stopped
 
+A **reconnection** is different, and needs nothing from you. When the
+connection drops and the library brings it back, a stream reader carries on from
+the oldest entry it was handed and had not yet acknowledged, or from just after
+the newest it had — not from the offset it was started with. A reader started at
+`from_first()` does not replay the stream, and one started at `from_next()` does
+not skip what was appended while it was away. Entries a handler was still
+working on when the connection went arrive again, so a handler sees at most a
+prefetch's worth of repeats.
+
+What follows is about a **restart**, where the process and everything it held
+are gone.
+
 The broker does not remember your position between runs. That is what makes
 streams cheap, and it is what makes checkpointing your job. A reader restarted
 with `from_first()` reprocesses everything; one restarted with `from_next()`

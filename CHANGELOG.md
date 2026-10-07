@@ -10,6 +10,17 @@ While the version is `0.x` the public API may change in any release.
 
 ### Fixed
 
+- **A stream reader resumes where it was after a reconnection.** The robust
+  connection consumed again with the arguments it was first given, so a stream
+  subscription asked for its original `x-stream-offset` a second time. A reader
+  that began at `from_first()` was handed the whole stream again (3,000 entries
+  became 3,650 deliveries when the connection was closed 650 in), and one that
+  began at `from_next()` skipped what had arrived while it was away (273 of
+  1,000 lost). The transport now keeps the recovery's offset at the oldest entry
+  delivered and not yet settled, or just after the newest settled one -- what a
+  queue would redeliver. The same run now gives 3,003 and 1,006 deliveries with
+  nothing missing; the few repeats are entries a handler held when the
+  connection went, which is at-least-once. Queue consumers are unchanged.
 - **A handler that raises inside `idempotent()` gives its claim back.** Only a
   handler that *returned* a retry or a rejection released the key; one that
   raised, which is how most Python handlers fail, left it claimed. The consumer
