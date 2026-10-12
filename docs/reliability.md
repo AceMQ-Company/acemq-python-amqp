@@ -335,7 +335,16 @@ only the raising that is opted into.
 
 Every hop this library makes itself is mandatory: a retry, a dead letter, a
 parked message and a replay all republish by queue name and check that the queue
-was there.
+was there. So is every publish the library makes for you and then treats as
+done — the outbox relay, a routing slip's hop to its next stop, the scheduler's
+hops down its ladder and its final delivery, and `replay()` — and each keeps the
+original when the copy reaches no queue: the outbox record stays in the table,
+the routing-slip step retries rather than accepting, the scheduler's control
+message is not acknowledged, and the replay leaves the message where it was and
+stops with a `ReplayError`. A returned message is reported as unroutable rather
+than as a refused confirm, so `publish_raw` gives back `routed=False` and a
+mandatory `Publisher` raises `PublishError` with `unroutable` set. All of this is
+from 0.7.9.
 
 ## Duplicates
 

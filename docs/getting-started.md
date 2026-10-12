@@ -6,7 +6,19 @@ apart.
 ## Install it
 
 ```bash
-pip install "acemq-amqp[rabbitmq]"
+pip install --extra-index-url https://acemq.org/pypi/simple/ "acemq-amqp[rabbitmq]==0.7.9"
+```
+
+The package is not on PyPI. Releases are served from AceMQ's own static index,
+<https://acemq.org/pypi/simple/> — no account, no credential, each link carrying
+the `sha256` pip checks — and everything it depends on still comes from PyPI.
+The current release is **0.7.9**. pip merges the two indexes and takes the
+highest version it finds under a name, whichever index it came from, so pin the
+version rather than floating it. To have the shorter `pip install` lines
+elsewhere in this guide work as written, set the index once:
+
+```bash
+export PIP_EXTRA_INDEX_URL=https://acemq.org/pypi/simple/
 ```
 
 Python 3.10 or newer. The extra is the broker client — `aio-pika` — and it is an

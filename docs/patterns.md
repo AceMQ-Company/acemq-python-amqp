@@ -136,7 +136,13 @@ the message is taken over and run. It shows as `outcome="in_progress"` on
 | `Claim.IN_PROGRESS` — live, unconfirmed | `in_progress(...)`, handler not run |
 
 When the handler does *not* accept, the key is forgotten so the retry can
-actually run. That ordering is what makes this a guard against duplicates rather
+actually run — and that includes a handler that **raises**, which is how most
+Python handlers fail. The claim is given back before the exception becomes a
+retry, so the retry runs the handler and spends an attempt, and the ladder and
+the dead-letter queue are reached as they would be without the wrapper. (Up to
+0.7.8 only a handler that *returned* a retry or a rejection released the key; one
+that raised left it claimed, and every redelivery found it "in progress" until
+the claim aged out.) That ordering is what makes this a guard against duplicates rather
 than a promise of exactly-once: between the handler finishing and the
 acknowledgement reaching the broker there is still a gap where a crash leaves a
 message that will be delivered again. **Only a store written in the same
@@ -440,6 +446,12 @@ republished *before* the original is acknowledged, so a failure in the gap
 replays one twice rather than losing it — the right way round for a queue
 somebody is putting back by hand.
 
+The republish is **mandatory**. A copy that reaches no queue — the target was
+deleted, or `routing_key` names something nothing is bound to — is not a
+success: the original stays on the queue it was being recovered from and the
+replay stops with a `ReplayError`, rather than acknowledging the last copy of a
+message the broker has just dropped.
+
 ## Routing slips
 
 Each service does its part and sends the message to the next stop written on the
@@ -481,7 +493,10 @@ carries what has already happened, oldest first, so a slip that fails halfway
 says how far it got.
 
 The message is accepted only once the next one is out, which is again why a step
-that changes anything should be idempotent.
+that changes anything should be idempotent. "Out" means routed: the hop to the
+next stop is published mandatory, so a next stop nothing is bound to makes the
+step retry rather than accept, and the message is never acknowledged on the
+strength of a copy the broker dropped.
 
 ### Two wire forms, and both are read
 
@@ -720,6 +735,11 @@ A message that reaches the control queue without the headers a scheduled message
 carries is rejected rather than retried: no number of attempts adds a header,
 and something else publishing into the scheduler's queues is a bug rather than a
 delivery to guess a destination for.
+
+Its own publishes — a hop down to the next rung and the final delivery — are
+mandatory. If the copy reaches no queue (a rung has been deleted, or the
+destination has nothing bound to it) the control message is not acknowledged,
+so the scheduled message is tried again rather than lost.
 
 `scheduled`, `delivered` and `hops` say what it has done. `hops` divided by
 `delivered` is the average number of hops, which is the number to look at when a
