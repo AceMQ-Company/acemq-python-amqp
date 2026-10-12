@@ -74,7 +74,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from ..ack import Ack, accept, reject
+from ..ack import Ack, accept, in_progress, reject
 from ..codec import JSON_CONTENT_TYPE, BytesCodec, Codec
 from ..connection import Connection, Consumer, Message
 from ..envelope import Envelope
@@ -138,6 +138,15 @@ SCHEDULE_RUNGS: tuple[timedelta, ...] = (
 #: per message beyond a republish, so it can hold rather more than an ordinary
 #: consumer without any of them waiting on it.
 DEFAULT_SCHEDULE_PREFETCH = 50
+
+#: How long a due message that could not be delivered waits before the next try.
+#:
+#: Unbounded in attempts, as in every AceMQ library: a target nothing is bound to
+#: yet is a deployment-order problem that fixes itself, and the message is the one
+#: thing that must survive it. A rung rather than a sleep, so the wait holds no
+#: prefetch slot and survives a restart; ten seconds keeps a target that stays
+#: unroutable from spinning.
+SCHEDULE_RETRY_RUNG = timedelta(seconds=10)
 
 #: The envelope type every message the scheduler moves is published under.
 SCHEDULED_TYPE = "ScheduledMessage"
@@ -390,7 +399,20 @@ class Scheduler:
             when = _from_millis(_number(due_at))
         except AceMQError as unreadable:
             return reject(unreadable)
-        await self._route(message.body, headers, when)
+        try:
+            await self._route(message.body, headers, when)
+        except Exception as failure:
+            # Only reached when even the hop into a rung failed — a rung deleted
+            # under a running scheduler, or the connection going. Put back on the
+            # control queue rather than left to the consumer's retry policy: this
+            # queue has no dead-letter queue, so giving up would reject the
+            # message to nowhere.
+            log.error(
+                "acemq: could not move a scheduled message on, putting it back on %s: %s",
+                SCHEDULE_DUE,
+                failure,
+            )
+            return in_progress()
         return accept()
 
     async def _route(self, body: bytes, headers: dict[str, Any], when: datetime) -> None:
@@ -407,13 +429,19 @@ class Scheduler:
             (candidate for candidate in SCHEDULE_RUNGS if candidate <= remaining),
             SCHEDULE_RUNGS[-1],
         )
+        await self._hop(body, headers, rung)
+
+    async def _hop(self, body: bytes, headers: dict[str, Any], rung: timedelta) -> None:
+        """Puts the message in a rung, from which it comes back to
+        :data:`SCHEDULE_DUE` when the rung's time to live runs out."""
         self._hops += 1
         # Mandatory here and in _deliver, because the control message is
         # acknowledged as soon as this returns: a rung that has been deleted or
         # a destination nothing is bound to is confirmed and dropped by the
         # broker, and without the return the scheduled message would be gone
-        # with nothing reporting it. Raised instead, so the control consumer's
-        # retry policy has it.
+        # with nothing reporting it. Raised instead: _deliver sends a refused
+        # delivery round a rung, and _forward puts back a message whose hop
+        # failed.
         await self._connection.publisher(
             SCHEDULE_EXCHANGE, schedule_rung_name(rung), codec=BytesCodec(), mandatory=True
         ).send(body, envelope=Envelope(type=SCHEDULED_TYPE, headers=headers))
@@ -424,13 +452,31 @@ class Scheduler:
         routing_key = _text(headers.get(HEADER_SCHEDULE_ROUTING_KEY))
         content_type = _text(headers.get(HEADER_SCHEDULE_CONTENT_TYPE)) or JSON_CONTENT_TYPE
 
-        self._delivered += 1
         # The scheduler's own headers are not passed on: they are bookkeeping,
         # and a consumer that started depending on them would be depending on
         # how a message got to it.
-        await self._connection.publisher(
-            exchange, routing_key, codec=_Verbatim(content_type), mandatory=True
-        ).send(body, envelope=Envelope(type=SCHEDULED_TYPE))
+        try:
+            await self._connection.publisher(
+                exchange, routing_key, codec=_Verbatim(content_type), mandatory=True
+            ).send(body, envelope=Envelope(type=SCHEDULED_TYPE))
+        except Exception as refused:
+            # Unroutable, refused or sent to an exchange that is not there. Kept
+            # and tried again after one more trip through a rung, for as long as
+            # it takes, as the other AceMQ libraries do. Left to the control
+            # consumer it would be dead-lettered to a queue that does not exist,
+            # and so rejected to nowhere: "the target is not bound yet" turned
+            # into a message nobody delivers.
+            log.warning(
+                "acemq: a scheduled message for %r/%r could not be delivered; "
+                "trying again in %s: %s",
+                exchange,
+                routing_key,
+                SCHEDULE_RETRY_RUNG,
+                refused,
+            )
+            await self._hop(body, headers, SCHEDULE_RETRY_RUNG)
+            return
+        self._delivered += 1
 
     async def close(self) -> None:
         """Stops consuming the control queue.

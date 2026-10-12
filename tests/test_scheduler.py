@@ -481,12 +481,14 @@ async def test_closing_a_scheduler_stops_the_consumer_and_deletes_nothing() -> N
 # --- a destination nothing is bound to -----------------------------------------
 
 
-async def test_a_due_message_nothing_is_bound_to_is_not_acknowledged() -> None:
+async def test_a_due_message_nothing_is_bound_to_goes_round_again_rather_than_away() -> None:
     """The scheduler's last hop is the one that matters, and it is the library's.
 
     Published without ``mandatory``, a due message for a queue that is not there
-    is confirmed and dropped by the broker, the control message is acknowledged
-    as delivered, and the scheduled message is gone with nothing reporting it.
+    is confirmed and dropped by the broker. Refused, it used to be handed to the
+    control consumer's retry policy, which dead-lettered it to a queue that does
+    not exist — rejected to nowhere. It is kept instead: back into the ten-second
+    rung, to be tried again when that runs out, and not counted as delivered.
     """
     transport = FakeTransport()
     mq, scheduler = await running(transport)
@@ -505,20 +507,61 @@ async def test_a_due_message_nothing_is_bound_to_is_not_acknowledged() -> None:
         await mq.close()
 
     assert published_to(transport, "", "nobody-is-bound-here")[0].message.mandatory
-    assert not settlement.acked, "an unroutable scheduled message was acknowledged"
+    again = published_to(transport, SCHEDULE_EXCHANGE, "acemq.schedule.10s")
+    assert len(again) == 1, "an unroutable scheduled message was not kept"
+    assert again[0].message.headers[HEADER_SCHEDULE_ROUTING_KEY] == "nobody-is-bound-here"
+    assert "acemq.schedule.due.dlq" not in [sent.routing_key for sent in transport.sent]
+    # Acknowledged only because it is safely in the rung.
+    assert settlement.acked
+    assert scheduler.delivered == 0
 
 
-async def test_scheduling_for_now_to_a_queue_that_is_not_there_says_so() -> None:
+async def test_scheduling_for_now_to_a_queue_that_is_not_there_keeps_it() -> None:
     transport = FakeTransport()
     mq, scheduler = await running(transport)
     try:
-        with pytest.raises(PublishError) as raised:
-            await scheduler.after(timedelta(0), "", "nobody-is-bound-here", {"n": 1})
+        await scheduler.after(timedelta(0), "", "nobody-is-bound-here", {"n": 1})
     finally:
         await scheduler.close()
         await mq.close()
 
-    assert raised.value.unroutable
+    assert len(published_to(transport, SCHEDULE_EXCHANGE, "acemq.schedule.10s")) == 1
+    assert scheduler.delivered == 0
+
+
+async def test_a_message_that_cannot_even_reach_a_rung_is_put_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control queue has no dead-letter queue, so the consumer's retry
+    policy must never be the one to give up on a scheduled message."""
+    transport = FakeTransport()
+    mq, scheduler = await running(transport)
+
+    async def no_rung(*_: Any) -> None:
+        raise PublishError("", SCHEDULE_EXCHANGE, "acemq.schedule.10s", "NO_ROUTE")
+
+    async def no_wait(*_: Any) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler, "_hop", no_rung)
+    monkeypatch.setattr("acemq_amqp.connection.asyncio.sleep", no_wait)
+    try:
+        settlement = await transport.deliver(
+            SCHEDULE_DUE,
+            b"{}",
+            headers=scheduled_headers(
+                int(now().timestamp() * 1000) - 5_000,
+                exchange="",
+                routing_key="nobody-is-bound-here",
+            ),
+        )
+    finally:
+        await scheduler.close()
+        await mq.close()
+
+    assert [sent.routing_key for sent in transport.sent][-1] == SCHEDULE_DUE
+    assert settlement.acked
+    assert "acemq.schedule.due.dlq" not in [sent.routing_key for sent in transport.sent]
 
 
 async def test_a_hop_down_a_rung_is_mandatory() -> None:

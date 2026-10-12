@@ -663,6 +663,12 @@ minute, then three tens; a one-day delay is twenty-four hops and a one-minute
 delay is one, which is the right way round — short delays are common and want
 to be cheap.
 
+A due message that reaches no queue — nothing bound to its routing key yet, or
+its exchange not declared yet — is kept, not dropped. The scheduler logs a
+warning, puts it back in the ten-second rung and tries again when that runs
+out, as many times as it takes, so it arrives once its queue is bound.
+`delivered` counts only the messages that actually arrived.
+
 The cost is honest and worth stating: a long delay is several broker round trips
 rather than one, and delivery is accurate to about the smallest rung rather than
 to the second. A scheduler that must fire at 09:00:00.000 exactly is a

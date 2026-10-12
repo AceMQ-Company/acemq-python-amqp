@@ -2267,6 +2267,50 @@ async def test_a_scheduled_message_arrives_late_rather_than_early_or_never(
         await without_the_scheduler_queues(mq)
 
 
+async def test_a_scheduled_message_nothing_is_bound_for_yet_waits_rather_than_vanishing(
+    mq: Connection, workspace: Workspace
+) -> None:
+    """A due message that reaches no queue is kept and tried again.
+
+    The deployment-order case: a message is scheduled to a routing key whose
+    queue is bound later. The scheduler's control queue has no dead-letter
+    queue, so a delivery that gave up would be rejected to nowhere and the
+    message would be gone with nothing reporting it. It goes round the
+    ten-second rung instead, and arrives once something is listening.
+    """
+    exchange = workspace.name("not-yet-bound")
+    queue = workspace.name("bound-later")
+    await mq.declare(Topology().exchange(exchange, "direct", auto_delete=True))
+
+    await without_the_scheduler_queues(mq)
+    try:
+        async with await Scheduler.open(mq) as scheduler:
+            # Long enough to go through a rung, so the refusal happens in the
+            # scheduler's consumer rather than in this call.
+            await scheduler.after(timedelta(seconds=2), exchange, "late.binding", {"n": 1})
+            # Due and refused at least once by now.
+            await asyncio.sleep(6)
+            print(f"\nafter 6s with nothing bound: {scheduler}")
+            assert scheduler.delivered == 0
+            # Not dead-lettered to somewhere nobody reads: still in a rung.
+            assert await mq.queue_exists("acemq.schedule.due.dlq") is False
+
+            await mq.declare(
+                Topology()
+                .exchange(exchange, "direct", auto_delete=True)
+                .queue(queue, dead_letter=True)
+                .binding(queue, exchange, "late.binding")
+            )
+            workspace.register(queue)
+
+            arrived = (await collect(mq, queue, timeout=30))[0]
+            print(f"  arrived once bound: {arrived.payload}, {scheduler}")
+            assert arrived.payload == {"n": 1}
+            assert scheduler.delivered == 1
+    finally:
+        await without_the_scheduler_queues(mq)
+
+
 async def test_a_scheduler_moves_bytes_it_cannot_decode_under_the_type_they_came_in_as(
     mq: Connection, workspace: Workspace
 ) -> None:

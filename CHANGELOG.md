@@ -8,6 +8,20 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.7.10] - 2026-10-12
+
+### Fixed
+
+- **A scheduled message is no longer lost when nothing is bound to receive it
+  when it falls due.** If its routing key had no queue bound yet, or its
+  exchange did not exist yet, the scheduler gave up on the first try and the
+  message was thrown away, with only an error in the log. It is now kept: the
+  scheduler logs a warning, waits ten seconds in its own queues and tries again,
+  for as long as it takes, so the message arrives once its queue is bound. This
+  matches the Java, .NET and Ruby libraries. `Scheduler.delivered` now counts
+  only messages that actually arrived, and scheduling for "now" to a queue that
+  is not there keeps the message instead of raising `PublishError`.
+
 ## [0.7.9] - 2026-10-11
 
 ### Fixed
