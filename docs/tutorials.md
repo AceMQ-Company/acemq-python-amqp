@@ -21,7 +21,7 @@ translation of Java's.
 ## Before you start
 
 ```bash
-pip install --extra-index-url https://acemq.org/pypi/simple/ "acemq-amqp[rabbitmq]==0.7.9"
+pip install --extra-index-url https://acemq.org/pypi/simple/ "acemq-amqp[rabbitmq]==0.7.10"
 ```
 
 Python 3.10 or newer.

@@ -15,7 +15,7 @@ production.
 
 > **Status: in build.** The contract layer, the transport and the pattern
 > library are implemented and tested, against a real broker as well as a fake
-> one. The current release is **0.7.9**, published to AceMQ's own package index
+> one. The current release is **0.7.10**, published to AceMQ's own package index
 > at <https://acemq.org/pypi/simple/> rather than to PyPI.
 
 ## Sending and receiving
@@ -67,7 +67,7 @@ under a name across both indexes:
 
 ```bash
 export PIP_EXTRA_INDEX_URL=https://acemq.org/pypi/simple/
-pip install "acemq-amqp[rabbitmq]==0.7.9"
+pip install "acemq-amqp[rabbitmq]==0.7.10"
 
 pip install acemq-amqp                # the contract, no dependencies at all
 pip install "acemq-amqp[rabbitmq]"    # and a way to talk to a broker
