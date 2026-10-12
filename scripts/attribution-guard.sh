@@ -11,6 +11,11 @@
 set -euo pipefail
 
 PATTERN='claude|anthropic|co-authored-by[[:space:]]*:|\bgenerated with\b|assisted by (an )?ai|ai-generated|🤖'
+# The one co-author line that is not attribution: GitHub writes it into every
+# squash-merged Dependabot pull request. Matched to the bot's exact address, so a
+# co-author line naming anybody or anything else is still a violation.
+DEPENDABOT_COAUTHOR='^[[:space:]]*co-authored-by:[[:space:]]*dependabot\[bot\][[:space:]]*<49699333\+dependabot\[bot\]@users\.noreply\.github\.com>[[:space:]]*$'
+not_dependabot() { grep -viE "$DEPENDABOT_COAUTHOR" || true; }
 TARGET="."; RANGE=""; MSG_FILE=""; found=0
 
 while [ $# -gt 0 ]; do
@@ -27,9 +32,9 @@ report() { echo "ATTRIBUTION VIOLATION — $1" >&2; found=1; }
 
 # 1. a single commit message (commit-msg hook)
 if [ -n "$MSG_FILE" ]; then
-  if grep -qiE "$PATTERN" "$MSG_FILE"; then
+  if not_dependabot < "$MSG_FILE" | grep -qiE "$PATTERN"; then
     report "commit message contains forbidden attribution"
-    grep -inE "$PATTERN" "$MSG_FILE" >&2 || true
+    not_dependabot < "$MSG_FILE" | grep -inE "$PATTERN" >&2 || true
   fi
   exit "$found"
 fi
@@ -41,7 +46,7 @@ if git rev-parse --git-dir >/dev/null 2>&1; then
   if [ -z "$RANGE" ]; then
     if git rev-parse --verify -q origin/main >/dev/null; then RANGE="origin/main..HEAD"; else RANGE="HEAD"; fi
   fi
-  if hits="$(git log --format='%H%n%B%n%an <%ae>%n%cn <%ce>' "$RANGE" 2>/dev/null | grep -inE "$PATTERN" || true)"; then
+  if hits="$(git log --format='%H%n%B%n%an <%ae>%n%cn <%ce>' "$RANGE" 2>/dev/null | not_dependabot | grep -inE "$PATTERN" || true)"; then
     if [ -n "$hits" ]; then
       report "commit history in range '$RANGE'"
       echo "$hits" >&2
