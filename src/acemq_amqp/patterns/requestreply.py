@@ -49,7 +49,7 @@ from datetime import timedelta
 from typing import Any
 
 from ..ack import Ack, FatalError, accept, reject, retry
-from ..codec import Codec
+from ..codec import BytesCodec, Codec
 from ..connection import Connection, Consumer, Message
 from ..envelope import Envelope
 from ..errors import AceMQError
@@ -204,8 +204,13 @@ class Requester:
         # nothing ever deletes. There is nothing for them to catch either:
         # :meth:`_receive` accepts every reply, including one nobody is waiting
         # for, so no message on this queue is ever dead-lettered or parked.
+        #
+        # Consumed as bytes, and decoded by :meth:`ask`, for the same reason: a
+        # consumer parks a body its codec cannot read, and this queue has no
+        # parked queue. The reply would vanish and its caller would wait out the
+        # whole timeout instead of hearing why. Java and .NET do the same.
         requester._consumer = await connection.consume(
-            queue, requester._receive, codec=codec, declare=False
+            queue, requester._receive, codec=BytesCodec(), declare=False
         )
         return requester
 
@@ -252,6 +257,7 @@ class Requester:
         :returns: the reply's payload
         :raises RequestTimeoutError: when nothing came back in time
         :raises ResponderError: when the responder said it could not do it
+        :raises Exception: whatever the codec raises for a reply it cannot read
         """
         deadline = timeout or self._timeout
         correlation = str(uuid.uuid4())
@@ -309,7 +315,8 @@ class Requester:
             raise ResponderError(
                 f"acemq: the responder could not answer {correlation}: {failure}"
             )
-        return answer.payload
+        codec = self._codec or self._connection.codec
+        return codec.decode(answer.body, answer.content_type)
 
     def _record(self, elapsed: float, outcome: str) -> None:
         """One round trip, on the two metrics Java writes for the same thing.

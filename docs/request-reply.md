@@ -183,6 +183,10 @@ Two failures, and they are different facts:
 milliseconds rather than at the deadline, and learns why. That is the whole
 reason `serve` sends a failure back rather than swallowing it.
 
+A reply the caller's codec cannot read is a third case, and it is raised the
+same way: `ask` raises the codec's own error (a `FatalError` for a body that is
+not JSON) as soon as the reply arrives, rather than waiting out the deadline.
+
 `RequestTimeoutError` is **also a `TimeoutError`**, so the clause a Python caller
 actually writes catches it:
 

@@ -8,6 +8,19 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.7.11] - 2026-10-12
+
+### Fixed
+
+- **A reply the caller cannot decode now reaches the caller as an error
+  instead of a timeout.** If a responder answered in a format the requester's
+  codec could not read, the reply was set aside to a parked queue that the
+  reply queue never has, so it was lost and `ask` waited out its whole timeout
+  before raising `RequestTimeoutError`. `ask` now raises the codec's own error
+  (for example `FatalError` for a body that is not JSON) as soon as the reply
+  arrives, and the reply is acknowledged. This matches the Java and .NET
+  libraries.
+
 ## [0.7.10] - 2026-10-12
 
 ### Fixed

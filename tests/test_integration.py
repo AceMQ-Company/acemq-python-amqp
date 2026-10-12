@@ -1489,6 +1489,38 @@ async def test_a_question_over_a_queue_comes_back_answered(
         assert caller.unmatched == 0
 
 
+async def test_a_reply_the_caller_cannot_decode_is_raised_rather_than_timed_out(
+    mq: Connection, workspace: Workspace
+) -> None:
+    """A responder answering in a format the caller cannot read.
+
+    The reply queue declares no parked queue, so a reply the consumer set aside
+    as undecodable used to be published to a queue that does not exist and
+    vanish, and the caller waited out its whole timeout to learn nothing.
+    """
+    requests = await workspace.queue("garbled-requests")
+    replies = workspace.name("garbled-replies")
+    workspace.register(replies)
+
+    async def garble(message: Message) -> str:
+        return "this is not JSON"
+
+    async with (
+        await serve(mq, requests, garble, codec=TextCodec()),
+        await Requester.open(
+            mq, "", requests, reply_queue=replies, timeout=timedelta(seconds=15)
+        ) as caller,
+    ):
+        started = time.monotonic()
+        with pytest.raises(FatalError, match="not JSON"):
+            await caller.ask({"sku": "A-1"})
+        assert time.monotonic() - started < 5
+        assert caller.timed_out == 0
+
+    # Settled, not left on the queue or handed back by the broker.
+    assert await _count(mq, replies, 0)
+
+
 async def test_a_caller_that_sets_only_the_native_reply_to_is_answered(
     mq: Connection, workspace: Workspace
 ) -> None:

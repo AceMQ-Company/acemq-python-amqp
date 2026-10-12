@@ -31,6 +31,7 @@ from acemq_amqp import (
     ConsumeSpec,
     Delivery,
     Envelope,
+    FatalError,
     Message,
     Metrics,
     Outbound,
@@ -330,6 +331,32 @@ async def test_a_failure_carried_back_is_raised_rather_than_returned() -> None:
         with pytest.raises(ResponderError, match="no such sku"):
             await asking
 
+    await mq.close()
+
+
+async def test_a_reply_that_will_not_decode_is_raised_to_its_caller_not_parked() -> None:
+    # The reply queue declares no parked queue, so a reply the consumer set
+    # aside would go nowhere and its caller would wait out the whole timeout.
+    transport = FakeTransport()
+    mq = Connection(transport)
+
+    async with await Requester.open(mq, "", REQUESTS, timeout=timedelta(seconds=5)) as caller:
+        asking = asyncio.create_task(caller.ask({"sku": "A-1"}))
+        went_out = await sent_to(transport, REQUESTS)
+        correlation = str(went_out.headers[headers.CORRELATION])
+
+        settlement = await transport.deliver(
+            caller.reply_queue,
+            b"not json at all",
+            headers=Envelope(correlation_id=correlation).to_headers(),
+        )
+
+        with pytest.raises(FatalError, match="not JSON"):
+            await asyncio.wait_for(asking, 1)
+
+    assert settlement.acked is True
+    assert [sent.routing_key for sent in transport.sent] == [REQUESTS]
+    assert caller.timed_out == 0
     await mq.close()
 
 
