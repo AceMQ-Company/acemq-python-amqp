@@ -443,6 +443,10 @@ class Publisher:
         return result
 
 
+class _HopRefusedError(Exception):
+    """The broker refused a republish the consumer made on the user's behalf."""
+
+
 class Consumer:
     """A running subscription. Close it to stop.
 
@@ -900,7 +904,17 @@ class Consumer:
         """
         rung = naming.retry_queue(self._queue, delay)
         next_attempt = envelope.with_(attempt=envelope.attempt + 1)
-        if not await self._republish(delivery, rung, next_attempt):
+        try:
+            routed = await self._republish(delivery, rung, next_attempt)
+        except _HopRefusedError:
+            # The rung is there and would not take it. Requeued at once, with
+            # nothing else on this consumer settled, rather than waited out
+            # here: the broker is the one saying no, and holding the delivery
+            # for the whole delay would stall this consumer for nothing.
+            self._observer.count(METRIC_RETRIED_TOTAL, 1, {**self._labels, "where": "requeued"})
+            await delivery.nack(True)
+            return True
+        if not routed:
             # Kept even though a consumer declares its own rungs when it starts,
             # because the rung can still be missing: a consumer started with
             # ``declare=False`` declares nothing, and a rung deleted under a
@@ -955,7 +969,10 @@ class Consumer:
         message that has already failed once, that is the better trade.
         """
         next_attempt = envelope.with_(attempt=envelope.attempt + 1)
-        delivered = await self._republish(delivery, self._queue, next_attempt)
+        try:
+            delivered = await self._republish(delivery, self._queue, next_attempt)
+        except _HopRefusedError:
+            delivered = False
         if not delivered:
             # The queue we are consuming has gone. Requeued rather than
             # acknowledged, because dropping it here would lose a message over a
@@ -998,7 +1015,11 @@ class Consumer:
         """
         if delay > ZERO:
             await asyncio.sleep(delay.total_seconds())
-        if await self._republish(delivery, self._queue, envelope):
+        try:
+            delivered = await self._republish(delivery, self._queue, envelope)
+        except _HopRefusedError:
+            delivered = False
+        if delivered:
             await delivery.ack()
             return
         log.error(
@@ -1053,7 +1074,10 @@ class Consumer:
     ) -> None:
         """Republishes to ``target`` with the reason, then acknowledges."""
         failed = envelope.with_(error=reason)
-        delivered = await self._republish(delivery, target, failed)
+        try:
+            delivered = await self._republish(delivery, target, failed)
+        except _HopRefusedError:
+            delivered = False
         if not delivered:
             # Rejected rather than acknowledged: without a dead-letter queue to
             # put it in, the broker's own dead-lettering is the last thing left
@@ -1104,13 +1128,13 @@ class Consumer:
                 ),
             )
         except PublishError as refused:
-            # Refused rather than unroutable: the broker nacked it, or would not
-            # take it while blocked. Not taken all the same, so the caller's
-            # fallback for a hop that went nowhere applies -- requeue the delivery
-            # -- instead of the raise leaving it unsettled for the life of the
+            # The broker nacked it, or would not take it while blocked. Raised
+            # as the caller's to settle, because what to do differs: a refused
+            # rung means requeue now, where a missing rung means wait here.
+            # Escaping further left the delivery unsettled for the life of the
             # channel, which is what Ruby did before 0.7.12.
             log.error("acemq: the broker refused %s onto %s: %s", envelope.id, queue, refused)
-            return False
+            raise _HopRefusedError(str(refused)) from refused
         return result.routed
 
     async def close(self, *, timeout: float | None = DEFAULT_DRAIN_TIMEOUT) -> bool:

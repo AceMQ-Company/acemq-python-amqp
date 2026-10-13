@@ -17,6 +17,7 @@ import os
 import socket
 import sys
 from collections import Counter
+from collections.abc import Mapping
 from datetime import timedelta
 from typing import Any
 
@@ -29,19 +30,56 @@ from acemq_amqp import (
     FatalError,
     Message,
     PublishError,
+    PublishingPausedError,
     Topology,
     accept,
     connect,
     fixed_retry,
 )
-from acemq_amqp.patterns import Requester, Scheduler
+from acemq_amqp.patterns import (
+    Requester,
+    Scheduler,
+    StreamRetention,
+    declare_stream,
+    from_first,
+    from_next,
+    read_stream,
+)
 from acemq_amqp.patterns.requestreply import RequestTimeoutError, ResponderError
 
-OPS = ["hello", "begin", "end", "publish", "consume", "handled", "schedule", "request"]
+OPS = [
+    "hello",
+    "begin",
+    "end",
+    "publish",
+    "consume",
+    "handled",
+    "schedule",
+    "request",
+    "declareStream",
+    "readStream",
+    "metrics",
+]
 
 
 class UnsupportedOpError(Exception):
     pass
+
+
+class Recorder:
+    """The telemetry seam, recording every metric name with its labels."""
+
+    def __init__(self) -> None:
+        self.samples: list[tuple[str, dict[str, str]]] = []
+
+    def count(self, metric: str, delta: int, labels: Mapping[str, str]) -> None:
+        self.samples.append((metric, dict(labels)))
+
+    def observe(self, metric: str, seconds: float, labels: Mapping[str, str]) -> None:
+        self.samples.append((metric, dict(labels)))
+
+    def gauge(self, metric: str, value: int, labels: Mapping[str, str]) -> None:
+        self.samples.append((metric, dict(labels)))
 
 
 class Driver:
@@ -51,6 +89,8 @@ class Driver:
         self.consumers: dict[str, Consumer] = {}
         self.counts: dict[str, Counter[str]] = {}
         self.redelivered: dict[str, Counter[str]] = {}
+        self.order: dict[str, list[str]] = {}
+        self.recorder = Recorder()
         self.scheduler: Scheduler | None = None
         self.requesters: dict[tuple[str, str], Requester] = {}
 
@@ -65,7 +105,10 @@ class Driver:
     async def begin(self, args: dict[str, Any]) -> dict[str, Any]:
         await self.end({})
         origin = f"{args.get('clientName', 'tck')}@{socket.gethostname()}"
-        self.connection = await connect(self.url, origin=origin)
+        # Publisher confirms cannot be turned off in this library, so a case's
+        # ``confirms: false`` changes nothing here.
+        self.recorder = Recorder()
+        self.connection = await connect(self.url, origin=origin, observer=self.recorder)
         return {}
 
     async def end(self, _: dict[str, Any]) -> dict[str, Any]:
@@ -80,6 +123,7 @@ class Driver:
         self.consumers.clear()
         self.counts.clear()
         self.redelivered.clear()
+        self.order.clear()
         if self.connection is not None:
             await self.connection.close()
             self.connection = None
@@ -113,10 +157,12 @@ class Driver:
         sleep = behaviour.get("sleepMs", 0) / 1000
         counts: Counter[str] = Counter()
         redelivered: Counter[str] = Counter()
+        order: list[str] = []
 
         async def handle(message: Message) -> Ack:
             ident = str(message.payload.get("id"))
             counts[ident] += 1
+            order.append(ident)
             if message.redelivered:
                 redelivered[ident] += 1
             if sleep:
@@ -132,6 +178,7 @@ class Driver:
         self.consumers[args["handle"]] = consumer
         self.counts[args["handle"]] = counts
         self.redelivered[args["handle"]] = redelivered
+        self.order[args["handle"]] = order
         return {}
 
     async def handled(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -139,7 +186,36 @@ class Driver:
         return {
             "counts": dict(self.counts[handle]),
             "redelivered": dict(self.redelivered[handle]),
+            "order": list(self.order[handle]),
         }
+
+    async def declareStream(self, args: dict[str, Any]) -> dict[str, Any]:  # noqa: N802
+        retention = StreamRetention(max_age=timedelta(milliseconds=args["maxAgeMs"]))
+        await declare_stream(self.mq, args["queue"], retention)
+        return {}
+
+    async def readStream(self, args: dict[str, Any]) -> dict[str, Any]:  # noqa: N802
+        counts: Counter[str] = Counter()
+        order: list[str] = []
+
+        async def handle(message: Message) -> Ack:
+            ident = str(message.payload.get("id"))
+            counts[ident] += 1
+            order.append(ident)
+            return accept()
+
+        offset = from_first() if args.get("offset", "first") == "first" else from_next()
+        consumer = await read_stream(self.mq, args["queue"], handle, offset=offset)
+        self.consumers[args["handle"]] = consumer
+        self.counts[args["handle"]] = counts
+        self.redelivered[args["handle"]] = Counter()
+        self.order[args["handle"]] = order
+        return {}
+
+    async def metrics(self, _: dict[str, Any]) -> dict[str, Any]:
+        samples = [{"name": name, "tags": tags} for name, tags in self.recorder.samples]
+        names = sorted({name for name, _ in self.recorder.samples})
+        return {"names": names, "samples": samples}
 
     async def schedule(self, args: dict[str, Any]) -> dict[str, Any]:
         if self.scheduler is None:
@@ -170,8 +246,10 @@ def kind_of(failure: BaseException) -> str:
         return "timeout"
     if isinstance(failure, ResponderError):
         return "responder"
+    if isinstance(failure, PublishingPausedError):
+        return "paused"
     if isinstance(failure, PublishError):
-        return "unroutable" if failure.unroutable else "refused"
+        return "unroutable" if failure.unroutable else "nacked"
     if isinstance(failure, FatalError):
         return "decode"
     return "other"

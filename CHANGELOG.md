@@ -15,10 +15,13 @@ While the version is `0.x` the public API may change in any release.
   length limit with `reject-publish`, for instance — the nack escaped as
   aio-pika's own `DeliveryError`, past the consumer's handling, and the
   delivery was left unacknowledged for as long as the channel lived, holding
-  a prefetch slot and never retried. The hop is now treated like one that
-  reached no queue: the delivery is requeued and the consumer carries on. A
-  nack on any publish is now raised as `PublishError` rather than
-  `aiormq.exceptions.DeliveryError`. Found by the AceMQ TCK (case RETRY-001).
+  a prefetch slot and never retried. The delivery is now requeued at once and
+  the consumer carries on, whether the refused hop was back onto the source
+  queue or into a `{queue}.retry.{delay}` rung (a rung that is missing, rather
+  than refusing, is still waited out in the consumer as before). A nack on any
+  publish is now raised as `PublishError` rather than
+  `aiormq.exceptions.DeliveryError`. Found by the AceMQ TCK (cases RETRY-001
+  and RETRY-003).
 - **A message published with neither a type nor a routing key is typed
   `message`.** `x-acemq-type` was written as an empty string, which a
   consumer dispatching on type cannot route. Found by the AceMQ TCK (case
