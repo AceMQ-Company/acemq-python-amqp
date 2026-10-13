@@ -42,7 +42,7 @@ from aio_pika.abc import (
     AbstractIncomingMessage,
     AbstractRobustConnection,
 )
-from aiormq.exceptions import ChannelNotFoundEntity
+from aiormq.exceptions import ChannelNotFoundEntity, DeliveryError
 
 from .transport import (
     ConsumeSpec,
@@ -264,9 +264,18 @@ class RabbitMQTransport:
         # actually returns: a message the broker sent back as unroutable arrives
         # here as a DeliveredMessage carrying the Basic.Return, not as one of the
         # confirmation frames the signature promises.
-        confirmation: object = await target.publish(
-            outbound, routing_key=routing_key, mandatory=message.mandatory
-        )
+        try:
+            confirmation: object = await target.publish(
+                outbound, routing_key=routing_key, mandatory=message.mandatory
+            )
+        except DeliveryError as refused:
+            # aiormq raises a nack rather than returning it, so the frame the
+            # check below looks for never arrived here and a refusal escaped as
+            # aiormq's own exception -- past the PublishError the connection
+            # raises for a nack, and past every hop that settles on it.
+            if type(refused.frame).__name__ != "Nack":
+                raise
+            return PublishResult(message_id=message.message_id, confirmed=False, routed=True)
 
         returned = getattr(confirmation, "delivery", None)
         if returned is not None and hasattr(returned, "reply_text"):

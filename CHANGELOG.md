@@ -8,6 +8,23 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A retry the broker refuses no longer leaves its message unsettled.** When
+  the broker nacked the republish that carries a retry onward — a queue at its
+  length limit with `reject-publish`, for instance — the nack escaped as
+  aio-pika's own `DeliveryError`, past the consumer's handling, and the
+  delivery was left unacknowledged for as long as the channel lived, holding
+  a prefetch slot and never retried. The hop is now treated like one that
+  reached no queue: the delivery is requeued and the consumer carries on. A
+  nack on any publish is now raised as `PublishError` rather than
+  `aiormq.exceptions.DeliveryError`. Found by the AceMQ TCK (case RETRY-001).
+
+### Added
+
+- Runs the AceMQ TCK v0.1.0: a driver in `tests/tck/driver.py` and a `tck`
+  CI job that runs the cross-library compatibility kit against a real broker.
+
 ## [0.7.11] - 2026-10-12
 
 ### Fixed

@@ -54,6 +54,27 @@ jobs:
         # are believed.
         run: mypy
 
+  tck:
+    # The cross-library compatibility kit, at the version this library passes.
+    # The action starts its own broker; the pin on the uses line is the TCK
+    # version, and the release preflight refuses a release behind the newest.
+    name: AceMQ TCK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install
+        run: pip install -e .
+
+      - uses: AceMQ-Company/acemq-amqp-tck@v0.1.0
+        with:
+          driver: python tests/tck/driver.py
+
   integration:
     name: against a real broker
     runs-on: ubuntu-latest

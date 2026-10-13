@@ -1090,18 +1090,27 @@ class Consumer:
         came: re-encoding through a class that has since changed would replace
         what was committed with something else.
         """
-        result = await self._connection.publish_raw(
-            "",
-            queue,
-            Outbound(
-                body=delivery.body,
-                content_type=delivery.content_type or "",
-                message_id=envelope.id,
-                headers=envelope.to_headers(routing_key=delivery.routing_key),
-                persistent=True,
-                mandatory=True,
-            ),
-        )
+        try:
+            result = await self._connection.publish_raw(
+                "",
+                queue,
+                Outbound(
+                    body=delivery.body,
+                    content_type=delivery.content_type or "",
+                    message_id=envelope.id,
+                    headers=envelope.to_headers(routing_key=delivery.routing_key),
+                    persistent=True,
+                    mandatory=True,
+                ),
+            )
+        except PublishError as refused:
+            # Refused rather than unroutable: the broker nacked it, or would not
+            # take it while blocked. Not taken all the same, so the caller's
+            # fallback for a hop that went nowhere applies -- requeue the delivery
+            # -- instead of the raise leaving it unsettled for the life of the
+            # channel, which is what Ruby did before 0.7.12.
+            log.error("acemq: the broker refused %s onto %s: %s", envelope.id, queue, refused)
+            return False
         return result.routed
 
     async def close(self, *, timeout: float | None = DEFAULT_DRAIN_TIMEOUT) -> bool:
