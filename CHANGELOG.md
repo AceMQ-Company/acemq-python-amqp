@@ -19,6 +19,10 @@ While the version is `0.x` the public API may change in any release.
   reached no queue: the delivery is requeued and the consumer carries on. A
   nack on any publish is now raised as `PublishError` rather than
   `aiormq.exceptions.DeliveryError`. Found by the AceMQ TCK (case RETRY-001).
+- **A message published with neither a type nor a routing key is typed
+  `message`.** `x-acemq-type` was written as an empty string, which a
+  consumer dispatching on type cannot route. Found by the AceMQ TCK (case
+  ENV-003).
 
 ### Added
 

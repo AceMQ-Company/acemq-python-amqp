@@ -37,6 +37,10 @@ def _from_millis(value: int) -> datetime:
     return datetime.fromtimestamp(value / 1000, tz=timezone.utc)
 
 
+#: The type of a message published with neither a type nor a routing key.
+DEFAULT_TYPE = "message"
+
+
 @dataclass(frozen=True, slots=True)
 class Envelope:
     """The metadata AceMQ carries with every message.
@@ -129,12 +133,14 @@ class Envelope:
         """The AMQP headers for this envelope.
 
         :param routing_key: what the message is published under, used when no
-            type was given
+            type was given; when that is empty too, the type is the literal
+            ``message`` (AceMQ TCK requirement AMQP-ENV-006), rather than an
+            empty string no consumer can dispatch on
         :returns: the reserved headers, plus the application's own
         """
         written: dict[str, Any] = {
             headers.ID: self.id,
-            headers.TYPE: self.type or routing_key,
+            headers.TYPE: self.type or routing_key or DEFAULT_TYPE,
             headers.VERSION: self.version,
             headers.CORRELATION: self.correlation_id or self.id,
             headers.ATTEMPT: self.attempt,
@@ -187,7 +193,7 @@ class Envelope:
 
         return cls(
             id=identifier,
-            type=_text(raw.get(headers.TYPE)) or routing_key,
+            type=_text(raw.get(headers.TYPE)) or routing_key or DEFAULT_TYPE,
             version=_number(raw.get(headers.VERSION), 1),
             correlation_id=_text(raw.get(headers.CORRELATION)) or identifier,
             causation_id=_text(raw.get(headers.CAUSATION)),
