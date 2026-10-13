@@ -39,7 +39,7 @@ While the version is `0.x` the public API may change in any release.
 
 ### Added
 
-- Runs the AceMQ TCK v0.1.0: a driver in `tests/tck/driver.py` and a `tck`
+- Runs the AceMQ TCK v0.2.0: a driver in `tests/tck/driver.py` and a `tck`
   CI job that runs the cross-library compatibility kit against a real broker.
 
 ## [0.7.11] - 2026-10-12
