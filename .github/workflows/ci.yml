@@ -69,7 +69,7 @@ jobs:
           cache: pip
 
       - name: Install
-        run: pip install -e .
+        run: pip install -e ".[rabbitmq]"
 
       - uses: AceMQ-Company/acemq-amqp-tck@v0.1.0
         with:
