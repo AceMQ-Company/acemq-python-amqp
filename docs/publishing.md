@@ -257,6 +257,12 @@ message may have been lost, and none of them is a `PublishingPausedError`. The
 permit deadline stays a failure on purpose: a broker that stopped confirming may
 be dead rather than busy, and Java, .NET and Go call it a failure too.
 
+RabbitMQ only tells a connection it is blocked once it publishes, so the first
+publish after an alarm is written and then held with no confirm. It waits at most
+`confirm_timeout` (ten seconds by default) for that confirm and then raises a
+`PublishError` — failed, since it was written and may have arrived — instead of
+hanging until the alarm clears. The publish after it sees the block and is refused.
+
 `blocked` being `None` — the state could not be read — is not treated as blocked.
 Go returns `PublishingPausedError` at the same point, .NET throws
 `ConnectionBlockedException`, and Java's standing load counts the same event as

@@ -460,8 +460,9 @@ async def test_a_publish_with_no_room_and_nothing_completing_says_which_it_is() 
     assert refused.value.routing_key == "orders.new"
     assert not refused.value.unroutable
 
-    transport.confirm(0)
-    await held
+    # The held one is bounded by the same timeout: never confirmed, so failed.
+    with pytest.raises(PublishError, match="did not confirm this publish"):
+        await held
 
 
 async def test_a_refused_publish_gives_its_permit_back() -> None:

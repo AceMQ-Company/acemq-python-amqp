@@ -6,9 +6,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 While the version is `0.x` the public API may change in any release.
 
-## [Unreleased]
+## [0.7.12] - 2026-10-13
 
 ### Fixed
+
+- **A publish into a blocked broker no longer hangs until the alarm clears.**
+  RabbitMQ says a connection is blocked only once it publishes, so the first
+  publish after a memory or disk alarm was written and then waited for a
+  confirm with no bound — minutes, or for ever. The wait for the confirm is
+  now bounded by `confirm_timeout` (ten seconds by default), after which the
+  publish raises `PublishError` and counts as `failed`: it was written, so it
+  may have arrived. The publish after it sees the block and is refused at once
+  with `PublishingPausedError`, counted `refused`, as before. Found by the
+  AceMQ TCK (case TEL-003).
 
 - **A retry the broker refuses no longer leaves its message unsettled.** When
   the broker nacked the republish that carries a retry onward — a queue at its

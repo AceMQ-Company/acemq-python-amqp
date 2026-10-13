@@ -1242,11 +1242,11 @@ class Connection:
         like throughput right up to the moment it does not. A thousand by
         default, which is what Java's ``maxOutstandingPublishes`` and .NET's
         ``MaxOutstandingPublishes`` default to
-    :param confirm_timeout: how long a publish waits for one of those permits
-        before giving up. Ten seconds by default, the same as Java's
-        ``confirmTimeout``. Reaching it raises rather than waiting on, because a
-        publisher stalled for ever behind a broker that has stopped answering is
-        the failure this bound exists to make visible
+    :param confirm_timeout: how long a publish waits for one of those permits,
+        and then for the broker's confirm, before giving up. Ten seconds by
+        default, the same as Java's ``confirmTimeout``. Reaching it raises
+        rather than waiting on, because a publisher stalled for ever behind a
+        broker that has stopped answering is the failure this bound exists to make visible
     :param on_publish: cross-cutting behaviour to wrap every publish on this
         connection in, outermost first. See :mod:`acemq_amqp.interceptors`
     :param on_consume: the same around every handler.
@@ -1769,7 +1769,8 @@ class Connection:
         :raises PublishingPausedError: when the broker has blocked this
             connection. Nothing was sent; retry once it unblocks
         :raises PublishError: when every permit is taken and none came free
-            within :attr:`confirm_timeout`
+            within :attr:`confirm_timeout`, or when the broker did not confirm
+            this publish within it. The second may or may not have arrived
         """
         # Refused rather than queued, before a permit or a byte is spent. A
         # blocked broker stops reading the socket, so a publish sent now sits in
@@ -1819,7 +1820,27 @@ class Connection:
 
         self._in_flight_publishes += 1
         try:
-            result = await self._transport.publish(exchange, routing_key, message)
+            # Bounded as well, by the same timeout. RabbitMQ says a connection is
+            # blocked only once it publishes, so the first publish after an alarm
+            # is written and then held with no confirm until the alarm clears --
+            # minutes, or never. Said here as a failure, not a refusal: it was
+            # written, so it may have arrived. The publish after it sees the
+            # block and is refused above. .NET bounds the same wait the same way.
+            result = await asyncio.wait_for(
+                self._transport.publish(exchange, routing_key, message),
+                self._confirm_timeout.total_seconds(),
+            )
+        except asyncio.TimeoutError as unconfirmed:
+            raise PublishError(
+                message.message_id,
+                exchange,
+                routing_key,
+                (
+                    f"the broker did not confirm this publish within "
+                    f"{self._confirm_timeout}. It may or may not have been stored, "
+                    "so treat it as neither sent nor lost"
+                ),
+            ) from unconfirmed
         finally:
             self._in_flight_publishes -= 1
             self._outstanding.release()

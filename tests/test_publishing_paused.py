@@ -156,6 +156,42 @@ async def test_running_out_of_permits_is_a_failure_not_a_refusal() -> None:
     assert not isinstance(failed.value, PublishingPausedError)
 
 
+async def test_a_publish_held_by_a_broker_that_blocks_on_it_is_bounded() -> None:
+    # TCK TEL-003. RabbitMQ says a connection is blocked only once it publishes,
+    # so the first publish after an alarm is written and then held with no
+    # confirm until the alarm clears. It used to hang that long; now it fails
+    # within confirm_timeout, as a failure since it was written, and the next
+    # publish sees the block and is refused without writing anything.
+    class BlocksOnPublish(FakeTransport):
+        async def publish(
+            self, exchange: str, routing_key: str, message: Outbound
+        ) -> PublishResult:
+            await super().publish(exchange, routing_key, message)
+            self.blocked = True
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    transport = BlocksOnPublish()
+    metrics = Metrics()
+    connection = Connection(
+        transport, confirm_timeout=timedelta(milliseconds=50), observer=metrics
+    )
+    publisher = connection.publisher(routing_key="orders.new")
+
+    with pytest.raises(PublishError, match="did not confirm this publish") as failed:
+        await asyncio.wait_for(publisher.send({"id": "1"}), 2)
+    assert not isinstance(failed.value, PublishingPausedError)
+    assert connection.outstanding_publishes == 0
+
+    with pytest.raises(PublishingPausedError):
+        await publisher.send({"id": "2"})
+    assert len(transport.sent) == 1
+
+    for outcome in (OUTCOME_FAILED, OUTCOME_REFUSED):
+        key = metric_key(METRIC_PUBLISH_TOTAL, {**WHERE, "outcome": outcome})
+        assert metrics.counts[key] == 1
+
+
 # -------------------------------------------------------------- telemetry
 #
 # ``refused`` is the outcome for a publish the library declined before writing

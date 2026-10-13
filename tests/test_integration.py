@@ -1008,6 +1008,13 @@ async def test_a_broker_that_has_blocked_this_connection_is_reported_up() -> Non
         combined = await aggregate_health(BrokerHealth(connection))
         assert combined.status is HealthStatus.UP
         assert combined.parts["broker"].parts["blocked"] is True
+
+        # The publish that caused the block was written and is held with no
+        # confirm. Bounded by confirm_timeout rather than hanging until the
+        # alarm clears, and a failure rather than a refusal: it may have arrived.
+        with pytest.raises(PublishError, match="did not confirm this publish") as held:
+            await asyncio.wait_for(publishing, 30)
+        assert not isinstance(held.value, PublishingPausedError)
     finally:
         # Before anything else: closing a blocked connection waits on a broker
         # that is not reading, and the queue cannot be deleted through one either.
