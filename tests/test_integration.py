@@ -1450,6 +1450,40 @@ async def test_a_replay_moves_dead_letters_back_and_leaves_the_rest(
     await until(lambda: _count(mq, dead, 2), "the declined messages went back")
 
 
+@pytest.mark.parametrize("parked_on", ["quorum", "classic"])
+async def test_a_filtered_replay_returns_only_once_the_declined_are_back(
+    mq: Connection, workspace: Workspace, parked_on: str
+) -> None:
+    # The queue a replay reads from is the quorum queue in front for one run
+    # and its classic dead-letter queue for the other: settling a message is
+    # fire-and-forget on both, and slower to show on a quorum queue.
+    target = await workspace.queue("replay-target")
+    source = await workspace.queue("replay-parked")
+    if parked_on == "classic":
+        source = dead_letter_queue(source)
+
+    publisher = mq.publisher(routing_key=source, mandatory=True)
+    for n in range(20):
+        await publisher.send(
+            {"id": n},
+            envelope=Envelope(id=f"m-{n}", attempt=5, error="go" if n % 2 else "stay"),
+        )
+    await until(lambda: _count(mq, source, 20), "the parked messages were all written")
+
+    # Several passes, because the first moves the ten that match and every later
+    # one declines all ten that are left: each is a fresh chance to return early.
+    for moved in [10, 0, 0, 0, 0]:
+        result = await replay(
+            mq, source, routing_key=target, only=lambda envelope, body: envelope.error == "go"
+        )
+        # Read the moment replay returns, with no wait: a caller asking how much
+        # is left must be told the ten it passed over, not a number from before
+        # the broker took them back.
+        assert await mq.message_count(source) == 10
+        assert await mq.message_count(target) == 10
+        assert (result.moved, result.skipped, result.reason) == (moved, 10, "drained")
+
+
 async def test_a_question_over_a_queue_comes_back_answered(
     mq: Connection, workspace: Workspace
 ) -> None:

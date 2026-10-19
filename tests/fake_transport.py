@@ -204,7 +204,9 @@ class FakeTransport:
         return name in self.queues
 
     async def message_count(self, name: str) -> int:
-        return sum(1 for sent in self.sent if not sent.exchange and sent.routing_key == name)
+        # What was published to it plus what is staged on it to be pulled, the
+        # second being where a replay puts back what it declined.
+        return len(self.sent_to(name)) + len(self.waiting.get(name, []))
 
     async def delete_queue(self, name: str) -> None:
         self.queues.pop(name, None)

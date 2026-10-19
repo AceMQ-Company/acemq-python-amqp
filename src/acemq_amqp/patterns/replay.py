@@ -187,11 +187,59 @@ async def replay(
                 ) from failure
             moved += 1
     finally:
-        for held in declined:
-            # Nothing to report if this fails: the pass is over, and a message
-            # that cannot be returned is one the broker returns itself when this
-            # connection goes.
-            await _return_quietly(held)
+        await _return_declined(connection, queue, declined)
+
+
+#: How long a replay waits for the broker to show the messages it returned.
+_RETURN_WAIT = 10.0
+
+
+async def _return_declined(
+    connection: Connection, queue: str, declined: list[Delivery]
+) -> None:
+    """Returns what the pass declined, and waits until the queue shows them.
+
+    A requeue is fire-and-forget in AMQP: ``basic.nack`` has no reply, and a
+    quorum queue takes it through its log before the message counts as ready
+    again. Returning as soon as the nacks are written let a caller read the
+    queue's depth straight after a replay and be told 0 for a queue holding
+    every message the filter passed over. So the depth is read before the
+    messages go back, and the replay ends once it has grown by that many.
+    """
+    if not declined:
+        return
+    try:
+        before: int | None = await connection.message_count(queue)
+    except Exception:
+        before = None
+    for held in declined:
+        # Nothing to report if this fails: the pass is over, and a message
+        # that cannot be returned is one the broker returns itself when this
+        # connection goes.
+        await _return_quietly(held)
+    if before is None:
+        return
+
+    # ponytail: a depth count, so a producer writing to this queue at the same
+    # moment can end the wait early and a consumer reading it can make it run
+    # to the timeout. The broker offers no reply to a requeue to wait on instead.
+    clock = asyncio.get_running_loop()
+    expires = clock.time() + _RETURN_WAIT
+    while True:
+        try:
+            if await connection.message_count(queue) >= before + len(declined):
+                return
+        except Exception:
+            return
+        if clock.time() >= expires:
+            log.warning(
+                "acemq: %d messages returned to %r had not shown up after %ss",
+                len(declined),
+                queue,
+                _RETURN_WAIT,
+            )
+            return
+        await asyncio.sleep(0.01)
 
 
 async def _move(

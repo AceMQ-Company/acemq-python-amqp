@@ -6,6 +6,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 While the version is `0.x` the public API may change in any release.
 
+## [Unreleased]
+
+### Fixed
+
+- `replay(..., only=...)` no longer returns before the messages its filter
+  passed over are back on the queue. Their `basic.nack` has no reply, and a
+  quorum queue takes a requeue through its log before counting it, so a
+  `message_count` read straight after a replay could report 0 for a queue
+  still holding every declined message. The replay now waits, up to ten
+  seconds, until the queue's depth shows them.
+
 ## [0.7.12] - 2026-10-13
 
 ### Fixed
