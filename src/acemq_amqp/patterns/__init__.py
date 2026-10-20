@@ -100,6 +100,8 @@ from .requestreply import (
 from .routingslip import (
     HEADER_ROUTE,
     HEADER_ROUTING_SLIP,
+    Pipeline,
+    PipelineBuilder,
     RoutingSlip,
     SlipForm,
     Stage,
@@ -210,6 +212,8 @@ __all__ = [
     "OutboxRelay",
     "OutboxStore",
     "PartitionKey",
+    "Pipeline",
+    "PipelineBuilder",
     "ReplayError",
     "ReplayFilter",
     "ReplayResult",

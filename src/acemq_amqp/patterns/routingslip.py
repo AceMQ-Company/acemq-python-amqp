@@ -57,6 +57,7 @@ to, which is the one thing the declared form does not carry.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -69,15 +70,20 @@ from ..ack import Ack, FatalError, accept, reject, retry
 from ..codec import Codec
 from ..connection import AsyncHandler, Connection, Message
 from ..envelope import Envelope
+from ..retry import RetryPolicy
 from ..telemetry import (
     METRIC_PIPELINE_RUN_DURATION,
     METRIC_PIPELINE_RUN_TOTAL,
     OUTCOME_COMPLETED,
+    OUTCOME_ENDED_EARLY,
     TAG_OUTCOME,
     TAG_PIPELINE,
     TAG_STEP,
 )
+from ..topology import Topology
 from ._support import decide
+from .consumergroup import ConsumerGroup
+from .pipeline import NOTHING
 
 #: The itinerary, as JSON. An application header, so anything may set it.
 HEADER_ROUTING_SLIP = "acemq-routing-slip"
@@ -477,7 +483,9 @@ def follow_slip(
 
     The handler returns the payload to send onwards, which may be the one it was
     given or a changed copy, and raises to fail. When the slip has no steps left
-    the work is finished and nothing more is published.
+    the work is finished and nothing more is published. Returning
+    :data:`~acemq_amqp.patterns.NOTHING` ends the run at this step: nothing is
+    published, the message is accepted and the run is counted ``ended_early``.
 
     Either wire form is followed, and by default the next message carries the
     same one it arrived in. That is what lets a Python step sit in the middle of
@@ -506,12 +514,32 @@ def follow_slip(
     :param form: the wire form to write, defaulting to the one that arrived
     :returns: the wrapped handler
     """
+    return _follower(connection, step, codec=codec, pipeline=pipeline, form=form)
+
+
+def _follower(
+    connection: Connection,
+    step: Stage,
+    *,
+    codec: Codec | None = None,
+    pipeline: str = "",
+    form: SlipForm | None = None,
+    unslipped: RoutingSlip | None = None,
+) -> AsyncHandler:
+    """:func:`follow_slip`, with what to assume for a message carrying no slip.
+
+    ``unslipped`` is the declared pipeline's answer: a message published
+    straight onto a step's queue is at that step, which is what Java and Go
+    assume. :func:`follow_slip` has no declaration to ask, so it rejects one.
+    """
 
     async def travel(message: Message) -> Ack:
         try:
             slip = slip_from(message.envelope, pipeline=pipeline)
         except FatalError as unreadable:
             return reject(unreadable)
+        if slip is None:
+            slip = unslipped
         if slip is None:
             return reject(
                 FatalError(
@@ -527,8 +555,20 @@ def follow_slip(
         except Exception as failure:
             return retry(failure)
 
+        here = slip.next
+        labels = {
+            TAG_PIPELINE: pipeline or (here.exchange if here else ""),
+            TAG_STEP: str(here) if here else "",
+            TAG_OUTCOME: OUTCOME_COMPLETED,
+        }
         advanced = slip.advance()
         onwards = advanced.next
+        if onwards is not None and payload is NOTHING:
+            # Stopped before the end of the route: a decision, not a failure,
+            # and counted apart from both. Asked after the end of the route is,
+            # because the last step has nothing to send on whatever it returns.
+            _finished(connection, message, {**labels, TAG_OUTCOME: OUTCOME_ENDED_EARLY})
+            return accept()
         if onwards is None:
             # The end of the itinerary. Nothing to publish, and the work is done.
             #
@@ -540,18 +580,7 @@ def follow_slip(
             # through every hop — it is the only number that spans services, and
             # summing each step's consume duration would miss every second the
             # message spent waiting on a queue between two of them.
-            labels = {
-                TAG_PIPELINE: pipeline or slip.steps[0].exchange,
-                TAG_STEP: str(slip.steps[0]),
-                TAG_OUTCOME: OUTCOME_COMPLETED,
-            }
-            observer = connection.observer
-            observer.observe(
-                METRIC_PIPELINE_RUN_DURATION,
-                message.envelope.age.total_seconds(),
-                labels,
-            )
-            observer.count(METRIC_PIPELINE_RUN_TOTAL, 1, labels)
+            _finished(connection, message, labels)
             return accept()
 
         try:
@@ -592,3 +621,237 @@ def follow_slip(
         return accept()
 
     return travel
+
+
+def _finished(connection: Connection, message: Message, labels: dict[str, str]) -> None:
+    """Counts one run as over and times it by the envelope's age."""
+    observer = connection.observer
+    observer.observe(
+        METRIC_PIPELINE_RUN_DURATION, message.envelope.age.total_seconds(), labels
+    )
+    observer.count(METRIC_PIPELINE_RUN_TOTAL, 1, labels)
+
+
+#: What a step name may be: it is a routing key and a queue suffix, not a label.
+#: Java and Go restrict it to the same characters, and a name two libraries
+#: disagree about is a message published where nothing is listening.
+_STEP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9.\-]*")
+
+
+@dataclass(frozen=True, slots=True)
+class _PipelineStep:
+    name: str
+    handler: Stage
+    consumers: int
+    retry: RetryPolicy | None
+    prefetch: int | None
+    concurrency: int
+
+
+class PipelineBuilder:
+    """The steps of a :class:`Pipeline`, before it is declared and started::
+
+        policy = exponential_retry(5, timedelta(seconds=1))
+        pipeline = await (
+            mq.pipeline("fulfilment")
+            .step("validate", validate)
+            .step("reserve", reserve, consumers=4, retry=policy)
+            .step("dispatch", dispatch)
+            .build()
+        )
+        run_id = await pipeline.send(order)
+
+    Built by :meth:`acemq_amqp.Connection.pipeline`. Every check that can be
+    made without a broker is made in :meth:`step`, so a pipeline that cannot
+    work fails where it is written rather than on its first message.
+    """
+
+    def __init__(self, connection: Connection, name: str) -> None:
+        if not name:
+            raise ValueError("acemq: a pipeline needs a name, which is also its exchange")
+        self._connection = connection
+        self._name = name
+        self._steps: list[_PipelineStep] = []
+
+    def step(
+        self,
+        name: str,
+        handler: Stage,
+        *,
+        consumers: int = 1,
+        retry: RetryPolicy | None = None,
+        prefetch: int | None = None,
+        concurrency: int = 1,
+    ) -> PipelineBuilder:
+        """Adds the next step.
+
+        The handler takes the message and returns the payload for the next
+        step, as a :func:`follow_slip` step does: it may be a coroutine, it
+        raises to fail, :class:`~acemq_amqp.FatalError` skips the retries left,
+        and :data:`~acemq_amqp.patterns.NOTHING` ends the run here.
+
+        :param name: the step's name, which is its routing key and the suffix of
+            its queue ``{pipeline}.{name}``: letters, digits, dots and dashes
+        :param handler: what the step does
+        :param consumers: how many consumers read this step's queue, which is
+            how one slow step is scaled without touching the others
+        :param retry: a retry policy for this step instead of the connection's
+        :param prefetch: how many unacknowledged messages each consumer holds
+        :param concurrency: how many messages each consumer works on at once
+        :returns: this builder
+        :raises ValueError: for a name that cannot be a routing key, a name
+            already used, or fewer than one consumer
+        """
+        if not _STEP_NAME.fullmatch(name):
+            raise ValueError(
+                f"acemq: pipeline {self._name!r} has a step named {name!r}, which cannot "
+                "be a routing key: letters, digits, dots and dashes only"
+            )
+        if any(step.name == name for step in self._steps):
+            raise ValueError(
+                f"acemq: pipeline {self._name!r} declares the step {name!r} twice, and "
+                "two steps by one name are one queue with two handlers"
+            )
+        if consumers < 1:
+            raise ValueError(f"acemq: step {name!r} needs at least one consumer")
+        self._steps.append(
+            _PipelineStep(name, handler, consumers, retry, prefetch, concurrency)
+        )
+        return self
+
+    async def build(self) -> Pipeline:
+        """Declares the pipeline and starts a consumer group on every step.
+
+        The exchange ``{name}``, direct; a durable queue ``{name}.{step}`` per
+        step, bound on the step's name — Java's and Go's declaration exactly,
+        so either can run steps of a pipeline declared here. Declaring is
+        idempotent, which is what lets two services run different steps of one
+        pipeline. If a step fails to start, the ones already running are
+        stopped before the failure is raised.
+
+        :returns: the running pipeline
+        :raises ValueError: when no step was added
+        """
+        if not self._steps:
+            raise ValueError(f"acemq: pipeline {self._name!r} has no steps")
+        names = tuple(step.name for step in self._steps)
+        pipeline = Pipeline(self._connection, self._name, names)
+
+        topology = Topology().exchange(self._name, "direct")
+        for name in names:
+            queue = pipeline.queue_for(name)
+            topology.queue(queue).binding(queue, self._name, name)
+        await self._connection.declare(topology)
+
+        try:
+            for position, step in enumerate(self._steps):
+                at = pipeline.route()
+                for _ in range(position):
+                    at = at.advance()
+                pipeline._running.append(
+                    await ConsumerGroup.start(
+                        self._connection,
+                        pipeline.queue_for(step.name),
+                        step.consumers,
+                        _follower(
+                            self._connection,
+                            step.handler,
+                            pipeline=self._name,
+                            unslipped=at,
+                        ),
+                        retry=step.retry,
+                        prefetch=step.prefetch,
+                        concurrency=step.concurrency,
+                    )
+                )
+        except BaseException:
+            await pipeline.close()
+            raise
+        return pipeline
+
+
+class Pipeline:
+    """A declared pipeline whose steps are running. Built by
+    :meth:`PipelineBuilder.build`.
+
+    Each step follows the slip the message carries, in either form: a run
+    started by :meth:`send` travels as the declared route, and a message
+    carrying a JSON itinerary goes wherever that itinerary says, inside this
+    pipeline or not. A message published straight onto a step's queue with no
+    slip at all is taken to be at that step.
+
+    Closing stops the consumers and leaves the exchange and the queues alone:
+    they are durable, may hold messages, and another service may be running
+    steps of the same pipeline.
+    """
+
+    def __init__(self, connection: Connection, name: str, steps: tuple[str, ...]) -> None:
+        self._connection = connection
+        self._name = name
+        self._steps = steps
+        self._running: list[ConsumerGroup] = []
+
+    @property
+    def name(self) -> str:
+        """The pipeline's name, which is also its exchange."""
+        return self._name
+
+    @property
+    def steps(self) -> tuple[str, ...]:
+        """The step names, in order."""
+        return self._steps
+
+    def queue_for(self, step: str) -> str:
+        """The queue behind a step: ``{pipeline}.{step}``.
+
+        :raises ValueError: when the pipeline has no such step
+        """
+        if step not in self._steps:
+            raise ValueError(
+                f"acemq: pipeline {self._name!r} has no step {step!r}; its steps are "
+                f"{', '.join(self._steps)}"
+            )
+        return f"{self._name}.{step}"
+
+    def route(self, *, run_id: str = "") -> RoutingSlip:
+        """A slip at the start of this pipeline, in the declared form."""
+        return route_of(self._name, *self._steps, run_id=run_id)
+
+    async def send(
+        self,
+        payload: Any,
+        *,
+        envelope: Envelope | None = None,
+        codec: Codec | None = None,
+    ) -> str:
+        """Starts a run at the first step.
+
+        :param payload: what the first step is given
+        :param envelope: metadata to send instead of a fresh one
+        :param codec: a codec other than the connection's
+        :returns: the run's identifier, ``x-acemq-route-id`` on every hop
+        """
+        slip = self.route()
+        await start(self._connection, slip, payload, envelope=envelope, codec=codec)
+        return slip.run_id
+
+    async def close(self) -> None:
+        """Stops every step's consumers; the first failure is raised after."""
+        running, self._running = self._running, []
+        first: BaseException | None = None
+        for group in running:
+            try:
+                await group.close()
+            except BaseException as failure:
+                first = first or failure
+        if first is not None:
+            raise first
+
+    async def __aenter__(self) -> Pipeline:
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        await self.close()
+
+    def __str__(self) -> str:
+        return f"Pipeline[{self._name}: {' -> '.join(self._steps)}]"

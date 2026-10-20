@@ -33,7 +33,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, TypeAlias
+from typing import TYPE_CHECKING, Any, TypeAlias
 from urllib.parse import urlsplit
 
 from . import naming
@@ -89,6 +89,9 @@ from .telemetry import (
     Observer,
 )
 from .topology import Topology, declare_where_failures_go
+
+if TYPE_CHECKING:
+    from .patterns.routingslip import PipelineBuilder
 from .transport import (
     BlockedState,
     ConsumeSpec,
@@ -1820,6 +1823,20 @@ class Connection:
             self._untrack(consumer)
             raise
         return consumer
+
+    def pipeline(self, name: str) -> PipelineBuilder:
+        """Starts declaring a pipeline: steps in order, a queue behind each.
+
+        The exchange is ``name`` and each step's queue is ``{name}.{step}``, as
+        in Java, .NET, Go and Ruby. See
+        :class:`~acemq_amqp.patterns.PipelineBuilder`.
+
+        :param name: the pipeline's name, which is also its exchange
+        :returns: a builder; nothing is declared until its ``build()``
+        """
+        from .patterns.routingslip import PipelineBuilder
+
+        return PipelineBuilder(self, name)
 
     async def publish_raw(
         self, exchange: str, routing_key: str, message: Outbound

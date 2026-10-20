@@ -458,6 +458,47 @@ success: the original stays on the queue it was being recovered from and the
 replay stops with a `ReplayError`, rather than acknowledging the last copy of a
 message the broker has just dropped.
 
+## Declared pipelines
+
+A pipeline declared in one place — its name, its steps in order, a queue behind
+each and a consumer running on every one:
+
+```python
+policy = exponential_retry(5, timedelta(seconds=1))
+pipeline = await (
+    mq.pipeline("fulfilment")
+    .step("validate", validate)
+    .step("reserve", reserve, consumers=4, retry=policy)
+    .step("dispatch", dispatch)
+    .build()
+)
+run_id = await pipeline.send(order)
+...
+await pipeline.close()
+```
+
+`build()` declares a direct exchange `fulfilment`, a durable queue
+`fulfilment.{step}` per step bound on the step's name, and starts a
+`ConsumerGroup` of `consumers` on each, with that step's own `retry`, `prefetch`
+and `concurrency`. That is Java's `mq.pipeline(...)`, .NET's `mq.Pipeline<T>(...)`
+and Go's `patterns.NewPipeline` to the letter, so any of them can run steps of a
+pipeline declared here and the other way round.
+
+A step is a `follow_slip` step: it returns the payload for the next one, raises
+to fail, and the message goes on in the form it arrived in — `send` starts a
+declared route (`x-acemq-route`, the position and the run id, returned by
+`send`), and a message carrying a JSON itinerary goes wherever the itinerary
+says. A message published straight onto a step's queue with no slip at all is
+taken to be at that step. Returning `NOTHING` ends the run there: nothing is
+published, the message is accepted, and the run is counted `ended_early`.
+
+Step names are routing keys, so they are letters, digits, dots and dashes; a bad
+name, a repeated one or a pipeline with no steps is a `ValueError` before
+anything is declared. Closing stops the consumers and leaves the exchange and
+queues alone, because another service may be running steps of the same
+pipeline. Without an event loop, `SyncConnection.pipeline(...)` builds the same
+thing with plain functions as steps, each run on a worker thread.
+
 ## Routing slips
 
 Each service does its part and sends the message to the next stop written on the

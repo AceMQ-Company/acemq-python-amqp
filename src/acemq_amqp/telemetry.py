@@ -175,10 +175,9 @@ METRIC_OUTBOX_TOTAL = "acemq.outbox.total"
 #: that found no next stop is the step that finished the run, so the counter goes
 #: up exactly once per run however many services it passed through.
 #:
-#: The outcome is always :data:`OUTCOME_COMPLETED` here. Java also writes
-#: ``ended_early`` for a step that returned nothing with stops still to go, and
-#: this library has no way for a routing-slip step to say that — see
-#: :data:`OUTCOME_ENDED_EARLY`.
+#: The outcome is :data:`OUTCOME_COMPLETED`, or :data:`OUTCOME_ENDED_EARLY` for
+#: a step that returned :data:`~acemq_amqp.patterns.NOTHING` with stops still to
+#: go, as Java writes it.
 METRIC_PIPELINE_RUN_TOTAL = "acemq.pipeline.run.total"
 
 #: How old a message was when it left a pipeline, in seconds, carrying the same
@@ -278,13 +277,9 @@ OUTCOME_TIMED_OUT = "timed_out"
 OUTCOME_COMPLETED = "completed"
 
 #: A pipeline run that stopped before the end of its route because a step chose
-#: to stop it. **Nothing in this library writes it**, and the name is here so
-#: that a dashboard shared with Java can be read rather than guessed at: a
-#: :data:`~acemq_amqp.patterns.Stage` always returns the payload for the next
-#: stop, so there is no way for one to end a run early and no honest moment to
-#: emit this. :func:`~acemq_amqp.patterns.then` has :data:`NOTHING
-#: <acemq_amqp.patterns.NOTHING>` for that, and a ``then`` chain is not a routing
-#: slip — it has no pipeline name, no step name and no run to end.
+#: to stop it: a :data:`~acemq_amqp.patterns.Stage` that returned
+#: :data:`~acemq_amqp.patterns.NOTHING` with stops still to go. A ``then`` chain
+#: returning ``NOTHING`` does not write it — it has no pipeline and no run.
 OUTCOME_ENDED_EARLY = "ended_early"
 
 

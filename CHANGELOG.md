@@ -8,6 +8,28 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Added
+
+- **A pipeline builder.** `mq.pipeline(name).step(name, handler, ...).build()`
+  declares a direct exchange `{name}`, a queue `{name}.{step}` per step bound on
+  the step's name and a consumer group on each that follows the slip, as Java,
+  .NET, Go and Ruby do. Per step: `consumers`, `retry`, `prefetch`,
+  `concurrency`. `pipeline.send(payload)` starts a run and returns its run id;
+  `close()` stops the consumers and leaves the queues. A message with no slip on
+  a step's queue is taken to be at that step. `SyncConnection.pipeline(...)` is
+  the blocking form. `follow_slip` is unchanged and still the way to run one
+  step of a pipeline declared elsewhere.
+
+### Changed
+
+- **A routing-slip step that returns `NOTHING` now ends the run.** In a
+  pipeline step or a `follow_slip` step, returning `NOTHING` with stops still
+  to go publishes nothing, accepts the message and counts the run in
+  `acemq.pipeline.run.total` with `outcome=ended_early`, as Java does. It used
+  to be sent on as a payload, which failed to encode and was retried.
+- The TCK driver's `pipeline` op uses the builder instead of declaring the
+  topology and calling `follow_slip` by hand.
+
 ## [0.7.14] - 2026-10-20
 
 ### Changed

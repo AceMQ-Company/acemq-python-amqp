@@ -162,20 +162,17 @@ it is a fact about the delivery that is true before the handler runs — a messa
 whose body will not decode is counted too, and nothing this consumer is still
 working on when the process stops is lost.
 
-### One outcome value that is never written
+### How a run ends
 
-`acemq.pipeline.run.total` carries `outcome`, and the only value it ever takes
-here is `completed`. Java also writes `ended_early`, for a step that returned
-nothing with stops still to go. **This library has no way for a routing-slip step
-to end a run**: a `Stage` always returns the payload for the next stop, so there
-is no honest moment to emit it, and emitting `completed` for a run that stopped
-halfway would be a wrong number rather than a missing one. `OUTCOME_ENDED_EARLY`
-is defined so a shared dashboard can be read rather than guessed at, and nothing
-writes it.
+`acemq.pipeline.run.total` carries `outcome`: `completed` from the step that
+finds no next stop, and `ended_early`, as in Java, from a pipeline or
+`follow_slip` step that returns `NOTHING` with stops still to go. The last step
+of a route always writes `completed`, whatever it returns, because there is
+nothing after it to skip.
 
-`NOTHING` in `then(...)` is the nearest thing, and it is not the same thing: a
-`then` chain has no pipeline name, no step name and no run identifier, so there
-is no run for it to end.
+`NOTHING` in `then(...)` stops the message too but writes neither: a `then`
+chain has no pipeline name, no step name and no run identifier, so there is no
+run for it to end.
 
 ### The tags Java carries and this library does not
 

@@ -39,7 +39,7 @@ import threading
 from collections.abc import Callable, Coroutine, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
-from typing import Any, TypeAlias, TypeVar
+from typing import TYPE_CHECKING, Any, TypeAlias, TypeVar
 
 from .ack import Ack
 from .codec import Codec
@@ -59,6 +59,9 @@ from .retry import RetryPolicy
 from .security import Security
 from .topology import Topology
 from .transport import PublishResult
+
+if TYPE_CHECKING:
+    from .patterns.routingslip import Pipeline
 
 T = TypeVar("T")
 
@@ -303,6 +306,17 @@ class SyncConnection:
         )
         return SyncConsumer(self, consumer, workers)
 
+    def pipeline(self, name: str) -> SyncPipelineBuilder:
+        """Starts declaring a pipeline, as :meth:`acemq_amqp.Connection.pipeline`.
+
+        Each step's handler is a plain function, called on a worker thread so it
+        may block.
+
+        :param name: the pipeline's name, which is also its exchange
+        :returns: a builder; nothing is declared until its ``build()``
+        """
+        return SyncPipelineBuilder(self, name)
+
     def queue_exists(self, queue: str) -> bool:
         """Whether a queue is on the broker, creating nothing."""
         return self._loop.run(self._connection.queue_exists(queue))
@@ -407,3 +421,70 @@ def connect(
         loop.stop()
         raise
     return SyncConnection(loop, connection)
+
+
+class SyncPipelineBuilder:
+    """:class:`~acemq_amqp.patterns.PipelineBuilder` without an event loop."""
+
+    def __init__(self, connection: SyncConnection, name: str) -> None:
+        self._loop = connection._loop
+        self._builder = connection.connection.pipeline(name)
+
+    def step(
+        self,
+        name: str,
+        handler: Callable[[Message], Any],
+        *,
+        consumers: int = 1,
+        retry: RetryPolicy | None = None,
+        prefetch: int | None = None,
+        concurrency: int = 1,
+    ) -> SyncPipelineBuilder:
+        """Adds the next step; the options are
+        :meth:`~acemq_amqp.patterns.PipelineBuilder.step`'s."""
+
+        def on_a_thread(message: Message) -> Any:
+            return asyncio.to_thread(handler, message)
+
+        self._builder.step(
+            name,
+            on_a_thread,
+            consumers=consumers,
+            retry=retry,
+            prefetch=prefetch,
+            concurrency=concurrency,
+        )
+        return self
+
+    def build(self) -> SyncPipeline:
+        """Declares the pipeline and starts its steps."""
+        return SyncPipeline(self._loop, self._loop.run(self._builder.build()))
+
+
+class SyncPipeline:
+    """A running :class:`~acemq_amqp.patterns.Pipeline`, without an event loop."""
+
+    def __init__(self, loop: _LoopThread, pipeline: Pipeline) -> None:
+        self._loop = loop
+        self._pipeline = pipeline
+
+    @property
+    def pipeline(self) -> Pipeline:
+        """The asyncio pipeline underneath: ``name``, ``steps``, ``queue_for``."""
+        return self._pipeline
+
+    def send(
+        self, payload: Any, *, envelope: Envelope | None = None, codec: Codec | None = None
+    ) -> str:
+        """Starts a run at the first step and returns its identifier."""
+        return self._loop.run(self._pipeline.send(payload, envelope=envelope, codec=codec))
+
+    def close(self) -> None:
+        """Stops every step's consumers, leaving the queues alone."""
+        self._loop.run(self._pipeline.close())
+
+    def __enter__(self) -> SyncPipeline:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()

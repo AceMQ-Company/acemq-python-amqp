@@ -38,11 +38,11 @@ from acemq_amqp import (
 )
 from acemq_amqp.patterns import (
     InMemoryIdempotencyStore,
+    Pipeline,
     Requester,
     Scheduler,
     StreamRetention,
     declare_stream,
-    follow_slip,
     from_first,
     from_next,
     idempotent,
@@ -99,6 +99,7 @@ class Driver:
         self.recorder = Recorder()
         self.scheduler: Scheduler | None = None
         self.requesters: dict[tuple[str, str], Requester] = {}
+        self.pipelines: list[Pipeline] = []
 
     @property
     def mq(self) -> Connection:
@@ -127,6 +128,9 @@ class Driver:
         for consumer in self.consumers.values():
             await consumer.close()
         self.consumers.clear()
+        for pipeline in self.pipelines:
+            await pipeline.close()
+        self.pipelines.clear()
         self.counts.clear()
         self.redelivered.clear()
         self.order.clear()
@@ -210,16 +214,10 @@ class Driver:
             await counted(message)
             return message.payload
 
-        topology = Topology().exchange(name, "direct")
+        builder = self.mq.pipeline(name)
         for step in args["steps"]:
-            topology.queue(f"{name}.{step}", dead_letter=True).binding(
-                f"{name}.{step}", name, step
-            )
-        await self.mq.declare(topology)
-        for step in args["steps"]:
-            self.consumers[f"{handle}:{step}"] = await self.mq.consume(
-                f"{name}.{step}", follow_slip(self.mq, identity, pipeline=name)
-            )
+            builder.step(step, identity)
+        self.pipelines.append(await builder.build())
         return {}
 
     async def handled(self, args: dict[str, Any]) -> dict[str, Any]:

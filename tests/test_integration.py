@@ -1687,6 +1687,46 @@ async def test_a_java_shaped_route_is_followed_across_a_real_broker(
     assert HEADER_ROUTING_SLIP not in arrived.envelope.headers
 
 
+async def test_a_built_pipeline_runs_every_step_and_retries_the_one_that_fails(
+    mq: Connection, workspace: Workspace
+) -> None:
+    """The builder declares Java's topology, starts a consumer per step, and the
+    retry policy given to one step is the one that step runs."""
+    name = workspace.name("built")
+    attempts: list[int] = []
+    finished: asyncio.Queue[Message] = asyncio.Queue()
+
+    async def flaky(message: Message) -> object:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("the first attempt fails")
+        return {**message.payload, "enriched": True}
+
+    async def last(message: Message) -> object:
+        await finished.put(message)
+        return message.payload
+
+    pipeline = await (
+        mq.pipeline(name)
+        .step("validate", lambda message: message.payload)
+        .step("enrich", flaky, retry=fixed_retry(3, timedelta(milliseconds=50)))
+        .step("dispatch", last)
+        .build()
+    )
+    for step in pipeline.steps:
+        workspace.register(pipeline.queue_for(step))
+    async with pipeline:
+        run_id = await pipeline.send({"order": "order-1"})
+        arrived = await asyncio.wait_for(finished.get(), 20)
+
+    assert arrived.payload == {"order": "order-1", "enriched": True}
+    assert len(attempts) == 2
+    assert arrived.envelope.route == "validate,enrich,dispatch"
+    assert arrived.envelope.route_position == 2
+    assert arrived.envelope.route_id == run_id
+    assert arrived.envelope.causation_id != ""
+
+
 async def test_a_pipeline_step_publishes_onwards_or_stops(
     mq: Connection, workspace: Workspace
 ) -> None:

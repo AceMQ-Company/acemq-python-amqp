@@ -120,9 +120,8 @@ worth knowing before you build it, and neither leaves a panel blank.
 `acemq.consume.attempts` is a count of attempts rather than a number of seconds —
 the only metric here that is not — so an `Observer` of your own should give it
 buckets that are whole numbers. `PrometheusObserver` already does.
-`acemq.pipeline.run.total` carries `outcome` and the only value it ever takes
-here is `completed`; Java also writes `ended_early`, which nothing in this
-library can honestly emit. See
+`acemq.pipeline.run.total` carries `outcome`: `completed`, or `ended_early` for
+a pipeline step that returned `NOTHING` before the end of its route. See
 [what is reported](observability.md#what-is-reported) for both.
 
 There is also no counter for "a message arrived". Every delivery is counted once
