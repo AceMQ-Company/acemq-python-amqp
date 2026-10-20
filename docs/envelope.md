@@ -90,6 +90,12 @@ Reading works the same way round. An `x-acemq-` name this version does not know
 start writing it back and would then be lying about a field it does not
 understand.
 
+It is not lost either. Those headers travel in `envelope.extensions`, exactly as
+they arrived, and every republish this library makes — a retry hop, a dead
+letter, a park, a replay — writes them back unchanged. Up to 0.7.13 they were
+dropped there, so a header a newer service had added vanished at the first
+retry in a mixed fleet; from 0.7.14 it survives.
+
 ## Reading it in a handler
 
 ```python

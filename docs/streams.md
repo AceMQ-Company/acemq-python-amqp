@@ -182,7 +182,7 @@ and `read_stream` refuses one:
 | `retry(e)` | **the reader stops** at this message: the subscription is closed, nothing after it is handled, and no copy is written anywhere. **Nothing is appended to the stream** |
 | the handler raises | the same: the reader stops |
 
-Stopping is the default because the stream is the record: a reader restarted at
+Stopping is the default (from 0.7.14) because the stream is the record: a reader restarted at
 the same offset once the fault is fixed sees the message again, and nothing has
 been skipped or copied. `read_stream(..., on_failure="dead_letter")` is the
 opt-out, and the old behaviour: `retry(e)` is refused with a `StreamRetryError`

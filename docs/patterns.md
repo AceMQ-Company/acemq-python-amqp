@@ -424,7 +424,10 @@ different when the limit was 500. `drained`, `limit`, `deadline` or `failed`.
 
 Each message is stamped with `acemq-replayed-from`, `acemq-replayed-at` and
 `acemq-replay-count`, so a consumer that needs to treat a replayed message
-differently can, and one that does not is unaffected.
+differently can, and one that does not is unaffected. `acemq-replayed-at` is
+ISO-8601 in UTC to the millisecond with a `Z` (`2026-02-03T04:05:06.789Z`), as
+every AceMQ library writes it; up to 0.7.13 this one wrote microseconds and
+`+00:00`.
 
 `restart=True`, the default, **resets the attempt counter** and clears the error
 that dead-lettered it. A message that arrives back on attempt five of a

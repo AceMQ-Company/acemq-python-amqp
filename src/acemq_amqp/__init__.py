@@ -159,7 +159,7 @@ from .transport import (
 #: ``from acemq_amqp.retry import RetryPolicy`` still reaches the module.
 retry = _retry
 
-__version__ = "0.7.13"
+__version__ = "0.7.14"
 
 __all__ = [
     "BLOCKED_DETAIL",

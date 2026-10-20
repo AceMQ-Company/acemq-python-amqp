@@ -329,9 +329,11 @@ several `send` calls — rather than looking for a way to switch confirms off.
 An unroutable message is the quietest failure AMQP has: the publish succeeds,
 the message is discarded, the consumer waits, and nothing says why.
 
-`mq.publisher(..., mandatory=True)` makes the broker return it and this library
-raise `PublishError`. Without it, `result.routed` still reports the fact — it is
-only the raising that is opted into.
+A publisher is **mandatory by default** from 0.7.14 (it was opt-in before): the
+broker returns the message and this library raises `PublishError` with
+`unroutable` set. `mq.publisher(..., mandatory=False)` opts out, for a fan-out
+where no subscriber at all is normal; `result.routed` still reports the fact,
+and only the raising is turned off.
 
 Every hop this library makes itself is mandatory: a retry, a dead letter, a
 parked message and a replay all republish by queue name and check that the queue
@@ -346,6 +348,16 @@ returned message is reported as unroutable rather than as a refused confirm, so
 `publish_raw` gives back `routed=False` and a mandatory `Publisher` raises
 `PublishError` with `unroutable` set. All of this is from 0.7.9, except the
 scheduler's due delivery: up to 0.7.9 it was dropped, and it is kept from 0.7.10.
+
+## When the dead-letter or parked queue refuses the copy
+
+A dead letter or a park is a republish to `{queue}.dlq` or `{queue}.parked`, and
+the broker can refuse it — a nack, or a return because the queue is not there.
+From 0.7.14 the original delivery is then held for a second and `nack`ed with
+requeue, so it comes back and is set aside again once the queue takes it. The
+pause keeps a quorum queue's delivery limit from being spent in a hot loop. Up
+to 0.7.13 it was rejected without requeue, which dropped the message or sent it
+through the source queue's own dead-letter exchange.
 
 ## Duplicates
 
