@@ -1778,7 +1778,10 @@ async def test_a_failing_stream_handler_appends_nothing_to_the_log(
         failed.set()
         return retry(RuntimeError("the pricing service is down"))
 
-    consumer = await read_stream(retrying, name, always_fails, offset=from_first())
+    # dead_letter, because the default stops the reader and copies nothing.
+    consumer = await read_stream(
+        retrying, name, always_fails, offset=from_first(), on_failure="dead_letter"
+    )
     try:
         await asyncio.wait_for(failed.wait(), 20.0)
         await until(lambda: _count(mq, dlq, 1), f"the copy reached {dlq}")
