@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import timedelta
 
 import pytest
@@ -85,6 +86,41 @@ async def test_a_replayed_message_says_it_was_replayed() -> None:
     assert moved.headers[HEADER_REPLAYED_AT]
     assert moved.headers[headers.ID] == "order-0"
     assert moved.message.body == b'{"id": 0}'
+
+
+async def test_a_replay_writes_the_audit_headers_and_keeps_every_other_one() -> None:
+    # AceMQ TCK requirements AMQP-ENV-013, AMQP-REPLAY-003 and AMQP-ENV-014,
+    # case REPLAY-002: millisecond ISO-8601 with a Z, the error cleared, and an
+    # x-acemq- header this library has no field for carried on unchanged.
+    transport = FakeTransport()
+    mq = Connection(transport)
+    transport.queues[QUEUE] = QueueSpec()
+    transport.stage(
+        DLQ,
+        b'{"id": "r1"}',
+        headers={
+            headers.ID: "r1",
+            headers.ATTEMPT: 3,
+            headers.FIRST_SEEN: 1767323045678,
+            headers.ERROR: "handler failed",
+            HEADER_REPLAY_COUNT: 1,
+            "x-acemq-future": "kept",
+            "x-tenant": "acme",
+        },
+        routing_key=QUEUE,
+    )
+
+    await replay(mq, DLQ)
+
+    moved = transport.sent_to(QUEUE)[0].headers
+    stamp = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z"
+    assert re.fullmatch(stamp, moved[HEADER_REPLAYED_AT])
+    assert moved[HEADER_REPLAY_COUNT] == 2
+    assert moved[headers.ATTEMPT] == 1
+    assert headers.ERROR not in moved
+    assert moved[headers.FIRST_SEEN] == 1767323045678
+    assert moved["x-acemq-future"] == "kept"
+    assert moved["x-tenant"] == "acme"
 
 
 async def test_replaying_twice_counts_twice() -> None:

@@ -8,7 +8,49 @@ While the version is `0.x` the public API may change in any release.
 
 ## [0.7.13] - 2026-10-20
 
+### Changed
+
+- **A publisher is now mandatory by default.** `Connection.publisher(...)`
+  and `SyncConnection.publisher(...)` default to `mandatory=True` (was
+  `False`), so a message the broker can route to no queue raises
+  `PublishError` with `unroutable` set instead of being dropped in silence
+  (AceMQ TCK AMQP-PUB-006, case PUB-003). Pass `mandatory=False` to opt out,
+  for a fan-out where no subscriber at all is normal. Request/reply requests
+  and routing-slip `start(...)` publish mandatory too; replies stay
+  non-mandatory as before.
+- **A failing stream handler now stops the reader.** `read_stream(...)`
+  closes its subscription at the first message whose handler raises or asks
+  for a retry: nothing after it is handled, and no copy is written to
+  `{stream}.dlq`, `{stream}.parked` or the stream (AMQP-STREAM-004, case
+  STREAM-003). The message is returned unacknowledged, so a reader restarted
+  at that offset sees it again. The old behaviour, a copy in `{stream}.dlq`
+  and carry on, is `read_stream(..., on_failure="dead_letter")`. `park(...)`
+  and `reject(...)` returned by a handler still set the message aside.
+- **A dead letter or park the broker refuses is requeued, never rejected.**
+  When the copy to `{queue}.dlq` or `{queue}.parked` is nacked or returned,
+  the delivery is now `nack`ed with requeue. It used to be rejected without
+  requeue, which dropped the message, or dead-lettered it through the source
+  queue's own dead-letter exchange (AMQP-RETRY-007, AMQP-PUB-002, case
+  PARK-002).
+
 ### Fixed
+
+- `x-acemq-` headers this library has no field for (written by a newer
+  version or another language) survive every retry hop, dead letter, park
+  and replay instead of being dropped when the headers were rebuilt from the
+  envelope. They travel in the new `Envelope.extensions` (AMQP-ENV-014,
+  cases PARK-001, RETRY-004, REPLAY-002).
+- A delivery with no `x-acemq-id` takes its id from the AMQP `message_id`
+  rather than a fresh UUID, so an idempotent consumer handles two copies of
+  a message from a non-AceMQ publisher once (AMQP-IDEM-002, case IDEM-001).
+  `Envelope.from_headers(...)` takes the `message_id` as a new optional
+  argument.
+- `acemq-replayed-at` is written as millisecond ISO-8601 with `Z`
+  (`2026-02-03T04:05:06.789Z`), as the replayed fixture and the other
+  libraries have it, instead of `isoformat()`'s microseconds and `+00:00`
+  (AMQP-ENV-013, case REPLAY-002).
+- `x-acemq-first-seen` is rounded, not truncated, to the millisecond, so a
+  republish can no longer move it back by one.
 
 - `replay(..., only=...)` no longer returns before the messages its filter
   passed over are back on the queue. Their `basic.nack` has no reply, and a
@@ -19,6 +61,12 @@ While the version is `0.x` the public API may change in any release.
 
 ### Added
 
+- `read_stream(..., on_failure=...)`, `"stop"` (default) or `"dead_letter"`,
+  and the `StreamFailure` type for it.
+- The TCK driver implements the `pipeline` op and the new arguments
+  `publish.mandatory`, `consume` without `retry` (no retry policy),
+  `consume.idempotent` and `readStream.behaviour`, for the pending cases of
+  the TCK's R6 round.
 - The TCK driver implements the `replay` op, for the AceMQ TCK case
   REPLAY-001 (a filtered replay returns only once the messages it passed over
   are back on the queue).

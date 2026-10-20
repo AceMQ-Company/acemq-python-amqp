@@ -229,9 +229,12 @@ class SyncConnection:
         *,
         codec: Codec | None = None,
         persistent: bool = True,
-        mandatory: bool = False,
+        mandatory: bool = True,
     ) -> SyncPublisher:
-        """Builds a publisher for an exchange and routing key."""
+        """Builds a publisher for an exchange and routing key.
+
+        Mandatory by default, as :meth:`acemq_amqp.Connection.publisher` is:
+        ``mandatory=False`` opts out of the unroutable error."""
         return SyncPublisher(
             self._loop,
             self._connection.publisher(

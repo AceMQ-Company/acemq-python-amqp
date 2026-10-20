@@ -848,11 +848,11 @@ What a *failure* means changes with it. `read_stream` returns an ordinary
 `Consumer`, so a refused message is republished as a copy and the original
 acknowledged: `park()` puts a copy in `{stream}.parked` and `reject()` one in
 `{stream}.dlq`, both leaving the log untouched because both are ordinary queues
-beside it. **`retry()` is refused**, with a `StreamRetryError` naming those
-alternatives, because retrying on a stream means republishing *to* it —
-appending a copy for every other consumer to read as well. A stream consumer
-also runs on `no_retry()` whatever the connection's policy is, so an exception
-escaping a handler cannot append one either. See
+beside it. A handler that raises or returns `retry()` **stops the reader** at
+that message by default, writing no copy anywhere, because retrying on a stream
+means republishing *to* it — appending a copy for every other consumer to read
+as well. `on_failure="dead_letter"` puts a copy in `{stream}.dlq` and carries on
+instead. See
 [streams](streams.md#what-an-acknowledgement-means-here) for the whole table.
 
 Where to start:

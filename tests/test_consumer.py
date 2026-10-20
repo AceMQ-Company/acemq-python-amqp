@@ -528,9 +528,9 @@ async def test_a_handler_sees_the_envelope_that_travelled_with_the_message() -> 
 
 
 async def test_a_message_that_cannot_be_dead_lettered_is_left_with_the_broker() -> None:
-    # Without a dead-letter queue to put it in, the broker's own dead-lettering
-    # is the last thing between this message and nothing. Acknowledging it here
-    # would be dropping it.
+    # Without a dead-letter queue to put it in, the message goes back to the
+    # broker, requeued: acknowledging it here would be dropping it, and so would
+    # rejecting it without requeue (AceMQ TCK requirement AMQP-PUB-002).
     #
     # Reaching this at all now takes a consumer that was told not to declare, on
     # a queue whose topology has no dead-letter half either: an ordinary consumer
@@ -543,7 +543,64 @@ async def test_a_message_that_cannot_be_dead_lettered_is_left_with_the_broker() 
 
     assert settlement.acked is False
     assert settlement.nacked is True
-    assert settlement.requeued is False
+    assert settlement.requeued is True
+
+
+async def test_a_park_the_broker_refuses_requeues_the_delivery() -> None:
+    # AceMQ TCK requirement AMQP-RETRY-007, case PARK-002: a refused park loses
+    # nothing. Rejecting without requeue dropped the message.
+    async with running(always(accept())) as transport:
+        transport.refuse = {PARKED}
+        settlement = await transport.deliver(QUEUE, b"{not json", headers=wire(Envelope()))
+
+    assert settlement.acked is False
+    assert settlement.requeued is True
+
+
+async def test_a_park_keeps_every_header_the_message_arrived_with() -> None:
+    # AceMQ TCK requirements AMQP-RETRY-006 and AMQP-ENV-014, case PARK-001: an
+    # x-acemq- header this library has no field for survives, and so do the
+    # attempt, the first-seen to the millisecond and the message id.
+    arrived = {
+        headers.ID: "bad-1",
+        headers.TYPE: "order.placed",
+        headers.VERSION: 2,
+        headers.CORRELATION: "corr-p1",
+        headers.CAUSATION: "cause-p1",
+        headers.ATTEMPT: 2,
+        headers.FIRST_SEEN: 1767323045678,
+        headers.ORIGIN: "orders@host-7",
+        "x-acemq-future": "kept",
+        "x-tenant": "acme",
+    }
+    async with running(always(accept())) as transport:
+        await transport.deliver(QUEUE, b"not json{", headers=arrived, message_id="bad-1")
+
+    parked = transport.sent_to(PARKED)[0]
+    assert {k: v for k, v in parked.headers.items() if k != headers.ERROR} == arrived
+    assert parked.headers[headers.ERROR]
+    assert parked.message.message_id == "bad-1"
+    assert parked.message.body == b"not json{"
+
+
+async def test_a_dead_letter_with_no_policy_keeps_headers_it_does_not_know() -> None:
+    # AceMQ TCK requirements AMQP-RETRY-008 and AMQP-ENV-014, case RETRY-004.
+    calls = 0
+
+    async def fails(message: Message) -> Ack:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("down")
+
+    arrived = {headers.ID: "m1", headers.ATTEMPT: 1, "x-acemq-future": "kept"}
+    async with running(fails) as transport:
+        await transport.deliver(QUEUE, b'{"id": "m1"}', headers=arrived)
+
+    dead = transport.sent_to(DLQ)[0]
+    assert calls == 1
+    assert dead.headers[headers.ATTEMPT] == 1
+    assert dead.headers["x-acemq-future"] == "kept"
+    assert transport.sent_to(QUEUE) == []
 
 
 async def test_the_dead_lettered_message_keeps_its_identity() -> None:

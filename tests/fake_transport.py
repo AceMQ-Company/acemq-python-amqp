@@ -101,6 +101,10 @@ class FakeTransport:
     specs: dict[str, ConsumeSpec] = field(default_factory=dict)
     closed: bool = False
 
+    #: Queues the broker takes a message for and then nacks, which a test sets to
+    #: rehearse a ``reject-publish`` overflow on, say, the parked queue.
+    refuse: set[str] = field(default_factory=set)
+
     #: Whether the broker has blocked this connection, which a test sets to
     #: rehearse a disk or memory alarm. ``None`` is the third answer a transport
     #: can give — the question could not be asked — and is deliberately not the
@@ -132,7 +136,7 @@ class FakeTransport:
         routed = bool(exchange) or routing_key in self.queues
         return PublishResult(
             message_id=message.message_id,
-            confirmed=True,
+            confirmed=exchange != "" or routing_key not in self.refuse,
             routed=routed,
             return_reason="" if routed else "NO_ROUTE",
         )
@@ -225,6 +229,7 @@ class FakeTransport:
         routing_key: str | None = None,
         redelivered: bool = False,
         reply_to: str = "",
+        message_id: str = "",
         timeout: float = 5.0,
     ) -> Settlement:
         """Hands one message to whoever is consuming the queue.
@@ -253,7 +258,7 @@ class FakeTransport:
                 body=body,
                 content_type=content_type,
                 routing_key=queue if routing_key is None else routing_key,
-                message_id="",
+                message_id=message_id,
                 headers=dict(headers or {}),
                 redelivered=redelivered,
                 ack=ack,

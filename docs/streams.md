@@ -179,8 +179,15 @@ and `read_stream` refuses one:
 | `accept()` | acknowledged. The position advances; the message is still on the stream |
 | `park(e)`, or a body the codec refuses | a copy is published to `{stream}.parked`, then the delivery is acknowledged. The original is still on the stream |
 | `reject(e)` | a copy goes to `{stream}.dlq`, same shape |
-| `retry(e)` | **refused.** `StreamRetryError` naming the two alternatives, and a copy of the message goes to `{stream}.dlq` carrying that sentence. **Nothing is appended to the stream** |
-| the handler raises | the same: nothing is retried, and a copy goes to `{stream}.dlq` |
+| `retry(e)` | **the reader stops** at this message: the subscription is closed, nothing after it is handled, and no copy is written anywhere. **Nothing is appended to the stream** |
+| the handler raises | the same: the reader stops |
+
+Stopping is the default because the stream is the record: a reader restarted at
+the same offset once the fault is fixed sees the message again, and nothing has
+been skipped or copied. `read_stream(..., on_failure="dead_letter")` is the
+opt-out, and the old behaviour: `retry(e)` is refused with a `StreamRetryError`
+naming the two alternatives, a raise is not retried either, and both put a copy
+in `{stream}.dlq` carrying the reason while the reader carries on.
 
 The fourth row used to be the one that bit. A retry on a queue puts a message
 back on that queue; a retry on a stream **appends** to it, so every other

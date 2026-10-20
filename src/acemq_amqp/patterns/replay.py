@@ -43,7 +43,8 @@ log = logging.getLogger("acemq")
 #: The queue a message was replayed out of.
 HEADER_REPLAYED_FROM = "acemq-replayed-from"
 
-#: When it was replayed, as RFC 3339.
+#: When it was replayed, as ISO-8601 UTC with milliseconds and a ``Z``:
+#: ``2026-02-03T04:05:06.789Z`` (AceMQ TCK requirement AMQP-ENV-013).
 HEADER_REPLAYED_AT = "acemq-replayed-at"
 
 #: How many times it has been replayed, from 1.
@@ -170,7 +171,9 @@ async def replay(
                 # this pass declined, and it goes back as the pass ends.
                 return ReplayResult(moved, skipped, "drained")
 
-            envelope = Envelope.from_headers(message.headers, message.routing_key)
+            envelope = Envelope.from_headers(
+                message.headers, message.routing_key, message.message_id
+            )
             if only is not None and not only(envelope, message.body):
                 skipped += 1
                 declined.append(message)
@@ -263,7 +266,7 @@ async def _move(
 
     headers: dict[str, Any] = dict(going_back.to_headers(routing_key=key))
     headers[HEADER_REPLAYED_FROM] = queue
-    headers[HEADER_REPLAYED_AT] = datetime.now(timezone.utc).isoformat()
+    headers[HEADER_REPLAYED_AT] = _replayed_at(datetime.now(timezone.utc))
     headers[HEADER_REPLAY_COUNT] = _replays_so_far(envelope) + 1
 
     try:
@@ -311,6 +314,12 @@ async def _return_quietly(message: Delivery) -> None:
         await message.nack(True)
     except Exception:
         log.warning("acemq: could not return a message to the queue it was replayed from")
+
+
+def _replayed_at(when: datetime) -> str:
+    """The replay time as every AceMQ library writes it: milliseconds and ``Z``,
+    where ``isoformat()`` gives microseconds and ``+00:00``."""
+    return when.astimezone(timezone.utc).isoformat(timespec="milliseconds")[:-6] + "Z"
 
 
 def _replays_so_far(envelope: Envelope) -> int:

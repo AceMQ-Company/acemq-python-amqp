@@ -19,7 +19,20 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 
-from acemq_amqp import Ack, Action, Envelope, Message, accept, in_progress, reject, retry
+from fake_transport import FakeTransport
+
+from acemq_amqp import (
+    Ack,
+    Action,
+    Connection,
+    Envelope,
+    Message,
+    QueueSpec,
+    accept,
+    in_progress,
+    reject,
+    retry,
+)
 from acemq_amqp.patterns import Claim, InMemoryIdempotencyStore, idempotent
 
 CONTENT_TYPE = "application/json"
@@ -54,6 +67,30 @@ async def test_the_second_delivery_of_a_message_does_not_run_the_handler() -> No
     # went right.
     assert first == accept()
     assert second == accept()
+
+
+async def test_a_message_with_only_a_message_id_is_keyed_by_it() -> None:
+    # AceMQ TCK requirement AMQP-IDEM-002, case IDEM-001: a publisher that is
+    # not an AceMQ library sends message_id and no x-acemq-id. A key generated
+    # afresh per delivery would let both copies through.
+    transport = FakeTransport()
+    await transport.declare_queue("orders.new", QueueSpec())
+    mq = Connection(transport)
+    ran: list[str] = []
+
+    async def handler(incoming: Message) -> Ack:
+        ran.append(incoming.envelope.id)
+        return accept()
+
+    await mq.consume("orders.new", idempotent(InMemoryIdempotencyStore(), handler))
+    try:
+        first = await transport.deliver("orders.new", b"{}", message_id="d-2")
+        second = await transport.deliver("orders.new", b"{}", message_id="d-2")
+    finally:
+        await mq.close()
+
+    assert ran == ["d-2"]
+    assert first.acked and second.acked
 
 
 async def test_a_handler_that_failed_is_run_again_next_time() -> None:

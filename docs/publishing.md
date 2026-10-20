@@ -287,13 +287,14 @@ non-durable queue still goes when the broker does; see
 ## Messages that reach no queue
 
 ```python
-required = mq.publisher("orders-events", "order.placed", mandatory=True)
+required = mq.publisher("orders-events", "order.placed")
 await required.send(payload)   # raises PublishError if nothing is bound
 ```
 
 An unroutable message is the quietest failure AMQP has: the publish succeeds,
 the message is discarded, the consumer waits, and nothing anywhere says why.
-`mandatory=True` makes the broker return it, and this library **raises**
+So every publisher is **mandatory by default**: the broker returns the message,
+and this library **raises**
 `PublishError` rather than leaving the fact in the result, because a caller who
 does not read the result would otherwise carry on believing the message went
 somewhere:
@@ -307,8 +308,10 @@ except PublishError as failure:
     log.error("%s went nowhere: %s", failure.message_id, failure)
 ```
 
-Without `mandatory`, `result.routed` still says what happened — it is only the
-raising that is opted into.
+`failure.unroutable` is true for a returned message and false for one the broker
+nacked, so the two can be told apart without reading the message.
+`mandatory=False` opts out, for a fan-out where no subscriber at all is a normal
+state; `result.routed` still says what happened.
 
 ## A different codec for one publisher
 

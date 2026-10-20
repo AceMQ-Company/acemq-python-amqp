@@ -595,7 +595,7 @@ async def _reply(
     headers: Mapping[str, Any] = (
         {HEADER_ERROR: f"{type(failure).__name__}: {failure}"} if failure else {}
     )
-    await connection.publisher("", reply_to, codec=codec).send(
+    await connection.publisher("", reply_to, codec=codec, mandatory=False).send(
         answer,
         envelope=Envelope(
             correlation_id=request.envelope.correlation_id,

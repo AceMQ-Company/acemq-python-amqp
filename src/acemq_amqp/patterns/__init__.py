@@ -149,6 +149,7 @@ from .sql import (
 )
 from .streams import (
     DEFAULT_STREAM_PREFETCH,
+    StreamFailure,
     StreamOffset,
     StreamRetention,
     StreamRetryError,
@@ -232,6 +233,7 @@ __all__ = [
     "SqlSchemaRegistry",
     "Stage",
     "Step",
+    "StreamFailure",
     "StreamOffset",
     "StreamRetention",
     "StreamRetryError",

@@ -176,7 +176,7 @@ async def test_a_handler_asking_to_retry_is_refused_and_nothing_is_appended() ->
     async def gives_up(message: Message) -> Ack:
         return retry(RuntimeError("the pricing service is down"))
 
-    consumer = await read_stream(mq, NAME, gives_up)
+    consumer = await read_stream(mq, NAME, gives_up, on_failure="dead_letter")
     settlement = await transport.deliver(NAME, b'{"id": "7"}')
     await consumer.close()
 
@@ -207,12 +207,59 @@ async def test_a_handler_that_raises_is_not_retried_onto_the_stream_either() -> 
     async def raises(message: Message) -> Ack:
         raise RuntimeError("the pricing service is down")
 
-    consumer = await read_stream(mq, NAME, raises)
+    consumer = await read_stream(mq, NAME, raises, on_failure="dead_letter")
     await transport.deliver(NAME, b'{"id": "7"}')
     await consumer.close()
 
     assert transport.sent_to(NAME) == []
     assert len(transport.sent_to(f"{NAME}.dlq")) == 1
+
+
+async def test_a_failing_handler_stops_the_reader_at_that_message() -> None:
+    # AceMQ TCK requirement AMQP-STREAM-004, case STREAM-003: by default the
+    # reader stops, nothing after the failed message is handled, and no copy of
+    # it is written anywhere.
+    transport = FakeTransport()
+    mq = Connection(transport, retry=fixed_retry(3, timedelta(0)))
+    await declare_stream(mq, NAME)
+    seen: list[str] = []
+
+    async def fails_on_8(message: Message) -> Ack:
+        seen.append(message.payload["id"])
+        if message.payload["id"] == "8":
+            raise RuntimeError("the pricing service is down")
+        return accept()
+
+    consumer = await read_stream(mq, NAME, fails_on_8)
+    first = await transport.deliver(NAME, b'{"id": "7"}')
+    failed = await transport.deliver(NAME, b'{"id": "8"}')
+    after = await transport.deliver(NAME, b'{"id": "9"}')
+    await consumer.close()
+
+    assert seen == ["7", "8"]
+    assert first.acked
+    assert failed.requeued is True
+    assert after.requeued is True
+    assert consumer.closed and not consumer.running
+    assert transport.sent == []
+
+
+async def test_a_handler_asking_to_retry_stops_the_reader_too() -> None:
+    transport = FakeTransport()
+    mq = Connection(transport)
+    await declare_stream(mq, NAME)
+
+    consumer = await read_stream(mq, NAME, always_retry)
+    settlement = await transport.deliver(NAME, b'{"id": "7"}')
+    await consumer.close()
+
+    assert settlement.requeued is True
+    assert consumer.closed
+    assert transport.sent == []
+
+
+async def always_retry(message: Message) -> Ack:
+    return retry(RuntimeError("down"))
 
 
 async def test_a_stream_consumer_declares_no_retry_rungs() -> None:

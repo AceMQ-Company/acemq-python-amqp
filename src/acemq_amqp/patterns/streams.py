@@ -53,11 +53,11 @@ import inspect
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Literal, TypeAlias
 
 from ..ack import Ack, Action, FatalError
 from ..codec import Codec
-from ..connection import AsyncHandler, Connection, Consumer, Handler, Message
+from ..connection import AsyncHandler, Connection, Consumer, Handler, Message, _StopReading
 from ..errors import AceMQError
 from ..retry import no_retry
 from ..topology import QUEUE_TYPE_ARG as _QUEUE_TYPE_ARG
@@ -83,6 +83,14 @@ SEGMENT_BYTES_ARG = "x-stream-max-segment-size-bytes"
 #: gives back does not mention streams. Ten is enough to keep one busy and small
 #: enough that a slow handler is not holding a batch nobody else can have.
 DEFAULT_STREAM_PREFETCH = 10
+
+#: What a stream reader does when its handler fails — raises, or asks for a
+#: retry. ``stop``, the default, closes the reader at that message and writes
+#: no copy of it anywhere (AceMQ TCK requirement AMQP-STREAM-004): the stream is
+#: the record, so a reader restarted at the same offset after the fix sees it
+#: again. ``dead_letter`` puts a copy in ``{stream}.dlq`` and carries on, which
+#: was the only behaviour before this option existed.
+StreamFailure: TypeAlias = Literal["stop", "dead_letter"]
 
 
 class StreamRetryError(AceMQError, FatalError):
@@ -112,7 +120,7 @@ class StreamRetryError(AceMQError, FatalError):
     """
 
 
-def _refusing_retries(stream: str, handler: Handler) -> AsyncHandler:
+def _refusing_retries(stream: str, handler: Handler, stop: bool = False) -> AsyncHandler:
     """A handler that cannot ask for a retry, whatever the one inside it says.
 
     The constraint sits here, on the handler, rather than on a stream-specific
@@ -129,9 +137,16 @@ def _refusing_retries(stream: str, handler: Handler) -> AsyncHandler:
     """
 
     async def read(message: Message) -> Ack:
-        returned = handler(message)
-        decision: Ack = await returned if inspect.isawaitable(returned) else returned
+        try:
+            returned = handler(message)
+            decision: Ack = await returned if inspect.isawaitable(returned) else returned
+        except Exception as failure:
+            if stop:
+                raise _StopReading(f"the handler failed: {failure!r}") from failure
+            raise
         if isinstance(decision, Ack) and decision.action in (Action.RETRY, Action.IN_PROGRESS):
+            if stop:
+                raise _StopReading(f"the handler asked to retry it: {decision.error!r}")
             # Logged here as well as carried on the dead letter, because the two
             # reach different people. Whoever drains ``{stream}.dlq`` finds the
             # reason on the message; whoever wrote the handler is reading logs.
@@ -286,6 +301,7 @@ async def read_stream(
     codec: Codec | None = None,
     concurrency: int = 1,
     declare: bool = True,
+    on_failure: StreamFailure = "stop",
 ) -> Consumer:
     """Reads a stream from a chosen position::
 
@@ -301,7 +317,16 @@ async def read_stream(
     retrying on a stream means republishing to it, which appends a second copy
     for every other consumer of that log to read as well.
 
-    What a failing handler has instead is two outcomes, and they are enough.
+    **A failing handler stops the reader** by default: a handler that raises,
+    or asks for a retry, closes the subscription at that message. Nothing after
+    it is handled, and no copy of it is written anywhere — not ``{name}.dlq``,
+    not ``{name}.parked``, not the stream. The stream is the record, so a reader
+    restarted at the same offset once the fault is fixed sees the message again.
+    ``on_failure="dead_letter"`` is the opt-out: a copy goes to ``{name}.dlq``
+    and the reader carries on.
+
+    What a handler that wants to carry on has instead is two outcomes, and they
+    are enough.
     :func:`~acemq_amqp.park` puts a copy in ``{name}.parked``, a queue beside the
     stream rather than part of it, and the log is untouched.
     :func:`~acemq_amqp.accept` checkpoints past the message and leaves the
@@ -330,6 +355,8 @@ async def read_stream(
     :param declare: declare ``{name}.dlq`` and ``{name}.parked`` before
         subscribing. On by default; see :meth:`acemq_amqp.Connection.consume`.
         No retry rungs are declared, because nothing here retries
+    :param on_failure: ``stop`` (the default) or ``dead_letter``; see
+        :data:`StreamFailure`
     :returns: the running consumer
     """
     if prefetch < 1:
@@ -339,7 +366,7 @@ async def read_stream(
 
     return await connection.consume(
         name,
-        _refusing_retries(name, handler),
+        _refusing_retries(name, handler, stop=on_failure == "stop"),
         codec=codec,
         # Said rather than inherited. A connection carrying a retry policy for
         # its queues would otherwise turn every exception out of a stream handler

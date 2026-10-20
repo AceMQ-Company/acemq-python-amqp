@@ -30,7 +30,10 @@ def _now() -> datetime:
 
 
 def _millis(when: datetime) -> int:
-    return int(when.timestamp() * 1000)
+    # Rounded rather than truncated: the float can land a hair under the
+    # millisecond it came from, and a first-seen that drifts by one on a
+    # republish is a header changed in transit.
+    return round(when.timestamp() * 1000)
 
 
 def _from_millis(value: int) -> datetime:
@@ -89,6 +92,15 @@ class Envelope:
     #: The application's own headers. Never contains a reserved name.
     headers: Mapping[str, Any] = field(default_factory=dict)
 
+    #: ``x-acemq-`` headers this library has no field for, exactly as they
+    #: arrived: written by a newer version of this library or by another
+    #: language's. Read by :meth:`from_headers` and written back by
+    #: :meth:`to_headers`, so a retry, a dead letter, a park and a replay carry
+    #: them on unchanged (AceMQ TCK requirement AMQP-ENV-014) instead of every new
+    #: envelope header being a silent loss in a mixed fleet. Never contains a name
+    #: this library does know.
+    extensions: Mapping[str, Any] = field(default_factory=dict)
+
     def __post_init__(self) -> None:
         if not self.correlation_id:
             object.__setattr__(self, "correlation_id", self.id)
@@ -146,6 +158,12 @@ class Envelope:
             headers.ATTEMPT: self.attempt,
             headers.FIRST_SEEN: _millis(self.first_seen),
         }
+        # First, so a name this library knows can never be overwritten by one it
+        # carried on without reading.
+        written = {
+            **{n: v for n, v in self.extensions.items() if n not in headers.RESERVED},
+            **written,
+        }
         # Absent rather than empty. A header carrying "" is a header somebody
         # has to write a special case for at the other end.
         for name, value in (
@@ -171,7 +189,9 @@ class Envelope:
         return written
 
     @classmethod
-    def from_headers(cls, raw: Mapping[str, Any] | None, routing_key: str = "") -> Envelope:
+    def from_headers(
+        cls, raw: Mapping[str, Any] | None, routing_key: str = "", message_id: str = ""
+    ) -> Envelope:
         """Reads an envelope off a delivery.
 
         Anything missing takes its default, and anything unreadable takes its
@@ -181,14 +201,25 @@ class Envelope:
 
         :param raw: the delivery's headers
         :param routing_key: what it arrived on, used when no type was set
+        :param message_id: the delivery's AMQP ``message_id``, which is the id
+            when there is no ``x-acemq-id``: a message from a publisher that is
+            not an AceMQ library carries one and no envelope headers, and an id
+            generated afresh for each delivery would make two copies of it two
+            messages to every idempotent consumer (AceMQ TCK requirement
+            AMQP-IDEM-002)
         :returns: the envelope
         """
         raw = raw or {}
         application = {
             name: value for name, value in raw.items() if not headers.is_reserved(name)
         }
+        extensions = {
+            name: value
+            for name, value in raw.items()
+            if headers.is_reserved(name) and name not in headers.RESERVED
+        }
 
-        identifier = _text(raw.get(headers.ID)) or str(uuid.uuid4())
+        identifier = _text(raw.get(headers.ID)) or message_id or str(uuid.uuid4())
         first_seen = raw.get(headers.FIRST_SEEN)
 
         return cls(
@@ -209,6 +240,7 @@ class Envelope:
             route_position=_number(raw.get(headers.ROUTE_POSITION), 0),
             route_id=_text(raw.get(headers.ROUTE_ID)),
             headers=application,
+            extensions=extensions,
         )
 
 

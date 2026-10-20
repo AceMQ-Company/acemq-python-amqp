@@ -37,12 +37,15 @@ from acemq_amqp import (
     fixed_retry,
 )
 from acemq_amqp.patterns import (
+    InMemoryIdempotencyStore,
     Requester,
     Scheduler,
     StreamRetention,
     declare_stream,
+    follow_slip,
     from_first,
     from_next,
+    idempotent,
     read_stream,
     replay,
 )
@@ -61,6 +64,7 @@ OPS = [
     "readStream",
     "metrics",
     "replay",
+    "pipeline",
 ]
 
 
@@ -144,24 +148,22 @@ class Driver:
                 "headers": fields.get("headers"),
             }
             envelope = Envelope(**{k: v for k, v in given.items() if v is not None})
-        publisher = self.mq.publisher(args.get("exchange", ""), args["routingKey"])
+        # ``mandatory`` absent is the library's default, which is mandatory.
+        options = {} if args.get("mandatory") is None else {"mandatory": args["mandatory"]}
+        publisher = self.mq.publisher(args.get("exchange", ""), args["routingKey"], **options)
         result = await publisher.send(args["body"], envelope=envelope)
         return {"messageId": result.message_id}
 
-    async def consume(self, args: dict[str, Any]) -> dict[str, Any]:
-        queue = args["queue"]
-        retry = args.get("retry", {})
-        policy = fixed_retry(
-            retry.get("maxAttempts", 3), timedelta(milliseconds=retry.get("delayMs", 1000))
-        )
-        behaviour = args.get("behaviour", {})
+    def _counting(self, handle: str, behaviour: Mapping[str, Any]) -> Any:
+        """The TCK handler: counts ``body.id`` under ``handle``, sleeps, and
+        fails the first ``n`` deliveries of an id named in ``failFirst``."""
         fail_first: dict[str, int] = behaviour.get("failFirst", {})
         sleep = behaviour.get("sleepMs", 0) / 1000
-        counts: Counter[str] = Counter()
-        redelivered: Counter[str] = Counter()
-        order: list[str] = []
+        counts: Counter[str] = self.counts.setdefault(handle, Counter())
+        redelivered: Counter[str] = self.redelivered.setdefault(handle, Counter())
+        order: list[str] = self.order.setdefault(handle, [])
 
-        async def handle(message: Message) -> Ack:
+        async def handle_one(message: Message) -> Ack:
             ident = str(message.payload.get("id"))
             counts[ident] += 1
             order.append(ident)
@@ -173,14 +175,51 @@ class Driver:
                 raise RuntimeError(f"tck: failing {ident} on purpose, delivery {counts[ident]}")
             return accept()
 
+        return handle_one
+
+    async def consume(self, args: dict[str, Any]) -> dict[str, Any]:
+        queue = args["queue"]
+        retry = args.get("retry")
+        # ``retry`` absent is no policy at all: the consumer exactly as the
+        # library builds it when the caller configures none.
+        policy = (
+            None
+            if retry is None
+            else fixed_retry(
+                retry.get("maxAttempts", 3), timedelta(milliseconds=retry.get("delayMs", 1000))
+            )
+        )
+        handler = self._counting(args["handle"], args.get("behaviour", {}))
+        if args.get("idempotent"):
+            # Counted inside the wrapper, so a suppressed duplicate is not counted.
+            handler = idempotent(InMemoryIdempotencyStore(), handler)
+
         await self.mq.declare(Topology().queue(queue, dead_letter=True, retry=policy))
         consumer = await self.mq.consume(
-            queue, handle, retry=policy, prefetch=args.get("prefetch", 10)
+            queue, handler, retry=policy, prefetch=args.get("prefetch", 10)
         )
         self.consumers[args["handle"]] = consumer
-        self.counts[args["handle"]] = counts
-        self.redelivered[args["handle"]] = redelivered
-        self.order[args["handle"]] = order
+        return {}
+
+    async def pipeline(self, args: dict[str, Any]) -> dict[str, Any]:
+        name = args["name"]
+        handle = args["handle"]
+        counted = self._counting(handle, {})
+
+        async def identity(message: Message) -> Any:
+            await counted(message)
+            return message.payload
+
+        topology = Topology().exchange(name, "direct")
+        for step in args["steps"]:
+            topology.queue(f"{name}.{step}", dead_letter=True).binding(
+                f"{name}.{step}", name, step
+            )
+        await self.mq.declare(topology)
+        for step in args["steps"]:
+            self.consumers[f"{handle}:{step}"] = await self.mq.consume(
+                f"{name}.{step}", follow_slip(self.mq, identity, pipeline=name)
+            )
         return {}
 
     async def handled(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -197,21 +236,10 @@ class Driver:
         return {}
 
     async def readStream(self, args: dict[str, Any]) -> dict[str, Any]:  # noqa: N802
-        counts: Counter[str] = Counter()
-        order: list[str] = []
-
-        async def handle(message: Message) -> Ack:
-            ident = str(message.payload.get("id"))
-            counts[ident] += 1
-            order.append(ident)
-            return accept()
-
+        handler = self._counting(args["handle"], args.get("behaviour") or {})
         offset = from_first() if args.get("offset", "first") == "first" else from_next()
-        consumer = await read_stream(self.mq, args["queue"], handle, offset=offset)
+        consumer = await read_stream(self.mq, args["queue"], handler, offset=offset)
         self.consumers[args["handle"]] = consumer
-        self.counts[args["handle"]] = counts
-        self.redelivered[args["handle"]] = Counter()
-        self.order[args["handle"]] = order
         return {}
 
     async def metrics(self, _: dict[str, Any]) -> dict[str, Any]:

@@ -52,6 +52,11 @@ OUTCOME_PARKED = "parked"
 #: never dead-lettered for it. See :func:`in_progress`.
 OUTCOME_IN_PROGRESS = "in_progress"
 
+#: A stream reader stopped at this message because its handler failed: the
+#: subscription is closed, nothing after it is handled, and no copy of it is
+#: written anywhere. See :func:`acemq_amqp.patterns.read_stream`.
+OUTCOME_STOPPED = "stopped"
+
 #: How long a message found in progress waits before it is looked at again.
 DEFAULT_IN_PROGRESS_DELAY = timedelta(seconds=5)
 

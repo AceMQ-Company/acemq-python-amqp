@@ -149,11 +149,22 @@ async def test_a_returned_message_is_reported_as_unroutable_not_as_refused() -> 
     assert result.return_reason == "NO_ROUTE"
 
 
-async def test_an_unroutable_message_is_only_an_error_when_it_was_mandatory() -> None:
+async def test_a_publisher_is_mandatory_by_default() -> None:
+    # AceMQ TCK requirement AMQP-PUB-006: no argument means mandatory.
     transport = FakeTransport()
     connection = Connection(transport)
 
-    result = await connection.publisher(routing_key="nobody.listens").send({})
+    with pytest.raises(PublishError) as failure:
+        await connection.publisher(routing_key="nobody.listens").send({})
+    assert failure.value.unroutable is True
+    assert transport.sent[0].message.mandatory is True
+
+
+async def test_an_unroutable_message_is_not_an_error_when_the_caller_opts_out() -> None:
+    transport = FakeTransport()
+    connection = Connection(transport)
+
+    result = await connection.publisher(routing_key="nobody.listens", mandatory=False).send({})
 
     assert result.routed is False
 

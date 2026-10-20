@@ -44,6 +44,7 @@ from .ack import (
     OUTCOME_PARKED,
     OUTCOME_REJECTED,
     OUTCOME_RETRIED,
+    OUTCOME_STOPPED,
     Ack,
     Action,
     FatalError,
@@ -219,7 +220,7 @@ class Publisher:
         *,
         codec: Codec | None = None,
         persistent: bool = True,
-        mandatory: bool = False,
+        mandatory: bool = True,
     ) -> None:
         self._connection = connection
         self._exchange = exchange
@@ -254,8 +255,8 @@ class Publisher:
             same value: the header is what survives a service that rebuilds the
             message, the property is what the other four libraries read
         :returns: what the broker said
-        :raises PublishError: when the publisher is mandatory and the message
-            reached no queue
+        :raises PublishError: when the publisher is mandatory — the default — and
+            the message reached no queue; its ``unroutable`` is true
         """
         key = self._routing_key if routing_key is None else routing_key
         outgoing = envelope or Envelope(origin=self._connection.origin)
@@ -447,6 +448,18 @@ class _HopRefusedError(Exception):
     """The broker refused a republish the consumer made on the user's behalf."""
 
 
+class _StopReading(Exception):
+    """Raised by a handler wrapper to stop its consumer at this delivery.
+
+    What a stream reader does when its handler fails (AceMQ TCK requirement
+    AMQP-STREAM-004): the delivery is neither retried nor set aside, the
+    subscription is closed, and every delivery already prefetched is returned
+    unhandled. Private, because only :func:`acemq_amqp.patterns.read_stream`
+    has a use for it: on a queue, stopping at a message hands it to the next
+    consumer, which is a retry with extra steps.
+    """
+
+
 class Consumer:
     """A running subscription. Close it to stop.
 
@@ -484,6 +497,8 @@ class Consumer:
         self._subscription: Subscription | None = None
         self._in_flight = 0
         self._closed = False
+        self._halted = False
+        self._halting: asyncio.Task[bool] | None = None
 
     @property
     def queue(self) -> str:
@@ -579,7 +594,9 @@ class Consumer:
                 log.exception("acemq: could not settle a delivery from %s", self._queue)
 
     async def _handle(self, delivery: Delivery) -> None:
-        envelope = Envelope.from_headers(delivery.headers, delivery.routing_key)
+        envelope = Envelope.from_headers(
+            delivery.headers, delivery.routing_key, delivery.message_id
+        )
         # No counter for "a message arrived": every delivery is counted once
         # when it is settled, on ``acemq.consume.total`` with the outcome, and
         # the sum across the outcomes is how many arrived. One counter that
@@ -605,6 +622,11 @@ class Consumer:
             self._observer.gauge(METRIC_CONSUME_IN_FLIGHT, self._in_flight, self._labels)
 
     async def _handle_one(self, delivery: Delivery, envelope: Envelope) -> None:
+        if self._halted:
+            # Prefetched before the reader stopped. Returned unhandled: nothing
+            # after the message it stopped at is handled.
+            await delivery.nack(True)
+            return
         try:
             payload = self._codec.decode(delivery.body, delivery.content_type)
         except Exception as failure:
@@ -779,6 +801,15 @@ class Consumer:
             delay = decision.delay if decision.delay is not None else ZERO
             return Settlement(OUTCOME_IN_PROGRESS, delay=delay), Wait(delay, in_broker=False)
 
+        if isinstance(decision.error, _StopReading):
+            return (
+                Settlement(
+                    OUTCOME_STOPPED,
+                    reason=f"the reader stopped at it: {_describe(decision.error)}",
+                ),
+                None,
+            )
+
         if isinstance(decision.error, FatalError):
             # The handler asked for a retry but marked the reason as one that
             # will not change. Honouring the mark rather than the request is the
@@ -837,6 +868,19 @@ class Consumer:
 
         if settlement.outcome == OUTCOME_ACKED:
             await delivery.ack()
+            return
+
+        if settlement.outcome == OUTCOME_STOPPED:
+            # Returned, not acknowledged: on a stream neither moves the log, and
+            # a requeue is the honest word for a message nothing has dealt with.
+            log.error(
+                "acemq: stopped reading %s at %s: %s",
+                self._queue,
+                envelope.id,
+                settlement.reason,
+            )
+            self._halt()
+            await delivery.nack(True)
             return
 
         if settlement.outcome == OUTCOME_PARKED:
@@ -1079,19 +1123,22 @@ class Consumer:
         except _HopRefusedError:
             delivered = False
         if not delivered:
-            # Rejected rather than acknowledged: without a dead-letter queue to
-            # put it in, the broker's own dead-lettering is the last thing left
-            # between this message and nothing.
+            # Requeued, never rejected (AceMQ TCK requirements AMQP-PUB-002 and
+            # AMQP-RETRY-007). Rejecting without requeue dropped the message, or
+            # dead-lettered it through the source queue's own dead-letter
+            # exchange somewhere it does not belong, the moment the broker
+            # refused the copy. Requeued, it comes back and is set aside again
+            # once the broker takes it.
             self._observer.count(
                 METRIC_SET_ASIDE_FAILED, 1, {**self._labels, TAG_TARGET: target}
             )
             log.error(
-                "acemq: cannot move %s to %s (%s); rejecting it to the broker instead",
+                "acemq: cannot move %s to %s (%s); returning it to the broker",
                 envelope.id,
                 target,
                 reason,
             )
-            await delivery.nack(False)
+            await delivery.nack(True)
             return
 
         log.warning(
@@ -1137,6 +1184,16 @@ class Consumer:
             raise _HopRefusedError(str(refused)) from refused
         return result.routed
 
+    def _halt(self) -> None:
+        """Stops this consumer from inside one of its own handlers.
+
+        The close runs as a task of its own, because it waits for the workers
+        and the caller is one of them.
+        """
+        self._halted = True
+        if self._halting is None:
+            self._halting = asyncio.get_running_loop().create_task(self.close())
+
     async def close(self, *, timeout: float | None = DEFAULT_DRAIN_TIMEOUT) -> bool:
         """Stops the consumer and waits, for up to ``timeout``, for the handlers
         already running.
@@ -1163,6 +1220,11 @@ class Consumer:
             out first and some were cut off — the consumer is stopped either way
         """
         if self._closed:
+            halting = self._halting
+            if halting is not None and halting is not asyncio.current_task():
+                # Stopped by its own handler and still closing: closing the
+                # connection underneath that would cut it off halfway.
+                return await halting
             return True
         self._closed = True
 
@@ -1651,7 +1713,7 @@ class Connection:
         *,
         codec: Codec | None = None,
         persistent: bool = True,
-        mandatory: bool = False,
+        mandatory: bool = True,
     ) -> Publisher:
         """Builds a publisher for an exchange and routing key.
 
@@ -1663,7 +1725,11 @@ class Connection:
         :param codec: a codec other than this connection's
         :param persistent: ask the broker to write these messages to disk
         :param mandatory: fail when a message reaches no queue at all, rather
-            than letting the broker drop it silently
+            than letting the broker drop it silently. On by default (AceMQ TCK
+            requirement AMQP-PUB-006), so a message published to a routing key
+            nothing is bound to raises :class:`~acemq_amqp.PublishError` with
+            ``unroutable`` set instead of disappearing. ``mandatory=False`` is the
+            opt-out, for a fan-out where no subscriber at all is a normal state
         :returns: the publisher
         """
         return Publisher(
