@@ -28,7 +28,9 @@ While the version is `0.x` the public API may change in any release.
   and `reject(...)` returned by a handler still set the message aside.
 - **A dead letter or park the broker refuses is requeued, never rejected.**
   When the copy to `{queue}.dlq` or `{queue}.parked` is nacked or returned,
-  the delivery is now `nack`ed with requeue. It used to be rejected without
+  the delivery is now held for a second and `nack`ed with requeue (the pause
+  keeps a quorum queue's delivery limit from being spent in a hot loop). It
+  used to be rejected without
   requeue, which dropped the message, or dead-lettered it through the source
   queue's own dead-letter exchange (AMQP-RETRY-007, AMQP-PUB-002, case
   PARK-002).

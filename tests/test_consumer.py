@@ -546,9 +546,12 @@ async def test_a_message_that_cannot_be_dead_lettered_is_left_with_the_broker() 
     assert settlement.requeued is True
 
 
-async def test_a_park_the_broker_refuses_requeues_the_delivery() -> None:
+async def test_a_park_the_broker_refuses_requeues_the_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # AceMQ TCK requirement AMQP-RETRY-007, case PARK-002: a refused park loses
     # nothing. Rejecting without requeue dropped the message.
+    monkeypatch.setattr("acemq_amqp.connection.SET_ASIDE_REFUSED_DELAY", 0.0)
     async with running(always(accept())) as transport:
         transport.refuse = {PARKED}
         settlement = await transport.deliver(QUEUE, b"{not json", headers=wire(Envelope()))

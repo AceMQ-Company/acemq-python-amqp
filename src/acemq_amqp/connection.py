@@ -141,6 +141,15 @@ DEFAULT_HEALTH_TIMEOUT = 3.0
 #: it, so the connection is closed cleanly rather than torn down from outside.
 DEFAULT_DRAIN_TIMEOUT = 20.0
 
+# ponytail: a fixed pause gives about twenty seconds of refusal before a quorum
+# source queue's delivery limit; a backoff that grows per message if that is short.
+#: How long, in seconds, a delivery whose dead letter or park the broker refused
+#: is held before it is requeued. Not at once: the message comes straight back,
+#: is refused again, and the loop runs at broker speed — and a quorum queue
+#: counts every requeue against its delivery limit (twenty by default on
+#: RabbitMQ 4), after which the broker dead-letters the message itself.
+SET_ASIDE_REFUSED_DELAY = 1.0
+
 #: What a health report says about a connection the broker has blocked. It is
 #: reported **up**, which is the one place this disagrees with a naive reading of
 #: the state: a blocked connection is the broker protecting itself from a disk or
@@ -1138,6 +1147,7 @@ class Consumer:
                 target,
                 reason,
             )
+            await asyncio.sleep(SET_ASIDE_REFUSED_DELAY)
             await delivery.nack(True)
             return
 
