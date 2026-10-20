@@ -29,6 +29,11 @@ While the version is `0.x` the public API may change in any release.
   to be sent on as a payload, which failed to encode and was retried.
 - The TCK driver's `pipeline` op uses the builder instead of declaring the
   topology and calling `follow_slip` by hand.
+- The TCK driver's `pipeline` op takes `behaviour`, so a named step's own
+  handler can fail (TCK SLIP-003). The library already met that case: a
+  pipeline step with no retry policy is attempted once and then dead-lettered
+  to `{name}.{step}.dlq` with every header kept. An integration test and a
+  sentence in `docs/patterns.md` now say so.
 
 ## [0.7.14] - 2026-10-20
 

@@ -1727,6 +1727,68 @@ async def test_a_built_pipeline_runs_every_step_and_retries_the_one_that_fails(
     assert arrived.envelope.causation_id != ""
 
 
+async def test_a_failing_pipeline_step_with_no_policy_dead_letters_after_one_attempt(
+    mq: Connection, workspace: Workspace
+) -> None:
+    """AMQP-SLIP-004: no retry policy anywhere means one attempt, then
+    ``{pipeline}.{step}.dlq`` with every header kept, and nothing onwards."""
+    name = workspace.name("noretry")
+    attempts: list[int] = []
+
+    async def failing(message: Message) -> object:
+        attempts.append(1)
+        raise RuntimeError("step b fails")
+
+    pipeline = await (
+        mq.pipeline(name)
+        .step("a", lambda message: message.payload)
+        .step("b", failing)
+        .step("c", lambda message: message.payload)
+        .build()
+    )
+    for step in pipeline.steps:
+        workspace.register(pipeline.queue_for(step))
+    async with pipeline:
+        # Raw, because an x-acemq- header this version does not know cannot be
+        # set through an Envelope; a newer peer could still have written one.
+        headers = Envelope(id="o-1", route="a,b,c", route_position=1, route_id="run-1")
+        await mq.publish_raw(
+            name,
+            "b",
+            Outbound(
+                body=b'{"order": "order-1"}',
+                content_type="application/json",
+                message_id="o-1",
+                headers={**headers.to_headers(), "x-acemq-future": "kept", "x-tenant": "acme"},
+            ),
+        )
+        dlq = dead_letter_queue(pipeline.queue_for("b"))
+        for _ in range(200):
+            if await mq.message_count(dlq):
+                break
+            await asyncio.sleep(0.1)
+        await asyncio.sleep(1)  # room for a second attempt, which must not come
+
+    # Read straight off the broker: an Envelope keeps only the headers it knows.
+    raw = await aio_pika.connect_robust(BROKER)
+    try:
+        dead = await (await (await raw.channel()).get_queue(dlq, ensure=False)).get()
+        assert dead is not None
+        await dead.ack()
+    finally:
+        await raw.close()
+    assert len(attempts) == 1
+    assert dead.headers["x-acemq-attempt"] == 1
+    assert dead.headers["x-acemq-route"] == "a,b,c"
+    assert dead.headers["x-acemq-route-position"] == 1
+    assert dead.headers["x-acemq-route-id"] == "run-1"
+    assert dead.headers["x-acemq-future"] == "kept"
+    assert dead.headers["x-tenant"] == "acme"
+    assert dead.headers["x-acemq-error"]
+    assert await mq.message_count(dlq) == 0
+    assert (await mq.message_count(pipeline.queue_for("c"))) == 0
+
+
 async def test_a_pipeline_step_publishes_onwards_or_stops(
     mq: Connection, workspace: Workspace
 ) -> None:

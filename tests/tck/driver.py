@@ -208,15 +208,22 @@ class Driver:
     async def pipeline(self, args: dict[str, Any]) -> dict[str, Any]:
         name = args["name"]
         handle = args["handle"]
-        counted = self._counting(handle, {})
+        behaviour: Mapping[str, Any] = args.get("behaviour") or {}
 
-        async def identity(message: Message) -> Any:
-            await counted(message)
-            return message.payload
+        def identity_for(step: str) -> Any:
+            # Fails inside the step's own handler, as the contract requires;
+            # no retry policy is set on the step or the pipeline.
+            counted = self._counting(handle, behaviour.get(step) or {})
+
+            async def identity(message: Message) -> Any:
+                await counted(message)
+                return message.payload
+
+            return identity
 
         builder = self.mq.pipeline(name)
         for step in args["steps"]:
-            builder.step(step, identity)
+            builder.step(step, identity_for(step))
         self.pipelines.append(await builder.build())
         return {}
 

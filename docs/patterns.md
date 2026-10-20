@@ -492,6 +492,12 @@ says. A message published straight onto a step's queue with no slip at all is
 taken to be at that step. Returning `NOTHING` ends the run there: nothing is
 published, the message is accepted, and the run is counted `ended_early`.
 
+A step given no `retry`, in a pipeline on a connection with no default policy,
+is attempted once: when its handler raises, the message goes to
+`{name}.{step}.dlq` with `x-acemq-attempt` 1 and every header it arrived with,
+including `x-acemq-` headers this version does not know, and nothing is
+published to the next step. There is no built-in retry delay.
+
 Step names are routing keys, so they are letters, digits, dots and dashes; a bad
 name, a repeated one or a pipeline with no steps is a `ValueError` before
 anything is declared. Closing stops the consumers and leaves the exchange and
