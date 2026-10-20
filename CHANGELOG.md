@@ -22,6 +22,8 @@ While the version is `0.x` the public API may change in any release.
 - The TCK driver implements the `replay` op, for the AceMQ TCK case
   REPLAY-001 (a filtered replay returns only once the messages it passed over
   are back on the queue).
+- Runs the AceMQ TCK v0.3.0 (was v0.2.0), which adds REPLAY-001 to the
+  default run: 20 cases.
 
 ## [0.7.12] - 2026-10-13
 
