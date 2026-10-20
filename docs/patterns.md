@@ -438,7 +438,10 @@ back where it came from rather than everywhere.
 Messages the filter declines are held unsettled until the pass is over rather
 than returned one at a time. A rejected message goes back to the *head* of the
 queue, which is what RabbitMQ does, so returning one immediately means reading
-the same message for ever and never seeing what is behind it.
+the same message for ever and never seeing what is behind it. The replay
+returns only once the declined messages are back on the queue (it waits up to
+ten seconds for the depth to show them), so a `message_count` read straight
+after it counts them, on a quorum queue too.
 
 A failure raises `ReplayError` carrying the partial result: whatever had already
 been moved has been moved, and the rest is still on the queue. Each message is

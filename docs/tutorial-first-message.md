@@ -6,7 +6,7 @@ and you will know what every line does.
 ## Step 1 — Install it
 
 ```bash
-pip install --extra-index-url https://acemq.org/pypi/simple/ "acemq-amqp[rabbitmq]==0.7.12"
+pip install --extra-index-url https://acemq.org/pypi/simple/ "acemq-amqp[rabbitmq]==0.7.13"
 ```
 
 The core package has **no dependencies at all** — not even a UUID library — so
