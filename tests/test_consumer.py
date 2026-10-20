@@ -553,7 +553,7 @@ async def test_a_park_the_broker_refuses_requeues_the_delivery(
     # nothing. Rejecting without requeue dropped the message.
     monkeypatch.setattr("acemq_amqp.connection.SET_ASIDE_REFUSED_DELAY", 0.0)
     async with running(always(accept())) as transport:
-        transport.refuse = {PARKED}
+        transport.refused_queues = {PARKED}
         settlement = await transport.deliver(QUEUE, b"{not json", headers=wire(Envelope()))
 
     assert settlement.acked is False

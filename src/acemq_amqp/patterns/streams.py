@@ -57,7 +57,7 @@ from typing import Any, Literal, TypeAlias
 
 from ..ack import Ack, Action, FatalError
 from ..codec import Codec
-from ..connection import AsyncHandler, Connection, Consumer, Handler, Message, _StopReading
+from ..connection import AsyncHandler, Connection, Consumer, Handler, Message, _StopReadingError
 from ..errors import AceMQError
 from ..retry import no_retry
 from ..topology import QUEUE_TYPE_ARG as _QUEUE_TYPE_ARG
@@ -142,11 +142,11 @@ def _refusing_retries(stream: str, handler: Handler, stop: bool = False) -> Asyn
             decision: Ack = await returned if inspect.isawaitable(returned) else returned
         except Exception as failure:
             if stop:
-                raise _StopReading(f"the handler failed: {failure!r}") from failure
+                raise _StopReadingError(f"the handler failed: {failure!r}") from failure
             raise
         if isinstance(decision, Ack) and decision.action in (Action.RETRY, Action.IN_PROGRESS):
             if stop:
-                raise _StopReading(f"the handler asked to retry it: {decision.error!r}")
+                raise _StopReadingError(f"the handler asked to retry it: {decision.error!r}")
             # Logged here as well as carried on the dead letter, because the two
             # reach different people. Whoever drains ``{stream}.dlq`` finds the
             # reason on the message; whoever wrote the handler is reading logs.

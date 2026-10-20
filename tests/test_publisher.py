@@ -47,6 +47,7 @@ from acemq_amqp.transport import Subscription
 
 async def test_a_publisher_builds_the_envelope_when_it_is_given_none() -> None:
     transport = FakeTransport()
+    transport.queues["orders.new"] = QueueSpec()  # a publisher is mandatory
     connection = Connection(transport, origin="checkout@pod-7")
 
     await connection.publisher(routing_key="orders.new").send({"id": "7"})
@@ -67,6 +68,7 @@ async def test_a_publisher_builds_the_envelope_when_it_is_given_none() -> None:
 
 async def test_an_envelope_given_by_hand_is_the_one_that_goes() -> None:
     transport = FakeTransport()
+    transport.queues["orders.new"] = QueueSpec()  # a publisher is mandatory
     connection = Connection(transport)
     envelope = Envelope(
         id="order-1",
@@ -91,6 +93,7 @@ async def test_an_envelope_given_by_hand_is_the_one_that_goes() -> None:
 
 async def test_a_publisher_uses_the_codec_it_was_given_rather_than_the_connections() -> None:
     transport = FakeTransport()
+    transport.queues["lines"] = QueueSpec()  # a publisher is mandatory
     connection = Connection(transport)
 
     await connection.publisher(routing_key="lines", codec=TextCodec()).send("a line")
@@ -338,6 +341,7 @@ async def test_a_batchs_results_are_in_payload_order_whatever_the_broker_answers
 
 async def test_a_batch_that_fails_partway_still_waits_for_the_rest_and_counts_them() -> None:
     transport = HoldingTransport()
+    transport.queues["orders.new"] = QueueSpec()  # a publisher is mandatory
     connection = Connection(transport)
     publisher = connection.publisher(routing_key="orders.new")
 
@@ -365,6 +369,7 @@ async def test_a_batch_that_fails_partway_still_waits_for_the_rest_and_counts_th
 
 async def test_when_two_messages_fail_the_one_reported_is_the_first_in_payload_order() -> None:
     transport = HoldingTransport()
+    transport.queues["orders.new"] = QueueSpec()  # a publisher is mandatory
     connection = Connection(transport)
     publisher = connection.publisher(routing_key="orders.new")
 

@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -232,8 +233,10 @@ async def test_a_failing_handler_stops_the_reader_at_that_message() -> None:
 
     consumer = await read_stream(mq, NAME, fails_on_8)
     first = await transport.deliver(NAME, b'{"id": "7"}')
-    failed = await transport.deliver(NAME, b'{"id": "8"}')
-    after = await transport.deliver(NAME, b'{"id": "9"}')
+    # 9 is prefetched before 8 fails, which is what a real reader holds.
+    failed, after = await asyncio.gather(
+        transport.deliver(NAME, b'{"id": "8"}'), transport.deliver(NAME, b'{"id": "9"}')
+    )
     await consumer.close()
 
     assert seen == ["7", "8"]

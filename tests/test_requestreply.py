@@ -36,6 +36,7 @@ from acemq_amqp import (
     Metrics,
     Outbound,
     PublishResult,
+    QueueSpec,
     headers,
 )
 from acemq_amqp.patterns import (
@@ -287,6 +288,7 @@ async def test_an_answer_that_could_not_be_sent_is_tried_again() -> None:
 
 async def test_a_reply_finishes_the_request_that_was_waiting_for_it() -> None:
     transport = FakeTransport()
+    transport.queues[REQUESTS] = QueueSpec()  # a publisher is mandatory
     mq = Connection(transport)
 
     async with await Requester.open(mq, "", REQUESTS, timeout=timedelta(seconds=5)) as caller:
@@ -313,6 +315,7 @@ async def test_a_reply_finishes_the_request_that_was_waiting_for_it() -> None:
 
 async def test_a_failure_carried_back_is_raised_rather_than_returned() -> None:
     transport = FakeTransport()
+    transport.queues[REQUESTS] = QueueSpec()  # a publisher is mandatory
     mq = Connection(transport)
 
     async with await Requester.open(mq, "", REQUESTS, timeout=timedelta(seconds=5)) as caller:
@@ -338,6 +341,7 @@ async def test_a_reply_that_will_not_decode_is_raised_to_its_caller_not_parked()
     # The reply queue declares no parked queue, so a reply the consumer set
     # aside would go nowhere and its caller would wait out the whole timeout.
     transport = FakeTransport()
+    transport.queues[REQUESTS] = QueueSpec()  # a publisher is mandatory
     mq = Connection(transport)
 
     async with await Requester.open(mq, "", REQUESTS, timeout=timedelta(seconds=5)) as caller:
@@ -362,6 +366,7 @@ async def test_a_reply_that_will_not_decode_is_raised_to_its_caller_not_parked()
 
 async def test_silence_becomes_a_timeout_and_says_nothing_about_the_work() -> None:
     transport = FakeTransport()
+    transport.queues[REQUESTS] = QueueSpec()  # a publisher is mandatory
     mq = Connection(transport)
 
     async with await Requester.open(
@@ -393,6 +398,7 @@ async def test_a_reply_nobody_is_waiting_for_is_dropped_rather_than_dead_lettere
 
 async def test_closing_a_requester_does_not_leave_a_caller_waiting_out_its_timeout() -> None:
     transport = FakeTransport()
+    transport.queues[REQUESTS] = QueueSpec()  # a publisher is mandatory
     mq = Connection(transport)
     caller = await Requester.open(mq, "", REQUESTS, timeout=timedelta(seconds=30))
 
@@ -442,6 +448,7 @@ async def test_a_named_reply_queue_is_declared_to_survive_a_restart() -> None:
 
 async def test_a_round_trip_is_timed_and_counted_as_answered() -> None:
     transport = FakeTransport()
+    transport.queues[REQUESTS] = QueueSpec()  # a publisher is mandatory
     metrics = Metrics()
     mq = Connection(transport, observer=metrics)
 
@@ -473,6 +480,7 @@ async def test_a_call_that_times_out_is_still_timed_and_counted() -> None:
     # A p99 that quietly drops the slowest calls says a service is fast right up
     # to the point where nothing answers at all.
     transport = FakeTransport()
+    transport.queues[REQUESTS] = QueueSpec()  # a publisher is mandatory
     metrics = Metrics()
     mq = Connection(transport, observer=metrics)
 
@@ -494,6 +502,7 @@ async def test_a_reply_that_nobody_is_waiting_for_is_counted_as_unmatched() -> N
     # unmatched rising alongside timed_out is what separates "the responder is
     # broken" from "the timeout is too short", and from outside they look alike.
     transport = FakeTransport()
+    transport.queues[REQUESTS] = QueueSpec()  # a publisher is mandatory
     mq = Connection(transport)
 
     async with await Requester.open(

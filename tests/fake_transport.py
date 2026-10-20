@@ -103,7 +103,7 @@ class FakeTransport:
 
     #: Queues the broker takes a message for and then nacks, which a test sets to
     #: rehearse a ``reject-publish`` overflow on, say, the parked queue.
-    refuse: set[str] = field(default_factory=set)
+    refused_queues: set[str] = field(default_factory=set)
 
     #: Whether the broker has blocked this connection, which a test sets to
     #: rehearse a disk or memory alarm. ``None`` is the third answer a transport
@@ -136,7 +136,7 @@ class FakeTransport:
         routed = bool(exchange) or routing_key in self.queues
         return PublishResult(
             message_id=message.message_id,
-            confirmed=exchange != "" or routing_key not in self.refuse,
+            confirmed=exchange != "" or routing_key not in self.refused_queues,
             routed=routed,
             return_reason="" if routed else "NO_ROUTE",
         )

@@ -39,6 +39,7 @@ from acemq_amqp import (
     PublishError,
     PublishingPausedError,
     PublishResult,
+    QueueSpec,
 )
 from acemq_amqp.connection import Connection
 from acemq_amqp.telemetry import OUTCOME_FAILED, OUTCOME_REFUSED, metric_key
@@ -79,6 +80,7 @@ async def test_a_connection_that_cannot_say_whether_it_is_blocked_still_publishe
     # ``None`` is "could not look", not "blocked": refusing on it would stop every
     # publish on a client that has moved the state out of reach.
     transport = FakeTransport()
+    transport.queues["orders.new"] = QueueSpec()  # a publisher is mandatory
     transport.blocked = None
     connection = Connection(transport)
 
@@ -89,6 +91,7 @@ async def test_a_connection_that_cannot_say_whether_it_is_blocked_still_publishe
 
 async def test_publishing_resumes_once_the_broker_unblocks() -> None:
     transport = FakeTransport()
+    transport.queues["orders.new"] = QueueSpec()  # a publisher is mandatory
     transport.blocked = True
     connection = Connection(transport)
     publisher = connection.publisher(routing_key="orders.new")

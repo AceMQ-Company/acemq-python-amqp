@@ -457,7 +457,7 @@ class _HopRefusedError(Exception):
     """The broker refused a republish the consumer made on the user's behalf."""
 
 
-class _StopReading(Exception):
+class _StopReadingError(Exception):
     """Raised by a handler wrapper to stop its consumer at this delivery.
 
     What a stream reader does when its handler fails (AceMQ TCK requirement
@@ -810,7 +810,7 @@ class Consumer:
             delay = decision.delay if decision.delay is not None else ZERO
             return Settlement(OUTCOME_IN_PROGRESS, delay=delay), Wait(delay, in_broker=False)
 
-        if isinstance(decision.error, _StopReading):
+        if isinstance(decision.error, _StopReadingError):
             return (
                 Settlement(
                     OUTCOME_STOPPED,

@@ -425,12 +425,12 @@ async def test_a_message_without_the_headers_is_rejected_rather_than_retried() -
     # Nothing went to a rung and nothing went to a destination: a message the
     # scheduler cannot read is not a message it guesses a destination for. What
     # it tried instead was its own dead-letter queue, which nothing declared —
-    # so the broker refused it and the message was given back rather than
-    # quietly creating a queue nobody asked for.
+    # so the broker refused it and the message was given back, requeued
+    # (AMQP-PUB-002), rather than quietly creating a queue nobody asked for.
     assert [sent.routing_key for sent in transport.sent] == ["acemq.schedule.due.dlq"]
     assert "acemq.schedule.due.dlq" not in transport.queues
     assert settlement.nacked
-    assert settlement.requeued is False
+    assert settlement.requeued is True
 
 
 async def test_an_unreadable_due_time_is_rejected_rather_than_delivered_now() -> None:
