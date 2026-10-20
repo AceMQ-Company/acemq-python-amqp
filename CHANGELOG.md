@@ -6,7 +6,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 While the version is `0.x` the public API may change in any release.
 
-## [0.7.13] - 2026-10-20
+## [Unreleased]
 
 ### Changed
 
@@ -54,6 +54,19 @@ While the version is `0.x` the public API may change in any release.
 - `x-acemq-first-seen` is rounded, not truncated, to the millisecond, so a
   republish can no longer move it back by one.
 
+### Added
+
+- `read_stream(..., on_failure=...)`, `"stop"` (default) or `"dead_letter"`,
+  and the `StreamFailure` type for it.
+- The TCK driver implements the `pipeline` op and the new arguments
+  `publish.mandatory`, `consume` without `retry` (no retry policy),
+  `consume.idempotent` and `readStream.behaviour`, for the pending cases of
+  the TCK's R6 round.
+
+## [0.7.13] - 2026-10-20
+
+### Fixed
+
 - `replay(..., only=...)` no longer returns before the messages its filter
   passed over are back on the queue. Their `basic.nack` has no reply, and a
   quorum queue takes a requeue through its log before counting it, so a
@@ -63,12 +76,6 @@ While the version is `0.x` the public API may change in any release.
 
 ### Added
 
-- `read_stream(..., on_failure=...)`, `"stop"` (default) or `"dead_letter"`,
-  and the `StreamFailure` type for it.
-- The TCK driver implements the `pipeline` op and the new arguments
-  `publish.mandatory`, `consume` without `retry` (no retry policy),
-  `consume.idempotent` and `readStream.behaviour`, for the pending cases of
-  the TCK's R6 round.
 - The TCK driver implements the `replay` op, for the AceMQ TCK case
   REPLAY-001 (a filtered replay returns only once the messages it passed over
   are back on the queue).
