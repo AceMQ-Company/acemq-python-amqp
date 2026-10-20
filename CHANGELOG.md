@@ -17,6 +17,12 @@ While the version is `0.x` the public API may change in any release.
   still holding every declined message. The replay now waits, up to ten
   seconds, until the queue's depth shows them.
 
+### Added
+
+- The TCK driver implements the `replay` op, for the AceMQ TCK case
+  REPLAY-001 (a filtered replay returns only once the messages it passed over
+  are back on the queue).
+
 ## [0.7.12] - 2026-10-13
 
 ### Fixed

@@ -44,6 +44,7 @@ from acemq_amqp.patterns import (
     from_first,
     from_next,
     read_stream,
+    replay,
 )
 from acemq_amqp.patterns.requestreply import RequestTimeoutError, ResponderError
 
@@ -59,6 +60,7 @@ OPS = [
     "declareStream",
     "readStream",
     "metrics",
+    "replay",
 ]
 
 
@@ -216,6 +218,17 @@ class Driver:
         samples = [{"name": name, "tags": tags} for name, tags in self.recorder.samples]
         names = sorted({name for name, _ in self.recorder.samples})
         return {"names": names, "samples": samples}
+
+    async def replay(self, args: dict[str, Any]) -> dict[str, Any]:
+        ids = set(args["ids"])
+
+        def only(_: Envelope, body: bytes) -> bool:
+            return json.loads(body).get("id") in ids
+
+        result = await replay(
+            self.mq, args["from"], exchange="", routing_key=args["queue"], only=only
+        )
+        return {"replayed": result.moved}
 
     async def schedule(self, args: dict[str, Any]) -> dict[str, Any]:
         if self.scheduler is None:
