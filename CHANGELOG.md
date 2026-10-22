@@ -14,6 +14,9 @@ While the version is `0.x` the public API may change in any release.
   (TCK cases CLAIM-001, CLAIM-002, OUTBOX-001, OUTBOX-002, CONSUME-001),
   through `ClaimCheckCodec` over `FilesystemClaimCheckStore`, `record` with
   `InMemoryOutboxStore` and `OutboxRelay`, and `ConsumerGroup.start`.
+- Runs the AceMQ TCK v0.3.3 (was v0.3.2), which adds SLIP-004, SLIP-005,
+  CLAIM-001, CLAIM-002, OUTBOX-001, OUTBOX-002, CONSUME-001 and CONSUME-002
+  to the default run: 38 cases.
 
 ### Fixed
 
