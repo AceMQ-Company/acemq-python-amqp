@@ -8,6 +8,8 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.7.16] - 2026-10-22
+
 ### Added
 
 - The TCK driver has the ops `claimCheck`, `outbox` and `consumeGroup`
