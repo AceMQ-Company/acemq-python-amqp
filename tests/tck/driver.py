@@ -36,8 +36,14 @@ from acemq_amqp import (
     connect,
     fixed_retry,
 )
+from acemq_amqp.codec import JsonCodec
 from acemq_amqp.patterns import (
+    ClaimCheckCodec,
+    ConsumerGroup,
+    FilesystemClaimCheckStore,
     InMemoryIdempotencyStore,
+    InMemoryOutboxStore,
+    OutboxRelay,
     Pipeline,
     Requester,
     Scheduler,
@@ -47,6 +53,7 @@ from acemq_amqp.patterns import (
     from_next,
     idempotent,
     read_stream,
+    record,
     replay,
 )
 from acemq_amqp.patterns.requestreply import RequestTimeoutError, ResponderError
@@ -65,7 +72,25 @@ OPS = [
     "metrics",
     "replay",
     "pipeline",
+    "claimCheck",
+    "outbox",
+    "consumeGroup",
 ]
+
+
+def envelope_from(fields: Mapping[str, Any] | None) -> Envelope | None:
+    """The contract's ``envelope`` argument as the library's envelope."""
+    if not fields:
+        return None
+    given = {
+        "id": fields.get("id"),
+        "type": fields.get("type"),
+        "version": fields.get("version"),
+        "correlation_id": fields.get("correlationId"),
+        "causation_id": fields.get("causationId"),
+        "headers": fields.get("headers"),
+    }
+    return Envelope(**{k: v for k, v in given.items() if v is not None})
 
 
 class UnsupportedOpError(Exception):
@@ -100,6 +125,10 @@ class Driver:
         self.scheduler: Scheduler | None = None
         self.requesters: dict[tuple[str, str], Requester] = {}
         self.pipelines: list[Pipeline] = []
+        self.origin = ""
+        self.outbox_store: InMemoryOutboxStore | None = None
+        self.relay: OutboxRelay | None = None
+        self.groups: list[ConsumerGroup] = []
 
     @property
     def mq(self) -> Connection:
@@ -115,6 +144,7 @@ class Driver:
         # Publisher confirms cannot be turned off in this library, so a case's
         # ``confirms: false`` changes nothing here.
         self.recorder = Recorder()
+        self.origin = origin
         self.connection = await connect(self.url, origin=origin, observer=self.recorder)
         return {}
 
@@ -128,6 +158,13 @@ class Driver:
         for consumer in self.consumers.values():
             await consumer.close()
         self.consumers.clear()
+        if self.relay is not None:
+            await self.relay.close()
+            self.relay = None
+        self.outbox_store = None
+        for group in self.groups:
+            await group.close()
+        self.groups.clear()
         for pipeline in self.pipelines:
             await pipeline.close()
         self.pipelines.clear()
@@ -140,18 +177,7 @@ class Driver:
         return {}
 
     async def publish(self, args: dict[str, Any]) -> dict[str, Any]:
-        fields = args.get("envelope")
-        envelope = None
-        if fields:
-            given = {
-                "id": fields.get("id"),
-                "type": fields.get("type"),
-                "version": fields.get("version"),
-                "correlation_id": fields.get("correlationId"),
-                "causation_id": fields.get("causationId"),
-                "headers": fields.get("headers"),
-            }
-            envelope = Envelope(**{k: v for k, v in given.items() if v is not None})
+        envelope = envelope_from(args.get("envelope"))
         # ``mandatory`` absent is the library's default, which is mandatory.
         options = {} if args.get("mandatory") is None else {"mandatory": args["mandatory"]}
         publisher = self.mq.publisher(args.get("exchange", ""), args["routingKey"], **options)
@@ -225,6 +251,44 @@ class Driver:
         for step in args["steps"]:
             builder.step(step, identity_for(step))
         self.pipelines.append(await builder.build())
+        return {}
+
+    async def claimCheck(self, args: dict[str, Any]) -> dict[str, Any]:  # noqa: N802
+        # Reopened rather than wrapped: the codec is the connection's, so
+        # everything later in the case encodes and decodes through it.
+        await self.mq.close()
+        codec = ClaimCheckCodec(
+            JsonCodec(),
+            FilesystemClaimCheckStore(args["directory"]),
+            threshold=args["thresholdBytes"],
+        )
+        self.connection = await connect(
+            self.url, origin=self.origin, observer=self.recorder, codec=codec
+        )
+        return {}
+
+    async def outbox(self, args: dict[str, Any]) -> dict[str, Any]:
+        if self.outbox_store is None or self.relay is None:
+            self.outbox_store = InMemoryOutboxStore()
+            self.relay = OutboxRelay(self.mq, self.outbox_store)
+            self.relay.start()
+        entry = record(
+            self.mq,
+            args.get("exchange", ""),
+            args["routingKey"],
+            args["body"],
+            envelope=envelope_from(args.get("envelope")),
+        )
+        await self.outbox_store.add(entry)
+        return {"id": entry.id}
+
+    async def consumeGroup(self, args: dict[str, Any]) -> dict[str, Any]:  # noqa: N802
+        handler = self._counting(args["handle"], args.get("behaviour") or {})
+        await self.mq.declare(Topology().queue(args["queue"], dead_letter=True, retry=None))
+        group = await ConsumerGroup.start(
+            self.mq, args["queue"], args["size"], handler, prefetch=args.get("prefetch", 10)
+        )
+        self.groups.append(group)
         return {}
 
     async def handled(self, args: dict[str, Any]) -> dict[str, Any]:
