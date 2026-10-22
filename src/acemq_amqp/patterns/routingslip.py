@@ -590,12 +590,15 @@ def _follower(
             # this library does not know go on unchanged. The slip header is the
             # one exception, because the slip owns it: ``onto`` writes the
             # advanced one back in the JSON form, and the declared form must not
-            # carry a stale itinerary beside its own route headers.
+            # carry a stale itinerary beside its own route headers. The run's
+            # first-seen goes on too (AMQP-SLIP-006), or the run duration at the
+            # end would time only the last hop.
             incoming = message.envelope
             outgoing = written.onto(
                 Envelope(
                     correlation_id=incoming.correlation_id,
                     causation_id=incoming.id,
+                    first_seen=incoming.first_seen,
                     origin=connection.origin,
                     headers={
                         name: value

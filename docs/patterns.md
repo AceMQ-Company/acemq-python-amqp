@@ -569,6 +569,11 @@ route headers or the `acemq-routing-slip` header — plus the hop's own causatio
 and origin. This holds for `follow_slip` and for every step of a
 `mq.pipeline(...)`; up to 0.7.15 a hop dropped them.
 
+Every hop also keeps the run's `x-acemq-first-seen` (AceMQ TCK requirement
+AMQP-SLIP-006), so `acemq.pipeline.run.duration` covers the whole run, from the
+first publish to the last step. Up to 0.7.16 each hop restarted it, and the
+duration timed only the last hop. `then(...)` keeps it the same way.
+
 ### Two wire forms, and both are read
 
 | Header | Carries | Written by |

@@ -239,10 +239,12 @@ def then(publisher: Publisher, step: Callable[[Message], Any]) -> AsyncHandler:
                 produced,
                 # The application's headers and unknown x-acemq- ones go on
                 # unchanged: a step must not strip what an earlier one, in any
-                # language, put on the message (AceMQ TCK AMQP-SLIP-005).
+                # language, put on the message (AceMQ TCK AMQP-SLIP-005), and
+                # so does the run's first-seen (AMQP-SLIP-006).
                 envelope=Envelope(
                     correlation_id=message.envelope.correlation_id,
                     causation_id=message.envelope.id,
+                    first_seen=message.envelope.first_seen,
                     headers=message.envelope.headers,
                     extensions=message.envelope.extensions,
                 ),

@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -224,6 +224,21 @@ async def test_a_step_carries_the_headers_it_does_not_own() -> None:
     sent = transport.sent[0].headers
     assert sent["x-tenant"] == "acme"
     assert sent["x-acemq-future"] == "kept"
+
+
+async def test_a_step_keeps_the_runs_first_seen() -> None:
+    # AceMQ TCK AMQP-SLIP-006: the whole run keeps the first-seen it started with.
+    transport = FakeTransport()
+    mq = Connection(transport)
+    incoming = message()
+    started = datetime(2025, 10, 22, 12, 0, tzinfo=timezone.utc)
+    incoming = replace(incoming, envelope=incoming.envelope.with_(first_seen=started))
+
+    await then(mq.publisher("shipping-events", "shipment.requested"), lambda m: m.payload)(
+        incoming
+    )
+
+    assert transport.sent[0].headers[headers.FIRST_SEEN] == 1761134400000
 
 
 async def test_a_step_with_nothing_to_send_on_publishes_nothing() -> None:

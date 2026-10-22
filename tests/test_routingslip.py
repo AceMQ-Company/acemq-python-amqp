@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
+from datetime import datetime, timezone
 from typing import Any
 
 import pytest
@@ -216,6 +218,26 @@ async def test_a_hop_carries_the_headers_it_does_not_own() -> None:
     assert [step["name"] for step in json.loads(sent[HEADER_ROUTING_SLIP])["steps"]] == [
         "ship"
     ]
+
+
+async def test_a_hop_keeps_the_runs_first_seen() -> None:
+    # AceMQ TCK AMQP-SLIP-006: the run duration at the end is the envelope's
+    # age, so a hop that restarted first-seen would time only the last hop.
+    itinerary = (
+        RoutingSlip()
+        .then("fulfilment", "validate", name="validate")
+        .then("fulfilment", "enrich", name="enrich")
+    )
+    started = datetime(2025, 10, 22, 12, 0, tzinfo=timezone.utc)
+    for form in (None, SlipForm.STEP_NAMES):
+        transport = FakeTransport()
+        mq = Connection(transport)
+        incoming = carrying_headers(itinerary)
+        incoming = replace(incoming, envelope=incoming.envelope.with_(first_seen=started))
+
+        await follow_slip(mq, lambda message: message.payload, form=form)(incoming)
+
+        assert transport.sent[0].headers[headers.FIRST_SEEN] == 1761134400000
 
 
 async def test_a_hop_written_as_a_declared_route_drops_the_itinerary_it_replaced() -> None:

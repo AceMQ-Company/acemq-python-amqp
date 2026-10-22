@@ -8,6 +8,16 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A pipeline or routing-slip hop keeps the run's first-seen** (TCK
+  SLIP-006, SLIP-007, requirement AMQP-SLIP-006). `follow_slip`, every step
+  of `mq.pipeline(...)` and `then(...)` now publish the next message with the
+  handled message's `x-acemq-first-seen`, in both slip forms. Before, each hop
+  restarted it, so `acemq.pipeline.run.duration` measured only the last hop
+  instead of the whole run. Behaviour change: a dashboard on that metric now
+  shows whole-run times. See `docs/patterns.md`.
+
 ## [0.7.16] - 2026-10-22
 
 ### Added
