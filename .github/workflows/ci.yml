@@ -71,7 +71,7 @@ jobs:
       - name: Install
         run: pip install -e ".[rabbitmq]"
 
-      - uses: AceMQ-Company/acemq-amqp-tck@v0.3.1
+      - uses: AceMQ-Company/acemq-amqp-tck@v0.3.2
         with:
           driver: python tests/tck/driver.py
 
