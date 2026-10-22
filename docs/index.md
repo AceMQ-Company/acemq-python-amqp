@@ -16,7 +16,7 @@ afternoon, and is what
 [the conformance suite](testing.md#how-we-know-the-five-libraries-agree) is for.
 
 ```bash
-pip install --extra-index-url https://acemq.org/pypi/simple/ "acemq-amqp[rabbitmq]==0.7.16"
+pip install --extra-index-url https://acemq.org/pypi/simple/ "acemq-amqp[rabbitmq]==0.7.17"
 ```
 
 ## A message, end to end
@@ -179,6 +179,6 @@ out in the reverse of the way in. See [interceptors](interceptors.md).
 
 Pre-1.0 and in development. The API may change before 1.0. The contract layer,
 the transport and the pattern library are implemented and tested, against a real
-broker as well as a fake one. The current release is **0.7.16**, from
+broker as well as a fake one. The current release is **0.7.17**, from
 <https://acemq.org/pypi/simple/> — [getting started](getting-started.md#install-it)
 says how to install from it.

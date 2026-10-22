@@ -8,6 +8,8 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.7.17] - 2026-10-22
+
 ### Fixed
 
 - **A pipeline or routing-slip hop keeps the run's first-seen** (TCK
