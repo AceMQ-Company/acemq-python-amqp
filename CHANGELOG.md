@@ -18,6 +18,11 @@ While the version is `0.x` the public API may change in any release.
   instead of the whole run. Behaviour change: a dashboard on that metric now
   shows whole-run times. See `docs/patterns.md`.
 
+### Added
+
+- Runs the AceMQ TCK v0.3.4 (was v0.3.3), which adds SLIP-006 and SLIP-007
+  to the default run: 40 cases.
+
 ## [0.7.16] - 2026-10-22
 
 ### Added
