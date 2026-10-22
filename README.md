@@ -825,7 +825,8 @@ from acemq_amqp.patterns import InMemoryIdempotencyStore, chain, idempotent, wit
 | `replay(...)` | Put dead letters back, with a filter, a limit and a deadline, and a report of what it did and why it stopped |
 | `ordered(key, handler)` | Keep one entity's messages in sequence while everything else runs at once |
 | `ConsumerGroup` | Several consumers over one queue, started and stopped as one thing |
-| `RoutingSlip` / `follow_slip(...)` | An itinerary the message carries, instead of an orchestrator that knows it. Both wire forms are read — the JSON slip Python, Go and Ruby write, and the declared `x-acemq-route` Java's `Pipeline` writes — and either can be written |
+| `mq.pipeline(name).step(...).build()` | A declared pipeline: an exchange, a queue and a consumer group per step, the same topology as Java's, .NET's and Go's. A step with no `retry` is attempted once, then `{name}.{step}.dlq`; returning `NOTHING` before the last step ends the run (`ended_early`) |
+| `RoutingSlip` / `follow_slip(...)` | An itinerary the message carries, instead of an orchestrator that knows it. Both wire forms are read — the JSON slip Python, Go and Ruby write, and the declared `x-acemq-route` that `mq.pipeline(...)` and Java's `Pipeline` write — and either can be written |
 | `Saga` | Steps that must all happen across systems sharing no transaction, compensated in reverse when one fails. It reports what could **not** be undone rather than raising |
 | `Scheduler` | Deliver a message later, through a ladder of time-to-live queues rather than a per-message expiration that a queue only honours at its head |
 | `chain(...)` / `then(...)` | Wrap a handler in a deadline, logging and the guards; publish what a step produced onwards |
