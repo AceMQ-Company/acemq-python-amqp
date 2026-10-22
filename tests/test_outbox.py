@@ -120,6 +120,20 @@ async def test_a_record_can_carry_an_envelope_the_caller_already_has() -> None:
     assert entry.headers[headers.CAUSATION] == "cart-9"
 
 
+async def test_a_callers_envelope_without_an_origin_takes_the_connections() -> None:
+    # TCK OUTBOX-001: the relay publishes the stored headers as they are, so an
+    # origin left off here would never be written.
+    mq, _ = connection()
+
+    entry = record(mq, "", "orders", {"id": "7"}, envelope=Envelope(id="order-1"))
+    kept = record(
+        mq, "", "orders", {"id": "8"}, envelope=Envelope(origin="importer@batch-1")
+    )
+
+    assert entry.headers[headers.ORIGIN] == "checkout@pod-7"
+    assert kept.headers[headers.ORIGIN] == "importer@batch-1"
+
+
 async def test_a_sweep_publishes_what_is_waiting_and_forgets_it() -> None:
     mq, transport = connection()
     store = InMemoryOutboxStore()

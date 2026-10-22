@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import replace
 from datetime import timedelta
 from typing import Any
 
@@ -206,6 +207,23 @@ async def test_a_step_publishes_what_it_produced_and_says_what_caused_it() -> No
     assert sent.headers[headers.CORRELATION] == "cart-9"
     assert sent.headers[headers.CAUSATION] == "order-1"
     assert sent.headers[headers.ORIGIN] == "orders@pod-1"
+
+
+async def test_a_step_carries_the_headers_it_does_not_own() -> None:
+    transport = FakeTransport()
+    mq = Connection(transport)
+    incoming = message(**{"x-tenant": "acme"})
+    incoming = replace(
+        incoming, envelope=incoming.envelope.with_(extensions={"x-acemq-future": "kept"})
+    )
+
+    await then(mq.publisher("shipping-events", "shipment.requested"), lambda m: m.payload)(
+        incoming
+    )
+
+    sent = transport.sent[0].headers
+    assert sent["x-tenant"] == "acme"
+    assert sent["x-acemq-future"] == "kept"
 
 
 async def test_a_step_with_nothing_to_send_on_publishes_nothing() -> None:

@@ -8,6 +8,27 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Added
+
+- The TCK driver has the ops `claimCheck`, `outbox` and `consumeGroup`
+  (TCK cases CLAIM-001, CLAIM-002, OUTBOX-001, OUTBOX-002, CONSUME-001),
+  through `ClaimCheckCodec` over `FilesystemClaimCheckStore`, `record` with
+  `InMemoryOutboxStore` and `OutboxRelay`, and `ConsumerGroup.start`.
+
+### Fixed
+
+- **A routing-slip hop keeps the headers it does not own** (TCK SLIP-004,
+  SLIP-005). A `follow_slip` step and every step of `mq.pipeline(...)` now send
+  the next stop every application header the message arrived with (a tenant, a
+  `traceparent`) and every `x-acemq-` header this library does not know,
+  unchanged, in both the JSON and the declared wire form. They used to publish
+  a fresh envelope carrying only the correlation, so those headers were lost at
+  the first hop. `then(...)` keeps them the same way. See `docs/patterns.md`.
+- **`record(..., envelope=...)` stamps the connection's origin** when the
+  envelope has none (TCK OUTBOX-001), as a direct publish does. A relayed
+  message recorded with the caller's own envelope used to go out with no
+  `x-acemq-origin`.
+
 ## [0.7.15] - 2026-10-21
 
 ### Added

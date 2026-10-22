@@ -204,6 +204,11 @@ survive a deployment that changes the class the payload was written from, so
 what is stored is bytes and a content type; the relay is then a thing that moves
 bytes and needs to know nothing about what they mean.
 
+`record(..., envelope=...)` takes an envelope you already have, and stores its
+headers as the message's. An envelope without an origin takes the connection's,
+exactly as a direct publish does (before 0.7.16 the relayed message went out
+with no `x-acemq-origin` at all).
+
 The relay is **at-least-once by construction**: a record is removed only after
 the broker has confirmed it, so a crash in between sends it twice. Removing it
 first would lose it instead, and a repeated message is a problem a consumer can
@@ -374,7 +379,10 @@ unsafe to keep is one somebody eventually turns off.
 
 **`then`** makes a pipeline out of several services: each consumes, does its
 part, and publishes what comes out, carrying the correlation forward so the
-whole run can be followed afterwards.
+whole run can be followed afterwards. The incoming message's application
+headers (a tenant, a `traceparent`) and any `x-acemq-` headers this library
+does not know go on unchanged; up to 0.7.15 the outgoing message started with
+none of them.
 
 ```python
 from acemq_amqp.patterns import NOTHING, then
@@ -552,6 +560,14 @@ that changes anything should be idempotent. "Out" means routed: the hop to the
 next stop is published mandatory, so a next stop nothing is bound to makes the
 step retry rather than accept, and the message is never acknowledged on the
 strength of a copy the broker dropped.
+
+A hop is the message moving on, not a new message: the next stop gets every
+application header the step received (a tenant, a `traceparent`) and every
+`x-acemq-` header this library does not know, unchanged, in both wire forms
+(AceMQ TCK requirement AMQP-SLIP-005). Only what the slip owns changes — the
+route headers or the `acemq-routing-slip` header — plus the hop's own causation
+and origin. This holds for `follow_slip` and for every step of a
+`mq.pipeline(...)`; up to 0.7.15 a hop dropped them.
 
 ### Two wire forms, and both are read
 

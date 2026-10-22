@@ -174,6 +174,70 @@ async def test_a_step_sends_the_message_on_to_the_next_stop() -> None:
     assert [step["name"] for step in carried["done"]] == ["validate", "charge"]
 
 
+TRACEPARENT = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+
+
+def carrying_headers(slip: RoutingSlip) -> Message:
+    """A message with a tenant, a trace context and an x-acemq- header nobody knows."""
+    return Message(
+        payload={"order": "order-1"},
+        envelope=Envelope(
+            id="order-1",
+            correlation_id="cart-9",
+            headers={
+                HEADER_ROUTING_SLIP: slip.to_header(),
+                "x-tenant": "acme",
+                "traceparent": TRACEPARENT,
+            },
+            extensions={"x-acemq-future": "kept"},
+        ),
+        routing_key="order.charge",
+        content_type="application/json",
+        redelivered=False,
+        body=b"{}",
+    )
+
+
+async def test_a_hop_carries_the_headers_it_does_not_own() -> None:
+    # AceMQ TCK AMQP-SLIP-005: a hop is the message moving on, so a step must
+    # not strip what the service that started the run put on it.
+    transport = FakeTransport()
+    mq = Connection(transport)
+
+    await follow_slip(mq, lambda message: message.payload)(
+        carrying_headers(ITINERARY.advance())
+    )
+
+    sent = transport.sent[0].headers
+    assert sent["x-tenant"] == "acme"
+    assert sent["traceparent"] == TRACEPARENT
+    assert sent["x-acemq-future"] == "kept"
+    # The slip is the hop's to change, and it did.
+    assert [step["name"] for step in json.loads(sent[HEADER_ROUTING_SLIP])["steps"]] == [
+        "ship"
+    ]
+
+
+async def test_a_hop_written_as_a_declared_route_drops_the_itinerary_it_replaced() -> None:
+    transport = FakeTransport()
+    mq = Connection(transport)
+    itinerary = (
+        RoutingSlip()
+        .then("fulfilment", "validate", name="validate")
+        .then("fulfilment", "enrich", name="enrich")
+    )
+
+    await follow_slip(mq, lambda message: message.payload, form=SlipForm.STEP_NAMES)(
+        carrying_headers(itinerary)
+    )
+
+    sent = transport.sent[0].headers
+    assert sent[headers.ROUTE] == "validate,enrich"
+    assert HEADER_ROUTING_SLIP not in sent
+    assert sent["x-tenant"] == "acme"
+    assert sent["x-acemq-future"] == "kept"
+
+
 async def test_the_last_step_publishes_nothing_and_the_work_is_done() -> None:
     transport = FakeTransport()
     mq = Connection(transport)

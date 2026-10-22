@@ -256,12 +256,18 @@ def record(
     :param exchange: where it is going, empty for the default exchange
     :param routing_key: what to publish it under
     :param payload: what to send
-    :param envelope: metadata to use instead of a fresh one
+    :param envelope: metadata to use instead of a fresh one; one without an
+        origin takes the connection's, as a direct publish does
     :param codec: a codec other than the connection's
     :returns: the record
     """
     writer = codec or connection.codec
     outgoing = envelope or Envelope(origin=connection.origin)
+    if not outgoing.origin:
+        # As Publisher.send does: the relay publishes these bytes as they are,
+        # so a caller's envelope without an origin would otherwise go out with
+        # none (AceMQ TCK requirement AMQP-OUTBOX-001).
+        outgoing = outgoing.with_(origin=connection.origin)
     return OutboxRecord(
         id=outgoing.id,
         exchange=exchange,

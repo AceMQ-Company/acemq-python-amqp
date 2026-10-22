@@ -108,6 +108,32 @@ async def test_a_step_moves_the_route_on_and_names_its_cause() -> None:
     await pipeline.close()
 
 
+async def test_a_step_carries_the_headers_it_does_not_own() -> None:
+    # TCK SLIP-004: a tenant, a trace context and an x-acemq- header no library
+    # knows all reach the next step unchanged.
+    transport = FakeTransport()
+    pipeline = await built(Connection(transport))
+
+    await transport.deliver(
+        "fulfilment.validate",
+        b'{"order": "A-1"}',
+        headers={
+            headers.ROUTE: "validate,enrich,dispatch",
+            headers.ROUTE_POSITION: 0,
+            "x-tenant": "acme",
+            "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+            "x-acemq-future": "kept",
+        },
+    )
+
+    sent = transport.sent[-1].headers
+    assert sent[headers.ROUTE_POSITION] == 1
+    assert sent["x-tenant"] == "acme"
+    assert sent["traceparent"] == "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+    assert sent["x-acemq-future"] == "kept"
+    await pipeline.close()
+
+
 async def test_an_itinerary_is_followed_wherever_it_goes() -> None:
     transport = FakeTransport()
     pipeline = await built(Connection(transport))

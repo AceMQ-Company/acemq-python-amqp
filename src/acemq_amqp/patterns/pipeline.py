@@ -213,7 +213,8 @@ def then(publisher: Publisher, step: Callable[[Message], Any]) -> AsyncHandler:
     The step that turns a set of services into a pipeline. The correlation
     identifier is carried forward and the incoming message becomes the outgoing
     one's causation, so afterwards the whole run can be reconstructed from any
-    message in it.
+    message in it. The incoming message's application headers and any
+    ``x-acemq-`` headers this library does not know go on unchanged.
 
     Returning :data:`NOTHING` publishes nothing and accepts the message, which
     is how a step says "this one does not continue" without inventing an empty
@@ -236,9 +237,14 @@ def then(publisher: Publisher, step: Callable[[Message], Any]) -> AsyncHandler:
         try:
             await publisher.send(
                 produced,
+                # The application's headers and unknown x-acemq- ones go on
+                # unchanged: a step must not strip what an earlier one, in any
+                # language, put on the message (AceMQ TCK AMQP-SLIP-005).
                 envelope=Envelope(
                     correlation_id=message.envelope.correlation_id,
                     causation_id=message.envelope.id,
+                    headers=message.envelope.headers,
+                    extensions=message.envelope.extensions,
                 ),
             )
         except Exception as failure:

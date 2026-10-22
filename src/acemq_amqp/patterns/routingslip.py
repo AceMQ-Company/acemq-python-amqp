@@ -585,11 +585,24 @@ def _follower(
 
         try:
             written = advanced if form is None else advanced.written_as(form)
+            # A hop is the message moving on (AceMQ TCK requirement
+            # AMQP-SLIP-005): the application's headers and the x-acemq- ones
+            # this library does not know go on unchanged. The slip header is the
+            # one exception, because the slip owns it: ``onto`` writes the
+            # advanced one back in the JSON form, and the declared form must not
+            # carry a stale itinerary beside its own route headers.
+            incoming = message.envelope
             outgoing = written.onto(
                 Envelope(
-                    correlation_id=message.envelope.correlation_id,
-                    causation_id=message.envelope.id,
+                    correlation_id=incoming.correlation_id,
+                    causation_id=incoming.id,
                     origin=connection.origin,
+                    headers={
+                        name: value
+                        for name, value in incoming.headers.items()
+                        if name != HEADER_ROUTING_SLIP
+                    },
+                    extensions=incoming.extensions,
                 )
             )
         except ValueError as unwritable:
