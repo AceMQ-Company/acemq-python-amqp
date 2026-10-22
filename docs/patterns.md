@@ -491,6 +491,8 @@ declared route (`x-acemq-route`, the position and the run id, returned by
 says. A message published straight onto a step's queue with no slip at all is
 taken to be at that step. Returning `NOTHING` ends the run there: nothing is
 published, the message is accepted, and the run is counted `ended_early`.
+The same holds in a `follow_slip` step. Before 0.7.15 a `NOTHING` with stops
+still to go was sent on as a payload, failed to encode and was retried.
 
 A step given no `retry`, in a pipeline on a connection with no default policy,
 is attempted once: when its handler raises, the message goes to

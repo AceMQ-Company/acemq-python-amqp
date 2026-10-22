@@ -8,6 +8,8 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+## [0.7.15] - 2026-10-21
+
 ### Added
 
 - **A pipeline builder.** `mq.pipeline(name).step(name, handler, ...).build()`
