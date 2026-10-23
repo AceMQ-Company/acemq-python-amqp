@@ -39,6 +39,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -48,7 +49,18 @@ jobs:
           cache: pip
 
       - name: Install pandoc
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pandoc
+        # From the GitHub release rather than apt: the 27 MB pandoc .deb from
+        # the Azure Ubuntu mirror crawled at ~50 kB/s and held this step for
+        # 6-10 minutes, twice, on 2026-10-22. 3.1.3 is the version noble's apt
+        # shipped, so the rendered pages are unchanged. The checksum pins the
+        # bytes; the timeouts turn a slow download into a fast failure.
+        timeout-minutes: 3
+        run: |
+          curl -fsSL --retry 3 --max-time 120 -o "$RUNNER_TEMP/pandoc.tgz" \
+            https://github.com/jgm/pandoc/releases/download/3.1.3/pandoc-3.1.3-linux-amd64.tar.gz
+          echo "74bc434908e4d858b3edbfd6271d2e9e499477837e5df1d630df4e62f113803d  $RUNNER_TEMP/pandoc.tgz" | sha256sum -c -
+          sudo tar xzf "$RUNNER_TEMP/pandoc.tgz" --strip-components 1 -C /usr/local
+          pandoc --version | head -1
 
       - name: Install the library and pdoc
         # The library itself, with the broker extra, because pdoc imports what
