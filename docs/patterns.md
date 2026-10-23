@@ -454,6 +454,30 @@ returns only once the declined messages are back on the queue (it waits up to
 ten seconds for the depth to show them), so a `message_count` read straight
 after it counts them, on a quorum queue too.
 
+That approach has a cost, and it is the one to know before filtering a large
+queue. Every message the filter passes over stays **unacknowledged on this
+connection for the whole pass** — the broker still has it, and a crash returns
+it, but a prefetch or a memory limit counts it. And the wait at the end reads
+the queue's depth, so **a consumer reading the same queue at the same time can
+make it run out**: the depth never grows by the number returned, the replay logs
+`... had not shown up after 10.0s` and returns. Nothing is lost when it does —
+the messages are back on the queue — but the replay took the full wait.
+`return_wait` sets how long that wait is (from 0.7.18; ten seconds by default,
+and `timedelta(0)` does not wait at all):
+
+```python
+result = await replay(
+    mq,
+    dead_letter_queue("shipping.orders"),
+    only=lambda envelope, body: "timeout" in envelope.error,
+    return_wait=timedelta(seconds=2),
+)
+```
+
+The other AceMQ libraries make the same choice, except Go's, which republishes
+each passed-over message to the back of the queue instead of holding it, and so
+changes their order.
+
 A failure raises `ReplayError` carrying the partial result: whatever had already
 been moved has been moved, and the rest is still on the queue. Each message is
 republished *before* the original is acknowledged, so a failure in the gap
@@ -561,7 +585,14 @@ next stop is published mandatory, so a next stop nothing is bound to makes the
 step retry rather than accept, and the message is never acknowledged on the
 strength of a copy the broker dropped.
 
-A hop is the message moving on, not a new message: the next stop gets every
+A hop is published as a **new message caused by the one handled** (AceMQ TCK
+requirement AMQP-SLIP-007): it gets its own `x-acemq-id`, its
+`x-acemq-causation` is the handled message's `x-acemq-id`, and its
+`x-acemq-correlation` is unchanged, so the run can be put back together from any
+message in it. This holds in both slip forms, for `follow_slip`, every step of a
+`mq.pipeline(...)` and `then(...)`, and is how this library has always done it.
+
+Otherwise a hop is the message moving on: the next stop gets every
 application header the step received (a tenant, a `traceparent`) and every
 `x-acemq-` header this library does not know, unchanged, in both wire forms
 (AceMQ TCK requirement AMQP-SLIP-005). Only what the slip owns changes — the

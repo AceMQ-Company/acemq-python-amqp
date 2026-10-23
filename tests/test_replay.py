@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import timedelta
 
@@ -261,3 +262,37 @@ async def test_a_message_replayed_to_a_queue_that_is_not_there_stays_on_the_queu
     assert transport.sent[0].message.mandatory
     assert failure.value.result.moved == 0
     assert len(transport.waiting[DLQ]) == 2
+
+
+async def test_the_wait_for_declined_messages_to_return_can_be_shortened(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A consumer draining the same queue keeps the depth from ever showing the
+    # declined messages; the wait then runs out, as short as it was asked to be.
+    transport = FakeTransport()
+    mq = Connection(transport)
+    dead(transport, b"1", "disk full")
+    dead(transport, b"2", "timed out")
+
+    async def never_grows(name: str) -> int:
+        return 0
+
+    transport.message_count = never_grows  # type: ignore[method-assign]
+    started = asyncio.get_running_loop().time()
+
+    result = await replay(
+        mq,
+        DLQ,
+        only=lambda envelope, body: "timed out" in envelope.error,
+        return_wait=timedelta(milliseconds=50),
+    )
+
+    assert asyncio.get_running_loop().time() - started < 2
+    assert (result.moved, result.skipped) == (1, 1)
+    assert len(transport.waiting[DLQ]) == 1
+    assert "had not shown up" in caplog.text
+
+
+async def test_a_negative_return_wait_is_refused() -> None:
+    with pytest.raises(ValueError):
+        await replay(Connection(FakeTransport()), DLQ, return_wait=timedelta(seconds=-1))

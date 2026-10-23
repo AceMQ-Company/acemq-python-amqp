@@ -95,6 +95,7 @@ async def replay(
     deadline: timedelta | None = None,
     only: ReplayFilter | None = None,
     restart: bool = True,
+    return_wait: timedelta = timedelta(seconds=10),
 ) -> ReplayResult:
     """Moves messages from a queue back onto an exchange::
 
@@ -130,12 +131,20 @@ async def replay(
         from one queue to the same queue. Turn it off to put back exactly what
         was there — for an audit, or for a queue read by something that counts
         attempts itself
+    :param return_wait: how long, once the pass is over, to wait for the
+        messages ``only`` passed over to show on the queue again. Ten seconds by
+        default. They are held unacknowledged for the whole pass, and the wait
+        reads the queue's depth, so a consumer draining the same queue at the
+        same time can make it run out; it then logs a warning and returns, and
+        the messages are still on the queue. Zero does not wait at all
     :returns: what it did and why it stopped
     :raises ReplayError: when reading or republishing failed. Whatever had
         already been moved has been moved; the rest is still on the queue
     """
     if not queue:
         raise ValueError("acemq: a replay needs a queue to read from")
+    if return_wait < timedelta(0):
+        raise ValueError("acemq: a replay's return_wait cannot be negative")
 
     clock = asyncio.get_running_loop()
     expires = None if deadline is None else clock.time() + deadline.total_seconds()
@@ -190,15 +199,11 @@ async def replay(
                 ) from failure
             moved += 1
     finally:
-        await _return_declined(connection, queue, declined)
-
-
-#: How long a replay waits for the broker to show the messages it returned.
-_RETURN_WAIT = 10.0
+        await _return_declined(connection, queue, declined, return_wait.total_seconds())
 
 
 async def _return_declined(
-    connection: Connection, queue: str, declined: list[Delivery]
+    connection: Connection, queue: str, declined: list[Delivery], wait: float
 ) -> None:
     """Returns what the pass declined, and waits until the queue shows them.
 
@@ -220,14 +225,14 @@ async def _return_declined(
         # that cannot be returned is one the broker returns itself when this
         # connection goes.
         await _return_quietly(held)
-    if before is None:
+    if before is None or wait <= 0:
         return
 
     # ponytail: a depth count, so a producer writing to this queue at the same
     # moment can end the wait early and a consumer reading it can make it run
     # to the timeout. The broker offers no reply to a requeue to wait on instead.
     clock = asyncio.get_running_loop()
-    expires = clock.time() + _RETURN_WAIT
+    expires = clock.time() + wait
     while True:
         try:
             if await connection.message_count(queue) >= before + len(declined):
@@ -239,7 +244,7 @@ async def _return_declined(
                 "acemq: %d messages returned to %r had not shown up after %ss",
                 len(declined),
                 queue,
-                _RETURN_WAIT,
+                wait,
             )
             return
         await asyncio.sleep(0.01)

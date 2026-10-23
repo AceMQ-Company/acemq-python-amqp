@@ -241,6 +241,27 @@ async def test_a_step_keeps_the_runs_first_seen() -> None:
     assert transport.sent[0].headers[headers.FIRST_SEEN] == 1761134400000
 
 
+async def test_a_step_publishes_a_new_message_caused_by_the_one_handled() -> None:
+    # AceMQ TCK AMQP-SLIP-007: its own x-acemq-id, the handled one as its
+    # causation, the correlation unchanged.
+    transport = FakeTransport()
+    mq = Connection(transport)
+    incoming = message()
+    incoming = replace(
+        incoming,
+        envelope=incoming.envelope.with_(id="handled-1", correlation_id="order-7"),
+    )
+
+    await then(mq.publisher("shipping-events", "shipment.requested"), lambda m: m.payload)(
+        incoming
+    )
+
+    sent = transport.sent[0].headers
+    assert sent[headers.ID] not in ("", "handled-1")
+    assert sent[headers.CAUSATION] == "handled-1"
+    assert sent[headers.CORRELATION] == "order-7"
+
+
 async def test_a_step_with_nothing_to_send_on_publishes_nothing() -> None:
     # Rather than inventing an empty message for the next service to handle.
     transport = FakeTransport()

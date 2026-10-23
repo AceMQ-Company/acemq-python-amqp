@@ -359,6 +359,18 @@ pause keeps a quorum queue's delivery limit from being spent in a hot loop. Up
 to 0.7.13 it was rejected without requeue, which dropped the message or sent it
 through the source queue's own dead-letter exchange.
 
+**A refusal that lasts ends in `{queue}.dlq`, not lost.** Each requeue counts
+against a quorum source queue's delivery limit, twenty by default on RabbitMQ 4,
+and at one second a requeue that limit is spent after about twenty seconds of
+refusal. The broker then dead-letters the message itself, through the source
+queue's dead-letter exchange, so a park the broker refuses for longer than that
+arrives in `{queue}.dlq` with the `x-acemq-` headers it had, rather than in
+`{queue}.parked`. That is deliberate and every AceMQ library does the same: a
+copy that cannot go where it was meant to goes to the next safe place, and is
+never dropped. Look in the dead-letter queue as well as the parked one after a
+broker outage. A classic source queue has no delivery limit, so there the
+message keeps coming back until the queue takes it.
+
 ## Duplicates
 
 At-least-once delivery is not a flaw to be worked around; it is the only

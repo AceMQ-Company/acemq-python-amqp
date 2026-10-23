@@ -8,6 +8,25 @@ While the version is `0.x` the public API may change in any release.
 
 ## [Unreleased]
 
+### Added
+
+- **`replay(..., return_wait=...)`** sets how long a filtered replay waits, once
+  the pass is over, for the messages the filter passed over to show on the queue
+  again. Ten seconds by default, which is the wait it had; `timedelta(0)` does not
+  wait. The docs now spell out the cost of the approach: passed-over messages are
+  held unacknowledged for the whole pass, and a consumer reading the same queue
+  can make the wait run out. See `docs/patterns.md#replay`.
+
+### Documentation
+
+- A pipeline or routing-slip hop is a new message caused by the one handled: its
+  own `x-acemq-id`, the handled id as `x-acemq-causation`, the correlation
+  unchanged (AceMQ TCK requirement AMQP-SLIP-007, cases SLIP-008 and SLIP-009,
+  which this library passes). No change in behaviour; it already did this.
+- A park or dead letter the broker refuses for longer than about twenty seconds
+  ends in `{queue}.dlq` through a quorum queue's delivery limit, and is not lost.
+  See `docs/reliability.md`.
+
 ## [0.7.17] - 2026-10-22
 
 ### Fixed

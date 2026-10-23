@@ -240,6 +240,31 @@ async def test_a_hop_keeps_the_runs_first_seen() -> None:
         assert transport.sent[0].headers[headers.FIRST_SEEN] == 1761134400000
 
 
+async def test_a_hop_is_a_new_message_caused_by_the_one_handled() -> None:
+    # AceMQ TCK AMQP-SLIP-007: its own x-acemq-id, the handled one as its
+    # causation, the correlation unchanged, in both slip forms.
+    itinerary = (
+        RoutingSlip()
+        .then("fulfilment", "validate", name="validate")
+        .then("fulfilment", "enrich", name="enrich")
+    )
+    for form in (None, SlipForm.STEP_NAMES):
+        transport = FakeTransport()
+        mq = Connection(transport)
+        incoming = carrying_headers(itinerary)
+        incoming = replace(
+            incoming,
+            envelope=incoming.envelope.with_(id="handled-1", correlation_id="order-7"),
+        )
+
+        await follow_slip(mq, lambda message: message.payload, form=form)(incoming)
+
+        sent = transport.sent[0].headers
+        assert sent[headers.ID] not in ("", "handled-1")
+        assert sent[headers.CAUSATION] == "handled-1"
+        assert sent[headers.CORRELATION] == "order-7"
+
+
 async def test_a_hop_written_as_a_declared_route_drops_the_itinerary_it_replaced() -> None:
     transport = FakeTransport()
     mq = Connection(transport)
